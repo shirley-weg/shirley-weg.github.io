@@ -481,6 +481,7 @@ def render_backtest(settings: dict[str, object]) -> None:
         return
 
     show_summary(result["summary"])
+    show_latest_trading_signal(result, a_code, b_code, a_name, b_name, config)
     show_charts(result, a_code, b_code, str(settings["benchmark"]), config)
     show_tables(result)
 
@@ -1081,12 +1082,46 @@ def rolling_spread_signal(close_df: pd.DataFrame, a_code: str, b_code: str, look
     return pd.DataFrame(rows).set_index("signal_date")
 
 
+def latest_spread_signal(close_df: pd.DataFrame, a_code: str, b_code: str, lookback: int) -> dict[str, object]:
+    logp = np.log(close_df[[a_code, b_code]].dropna())
+    if len(logp) <= lookback:
+        return {}
+
+    signal_date = logp.index[-1]
+    train = logp.iloc[-lookback - 1 : -1]
+    if len(train) < lookback:
+        return {}
+
+    alpha, beta = ols(train[a_code].to_numpy(), train[b_code].to_numpy())
+    train_spread = train[a_code].to_numpy() - (alpha + beta * train[b_code].to_numpy())
+    spread_mean = float(train_spread.mean())
+    spread_std = float(train_spread.std(ddof=1))
+    if not np.isfinite(spread_std) or spread_std == 0:
+        return {}
+
+    spread = float(logp.iloc[-1][a_code] - alpha - beta * logp.iloc[-1][b_code])
+    zscore = (spread - spread_mean) / spread_std
+
+    return {
+        "signal_date": signal_date,
+        "alpha": float(alpha),
+        "beta": float(beta),
+        "spread": spread,
+        "spread_mean": spread_mean,
+        "spread_std": spread_std,
+        "zscore": float(zscore),
+        "a_close": float(close_df.loc[signal_date, a_code]),
+        "b_close": float(close_df.loc[signal_date, b_code]),
+    }
+
+
 def run_backtest(open_df: pd.DataFrame, close_df: pd.DataFrame, benchmark: pd.Series, a_code: str, b_code: str, start: pd.Timestamp, end: pd.Timestamp, config: Config) -> dict[str, object]:
     full_close = close_df.loc[close_df.index <= end].copy()
     full_open = open_df.loc[open_df.index <= end].copy()
     if len(full_close) <= config.lookback + 5:
         raise ValueError("The selected date range is too short for this lookback.")
     signals = rolling_spread_signal(full_close, a_code, b_code, config.lookback)
+    latest_signal = latest_spread_signal(full_close, a_code, b_code, config.lookback)
     signals = signals.loc[(signals.index >= start) & (signals.index <= end)].copy()
     trades = backtest_pair(signals, full_open, full_close, a_code, b_code, config)
     equity = build_equity(trades, full_close, start, config.capital)
@@ -1098,7 +1133,7 @@ def run_backtest(open_df: pd.DataFrame, close_df: pd.DataFrame, benchmark: pd.Se
     price_history = full_close.loc[(full_close.index >= start) & (full_close.index <= end), [a_code, b_code]]
     weight_cols = ["entry_date", "a_weight", "b_weight", "a_sign", "b_sign", "direction", "weight_method"]
     weights = trades[weight_cols].copy() if not trades.empty else pd.DataFrame(columns=weight_cols)
-    return {"signals": signals, "trades": trades, "equity": equity, "comparison": comparison, "summary": summary, "price_history": price_history, "weights": weights}
+    return {"signals": signals, "latest_signal": latest_signal, "trades": trades, "equity": equity, "comparison": comparison, "summary": summary, "price_history": price_history, "weights": weights}
 
 
 def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.DataFrame, a_code: str, b_code: str, config: Config) -> pd.DataFrame:
@@ -1288,6 +1323,159 @@ def show_summary(summary: dict[str, float]) -> None:
         cols = st.columns(3)
         for col, (label, value) in zip(cols, metrics[i : i + 3]):
             col.metric(label, value)
+
+
+def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: str, a_name: str, b_name: str, config: Config) -> None:
+    latest_signal: dict[str, object] = result.get("latest_signal", {})  # type: ignore[assignment]
+    trades: pd.DataFrame = result["trades"]  # type: ignore[assignment]
+
+    st.subheader("Latest Trading Signal")
+
+    if not latest_signal:
+        st.info("目前資料不足，無法產生最新交易訊號。")
+        return
+
+    latest_date = pd.Timestamp(latest_signal["signal_date"])
+    latest_z = float(latest_signal["zscore"])
+    latest_beta = float(latest_signal["beta"])
+    a_close = float(latest_signal["a_close"])
+    b_close = float(latest_signal["b_close"])
+
+    open_positions = trades[trades["status"].eq("open")].copy() if not trades.empty and "status" in trades.columns else pd.DataFrame()
+    direction, a_sign, b_sign = entry_direction(latest_z, config.entry_z)
+    in_stop_zone = is_stop_zone(latest_z)
+
+    if direction is None:
+        signal_text = "無新進場訊號"
+        layer_text = "無"
+        a_action = "無"
+        b_action = "無"
+        a_signed_weight = np.nan
+        b_signed_weight = np.nan
+        a_suggested_shares = 0
+        b_suggested_shares = 0
+    elif in_stop_zone:
+        signal_text = f"有 {direction} 訊號，但 z-score 已進入停損區，不開新倉"
+        layer_text = "不開倉"
+        a_action = "無"
+        b_action = "無"
+        a_signed_weight = np.nan
+        b_signed_weight = np.nan
+        a_suggested_shares = 0
+        b_suggested_shares = 0
+    else:
+        same_direction_open_count = 0
+        if not open_positions.empty:
+            same_direction_open_count = int((open_positions["direction"].astype(str) == direction).sum())
+
+        if same_direction_open_count >= MAX_OPEN_POSITIONS_PER_DIRECTION:
+            signal_text = f"有 {direction} 訊號，但同方向已滿 {MAX_OPEN_POSITIONS_PER_DIRECTION} 層，不再加碼"
+            layer_text = f"已滿 {MAX_OPEN_POSITIONS_PER_DIRECTION} 層"
+            a_action = "無"
+            b_action = "無"
+            a_signed_weight = np.nan
+            b_signed_weight = np.nan
+            a_suggested_shares = 0
+            b_suggested_shares = 0
+        else:
+            weights = choose_weights(latest_beta)
+            a_signed_weight = float(weights["a_weight"]) * a_sign
+            b_signed_weight = float(weights["b_weight"]) * b_sign
+            a_notional = config.capital * float(weights["a_weight"])
+            b_notional = config.capital * float(weights["b_weight"])
+            a_suggested_shares = int(a_notional // a_close) if config.integer_shares else a_notional / a_close
+            b_suggested_shares = int(b_notional // b_close) if config.integer_shares else b_notional / b_close
+            layer_text = f"第 {same_direction_open_count + 1} 層 / 最多 {MAX_OPEN_POSITIONS_PER_DIRECTION} 層"
+            signal_text = f"新進場訊號：{direction}"
+            a_action = action_text(a_sign)
+            b_action = action_text(b_sign)
+
+    if open_positions.empty:
+        stop_loss_text = "無持倉"
+        exit_text = "無持倉"
+    else:
+        stop_loss_count = int(open_positions["direction"].astype(str).apply(lambda d: should_stop_loss(d, latest_z)).sum())
+        exit_count = int(open_positions["direction"].astype(str).apply(lambda d: should_exit(d, latest_z, config.exit_z)).sum())
+        stop_loss_text = "是" if stop_loss_count > 0 else "否"
+        exit_text = "是" if exit_count > 0 else "否"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("最新日期", latest_date.strftime("%Y-%m-%d"))
+    c2.metric("最新 z-score", f"{latest_z:.2f}")
+    c3.metric("是否停損", stop_loss_text)
+    c4.metric("是否出場", exit_text)
+
+    signal_df = pd.DataFrame([{
+        "今日訊號": signal_text,
+        "A 標的": format_stock_label(a_code, a_name),
+        "A 買賣方向": a_action,
+        "A signed weight": signed_pct(a_signed_weight),
+        "A 建議股數": format_shares(a_suggested_shares),
+        "B 標的": format_stock_label(b_code, b_name),
+        "B 買賣方向": b_action,
+        "B signed weight": signed_pct(b_signed_weight),
+        "B 建議股數": format_shares(b_suggested_shares),
+        "目前第幾層": layer_text,
+        "估算價格基準": "最新 Close；實際交易仍以隔天 Open 為準",
+    }])
+    st.dataframe(signal_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 目前理論持倉狀況")
+    if open_positions.empty:
+        st.info("截至最新資料，目前沒有未平倉部位。")
+        return
+
+    open_positions["a_signed_shares"] = open_positions["a_shares"].astype(float) * open_positions["a_sign"].astype(float)
+    open_positions["b_signed_shares"] = open_positions["b_shares"].astype(float) * open_positions["b_sign"].astype(float)
+    open_positions["a_signed_weight"] = open_positions["a_weight"].astype(float) * open_positions["a_sign"].astype(float)
+    open_positions["b_signed_weight"] = open_positions["b_weight"].astype(float) * open_positions["b_sign"].astype(float)
+    open_positions["current_zscore"] = latest_z
+    open_positions["current_action"] = open_positions["direction"].astype(str).apply(
+        lambda d: "停損出場" if should_stop_loss(d, latest_z) else ("正常出場" if should_exit(d, latest_z, config.exit_z) else "續抱")
+    )
+
+    total_a_signed_shares = float(open_positions["a_signed_shares"].sum())
+    total_b_signed_shares = float(open_positions["b_signed_shares"].sum())
+    total_open_pnl = float(open_positions["pnl"].sum()) if "pnl" in open_positions.columns else np.nan
+
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("未平倉筆數", f"{len(open_positions)}")
+    h2.metric(f"{a_code} 淨股數", format_shares(total_a_signed_shares))
+    h3.metric(f"{b_code} 淨股數", format_shares(total_b_signed_shares))
+    h4.metric("未實現 P&L", num(total_open_pnl))
+
+    display_cols = [
+        "direction", "entry_layer", "entry_date", "entry_zscore", "current_zscore",
+        "a_signed_shares", "b_signed_shares", "a_signed_weight", "b_signed_weight",
+        "pnl", "holding_days", "current_action",
+    ]
+    position_df = open_positions[[c for c in display_cols if c in open_positions.columns]].copy()
+    for col in ["entry_zscore", "current_zscore", "a_signed_weight", "b_signed_weight", "pnl"]:
+        if col in position_df.columns:
+            position_df[col] = position_df[col].astype(float).round(4)
+    st.dataframe(position_df, use_container_width=True, hide_index=True)
+
+
+def action_text(sign: int | float) -> str:
+    if sign > 0:
+        return "買進 / 做多"
+    if sign < 0:
+        return "賣出 / 放空"
+    return "無"
+
+
+def signed_pct(value: float) -> str:
+    if value is None or not np.isfinite(value):
+        return "無"
+    return f"{value:+.2%}"
+
+
+def format_shares(value: float | int) -> str:
+    if value is None or not np.isfinite(float(value)):
+        return "無"
+    if abs(float(value) - int(float(value))) < 1e-9:
+        return f"{int(value):,}"
+    return f"{float(value):,.2f}"
 
 
 def show_charts(result: dict[str, object], a_code: str, b_code: str, benchmark_name: str, config: Config) -> None:
