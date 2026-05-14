@@ -278,6 +278,8 @@ MAX_HALF_LIFE = 60
 MAX_TREND_STRENGTH = 1.0
 MIN_CROSSINGS_PER_YEAR = 4
 TOP_N = 10
+STOP_Z = 3.5
+MAX_OPEN_POSITIONS_PER_DIRECTION = 3
 
 
 @dataclass(frozen=True)
@@ -1118,7 +1120,10 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
 
         still_open: list[dict[str, object]] = []
         for position in open_positions:
-            if should_exit(str(position["direction"]), z, config.exit_z):
+            stop_loss = should_stop_loss(str(position["direction"]), z)
+            normal_exit = should_exit(str(position["direction"]), z, config.exit_z)
+
+            if stop_loss or normal_exit:
                 exit_cost = transaction_cost(
                     float(position["a_shares"]) * a_price,
                     "sell" if position["a_sign"] == 1 else "buy",
@@ -1140,6 +1145,7 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
                     "holding_days": (pd.Timestamp(exec_date) - pd.Timestamp(position["entry_date"])).days,
                     "pnl": pnl,
                     "return_on_gross_exposure": pnl / float(position["gross_exposure"]),
+                    "exit_reason": "z_stop_loss" if stop_loss else "normal_exit",
                     "status": "closed",
                 })
                 trades.append(position)
@@ -1150,6 +1156,16 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
 
         direction, a_sign, b_sign = entry_direction(z, config.entry_z)
         if direction is None:
+            continue
+
+        if is_stop_zone(z):
+            continue
+
+        same_direction_open_count = sum(
+            1 for position in open_positions
+            if str(position["direction"]) == direction
+        )
+        if same_direction_open_count >= MAX_OPEN_POSITIONS_PER_DIRECTION:
             continue
 
         weights = choose_weights(beta)
@@ -1191,6 +1207,7 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
             "b_entry_notional": b_entry_notional,
             "gross_exposure": a_entry_notional + b_entry_notional,
             "entry_cost": entry_cost,
+            "entry_layer": same_direction_open_count + 1,
             **weights,
         })
 
@@ -1213,12 +1230,12 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
                 "holding_days": (last_date - pd.Timestamp(position["entry_date"])).days,
                 "pnl": pnl,
                 "return_on_gross_exposure": pnl / float(position["gross_exposure"]),
+                "exit_reason": "still_open",
                 "status": "open",
             })
             trades.append(position)
 
     return pd.DataFrame(trades)
-
 
 def choose_weights(beta: float) -> dict[str, object]:
     ols_a = 1 / (1 + abs(beta))
@@ -1383,7 +1400,7 @@ def show_tables(result: dict[str, object]) -> None:
     if trades.empty:
         st.warning("這段期間沒有觸發交易。")
     else:
-        cols = ["direction", "entry_date", "exit_date", "entry_zscore", "exit_zscore", "a_weight", "b_weight", "gross_exposure", "pnl", "return_on_gross_exposure", "holding_days", "status"]
+        cols = ["direction", "entry_layer", "entry_date", "exit_date", "entry_zscore", "exit_zscore", "a_weight", "b_weight", "gross_exposure", "pnl", "return_on_gross_exposure", "holding_days", "exit_reason", "status"]
         st.dataframe(trades[[c for c in cols if c in trades.columns]], use_container_width=True)
         st.download_button("Download trades CSV", trades.to_csv(index=False).encode("utf-8-sig"), "pair_trades.csv", "text/csv")
     with st.expander("Signal data"):
@@ -1406,6 +1423,14 @@ def entry_direction(z: float, entry_z: float) -> tuple[str | None, int, int]:
 
 def should_exit(direction: str, z: float, exit_z: float) -> bool:
     return (direction == "long_spread" and z >= exit_z) or (direction == "short_spread" and z <= -exit_z)
+
+
+def should_stop_loss(direction: str, z: float) -> bool:
+    return (direction == "long_spread" and z <= -STOP_Z) or (direction == "short_spread" and z >= STOP_Z)
+
+
+def is_stop_zone(z: float) -> bool:
+    return abs(z) >= STOP_Z
 
 
 def transaction_cost(notional: float, side: str, config: Config) -> float:
