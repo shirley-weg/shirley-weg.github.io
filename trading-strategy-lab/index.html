@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trading Strategy Lab | Pair Trading Backtest</title>
+  <meta name="description" content="A Python-powered trading strategy library for pair trading backtests, Sharpe optimization, and future TXO/TX strategy research." />
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #607080;
+      --line: #dfe5ec;
+      --panel: #ffffff;
+      --bg: #f6f8fb;
+      --teal: #0f766e;
+      --teal-dark: #0b4f4a;
+      --amber: #c9861a;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Noto Sans TC", "Microsoft JhengHei", Arial, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.65;
+    }
+    a { color: inherit; text-decoration: none; }
+    .wrap { width: min(1120px, calc(100% - 40px)); margin: 0 auto; }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(246, 248, 251, 0.92);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--line);
+    }
+    nav {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+    .brand { font-weight: 800; letter-spacing: 0; }
+    .navlinks { display: flex; gap: 20px; color: var(--muted); font-size: 0.95rem; }
+    .navlinks a:hover { color: var(--teal); }
+
+    .hero { padding: 76px 0 48px; }
+    .eyebrow {
+      color: var(--teal);
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      font-size: .82rem;
+      margin-bottom: 14px;
+    }
+    h1 {
+      margin: 0;
+      max-width: 860px;
+      font-size: clamp(2.4rem, 6vw, 4.8rem);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+    .hero p {
+      max-width: 780px;
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 30px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 0 18px;
+      border-radius: 8px;
+      font-weight: 800;
+      border: 1px solid transparent;
+    }
+    .btn.primary { background: var(--teal); color: #fff; }
+    .btn.primary:hover { background: var(--teal-dark); }
+    .btn.secondary { background: #fff; border-color: var(--line); color: var(--ink); }
+    .btn.secondary:hover { border-color: var(--teal); color: var(--teal); }
+
+    .grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 28px; align-items: stretch; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 14px 38px rgba(30, 42, 58, .06);
+    }
+    .terminal { padding: 22px; min-height: 360px; }
+    .terminal-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 14px;
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-size: .92rem;
+    }
+    .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #fbfcfe; }
+    .metric span { display: block; color: var(--muted); font-size: .82rem; }
+    .metric strong { display: block; margin-top: 4px; font-size: 1.45rem; }
+    .chart {
+      height: 170px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background:
+        linear-gradient(to top, rgba(15,118,110,.12), transparent 62%),
+        repeating-linear-gradient(to bottom, transparent 0 41px, #e7edf3 42px),
+        #fff;
+      position: relative;
+      overflow: hidden;
+    }
+    .chart svg { width: 100%; height: 100%; display: block; }
+
+    section { padding: 54px 0; }
+    h2 { margin: 0 0 14px; font-size: clamp(1.8rem, 4vw, 2.7rem); line-height: 1.2; }
+    .section-copy { color: var(--muted); max-width: 760px; margin: 0 0 28px; }
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .card { padding: 22px; }
+    .card h3 { margin: 0 0 8px; font-size: 1.1rem; }
+    .card p { margin: 0; color: var(--muted); font-size: .96rem; }
+    .split { display: grid; grid-template-columns: .85fr 1.15fr; gap: 22px; align-items: start; }
+    .list { display: grid; gap: 12px; }
+    .item { padding: 18px; display: grid; gap: 6px; }
+    .item strong { color: var(--teal-dark); }
+    code { background: #edf2f7; border: 1px solid #dbe3eb; border-radius: 6px; padding: 2px 6px; }
+    pre { overflow-x: auto; background: #111827; color: #d1fae5; border-radius: 8px; padding: 18px; }
+    footer { border-top: 1px solid var(--line); color: var(--muted); padding: 28px 0; font-size: .92rem; }
+
+    @media (max-width: 860px) {
+      .navlinks { display: none; }
+      .grid, .cards, .split, .metric-grid { grid-template-columns: 1fr; }
+      .hero { padding-top: 48px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <nav class="wrap">
+      <a class="brand" href="#">Trading Strategy Lab</a>
+      <div class="navlinks">
+        <a href="#features">功能</a>
+        <a href="#architecture">架構</a>
+        <a href="#deploy">部署</a>
+      </div>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap grid">
+        <div>
+          <div class="eyebrow">Python strategy library on GitHub</div>
+          <h1>交易策略庫與 Pair Trading 回測入口</h1>
+          <p>
+            這個頁面是策略庫的 GitHub Pages 入口。核心 Python app 已放在同一個 repo 的
+            <code>trading-strategy-lab/streamlit_app.py</code>，可用 Streamlit Cloud 部署成可互動網站，
+            讓你選擇標的、策略、回測時間、權重最佳化方法與交易成本。
+          </p>
+          <div class="actions">
+            <a class="btn primary" href="https://github.com/shirley-weg/shirley-weg.github.io/tree/main/trading-strategy-lab" target="_blank" rel="noreferrer">查看 GitHub 原始碼</a>
+            <a class="btn secondary" href="#deploy">部署 Streamlit App</a>
+          </div>
+        </div>
+
+        <div class="panel terminal" aria-label="Backtest dashboard preview">
+          <div class="terminal-top">
+            <span>2886 兆豐金 / 2891 中信金</span>
+            <span>Rolling max-Sharpe</span>
+          </div>
+          <div class="metric-grid">
+            <div class="metric"><span>Total Return</span><strong>8.31%</strong></div>
+            <div class="metric"><span>Sharpe</span><strong>0.46</strong></div>
+            <div class="metric"><span>Max DD</span><strong>-8.48%</strong></div>
+          </div>
+          <div class="chart">
+            <svg viewBox="0 0 680 170" preserveAspectRatio="none" role="img" aria-label="Equity curve preview">
+              <polyline fill="none" stroke="#0f766e" stroke-width="4" points="0,132 45,128 90,121 135,130 180,100 225,86 270,92 315,70 360,76 405,55 450,62 495,41 540,47 585,26 640,31 680,18" />
+              <polyline fill="none" stroke="#c9861a" stroke-width="3" stroke-dasharray="8 8" points="0,118 45,112 90,108 135,104 180,96 225,91 270,82 315,75 360,70 405,66 450,59 495,53 540,46 585,39 640,35 680,30" />
+            </svg>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="wrap">
+        <h2>目前已整理好的功能</h2>
+        <p class="section-copy">第一版先把 notebook 裡的 pair trading 策略整理成可重用的網站 app，後續可以把 TXO VIX-like、期貨策略、投組最佳化與 rebalancing 加進同一個策略庫。</p>
+        <div class="cards">
+          <div class="panel card">
+            <h3>Pair Trading Backtest</h3>
+            <p>使用 rolling OLS 估計 spread 與 z-score，沿用 t 日 Close 產生訊號、t+1 日 Open 進出場。</p>
+          </div>
+          <div class="panel card">
+            <h3>Sharpe 權重最佳化</h3>
+            <p>除了 OLS hedge ratio，也可用 rolling grid search 最大化歷史 Sharpe，決定兩檔資產 gross weight。</p>
+          </div>
+          <div class="panel card">
+            <h3>互動圖表與交易明細</h3>
+            <p>呈現權益曲線、benchmark 比較、drawdown、spread signal、entry weights 與 trade P&amp;L。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="wrap split">
+        <div>
+          <h2>架構方向</h2>
+          <p class="section-copy">GitHub Pages 負責這個靜態入口頁；真正的 Python 回測服務需要 Streamlit Cloud、Render 或 Railway 這類可執行 Python 的服務。</p>
+        </div>
+        <div class="list">
+          <div class="panel item"><strong>資料來源</strong><span>股票使用 yfinance；TX/TXO 預留 TAIFEX adapter。</span></div>
+          <div class="panel item"><strong>策略層</strong><span>每個策略拆成可重用函式，未來可加入 portfolio optimization 與 rebalance frequency。</span></div>
+          <div class="panel item"><strong>展示層</strong><span>Streamlit app 提供參數輸入、圖表與 CSV 下載。</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="deploy">
+      <div class="wrap">
+        <h2>部署方式</h2>
+        <p class="section-copy">要讓使用者真的在網頁上按鈕跑回測，請把下列 main file 指到 Streamlit Cloud。GitHub Pages 本身不能執行 Python。</p>
+        <pre><code>Repository: shirley-weg/shirley-weg.github.io
+Branch: main
+Main file path: trading-strategy-lab/streamlit_app.py</code></pre>
+        <div class="actions">
+          <a class="btn primary" href="https://share.streamlit.io/" target="_blank" rel="noreferrer">前往 Streamlit Cloud</a>
+          <a class="btn secondary" href="https://github.com/shirley-weg/shirley-weg.github.io/blob/main/trading-strategy-lab/streamlit_app.py" target="_blank" rel="noreferrer">查看 streamlit_app.py</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">Trading Strategy Lab. Research use only. Not investment advice.</div>
+  </footer>
+</body>
+</html>
