@@ -1203,34 +1203,36 @@ def show_charts(result: dict[str, object], a_code: str, b_code: str, benchmark_n
     equity: pd.DataFrame = result["equity"]  # type: ignore[assignment]
     trades: pd.DataFrame = result["trades"]  # type: ignore[assignment]
     weights: pd.DataFrame = result["weights"]  # type: ignore[assignment]
-    left, right = st.columns([0.58, 0.42])
-    with left:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=price_history.index, y=price_history[a_code], name=a_code, mode="lines"))
-        fig.add_trace(go.Scatter(x=price_history.index, y=price_history[b_code], name=b_code, mode="lines"))
-        fig.update_layout(title="Historical Close Price", template="plotly_white", height=370, hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-    with right:
-        st.plotly_chart(spread_chart(signals, config), use_container_width=True)
-    left, right = st.columns([0.58, 0.42])
-    with left:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=comparison.index, y=comparison["strategy_cumulative_return"], name="Strategy", mode="lines"))
-        if "benchmark_cumulative_return" in comparison:
-            fig.add_trace(go.Scatter(x=comparison.index, y=comparison["benchmark_cumulative_return"], name=benchmark_name, mode="lines"))
-        fig.update_layout(title="Cumulative Return vs Benchmark", template="plotly_white", height=350, yaxis_tickformat=".1%", hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-    with right:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=equity.index, y=equity["drawdown"], name="Drawdown", mode="lines", fill="tozeroy"))
-        fig.update_layout(title="Drawdown", template="plotly_white", height=350, yaxis_tickformat=".1%", hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-    left, right = st.columns(2)
-    with left:
-        st.plotly_chart(trade_chart(trades), use_container_width=True)
-    with right:
-        st.plotly_chart(weight_chart(weights), use_container_width=True)
 
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=price_history.index, y=price_history[a_code], name=a_code, mode="lines"))
+    fig.add_trace(go.Scatter(x=price_history.index, y=price_history[b_code], name=b_code, mode="lines"))
+    fig.update_layout(title="Historical Close Price", template="plotly_white", height=520, hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig = spread_chart(signals, config)
+    fig.update_layout(height=520)
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=comparison.index, y=comparison["strategy_cumulative_return"], name="Strategy", mode="lines"))
+    if "benchmark_cumulative_return" in comparison:
+        fig.add_trace(go.Scatter(x=comparison.index, y=comparison["benchmark_cumulative_return"], name=benchmark_name, mode="lines"))
+    fig.update_layout(title="Cumulative Return vs Benchmark", template="plotly_white", height=520, yaxis_tickformat=".1%", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=equity.index, y=equity["drawdown"], name="Drawdown", mode="lines", fill="tozeroy"))
+    fig.update_layout(title="Drawdown", template="plotly_white", height=520, yaxis_tickformat=".1%", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig = trade_chart(trades)
+    fig.update_layout(height=500)
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig = weight_chart(weights)
+    fig.update_layout(height=500)
+    st.plotly_chart(fig, use_container_width=True)
 
 def spread_chart(signals: pd.DataFrame, config: Config) -> go.Figure:
     fig = go.Figure()
