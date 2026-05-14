@@ -1096,7 +1096,7 @@ def run_backtest(open_df: pd.DataFrame, close_df: pd.DataFrame, benchmark: pd.Se
     comparison = return_comparison(equity, benchmark, config.capital)
     summary = summarize(equity, trades, config.capital)
     price_history = full_close.loc[(full_close.index >= start) & (full_close.index <= end), [a_code, b_code]]
-    weight_cols = ["entry_date", "a_weight", "b_weight", "weight_method"]
+    weight_cols = ["entry_date", "a_weight", "b_weight", "a_sign", "b_sign", "direction", "weight_method"]
     weights = trades[weight_cols].copy() if not trades.empty else pd.DataFrame(columns=weight_cols)
     return {"signals": signals, "trades": trades, "equity": equity, "comparison": comparison, "summary": summary, "price_history": price_history, "weights": weights}
 
@@ -1385,11 +1385,41 @@ def trade_chart(trades: pd.DataFrame) -> go.Figure:
 def weight_chart(weights: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     if weights.empty:
-        fig.update_layout(title="Entry Weights", template="plotly_white", height=320)
+        fig.update_layout(title="Signed Entry Weights", template="plotly_white", height=320)
         return fig
-    fig.add_trace(go.Scatter(x=weights["entry_date"], y=weights["a_weight"], name="A weight", mode="lines+markers"))
-    fig.add_trace(go.Scatter(x=weights["entry_date"], y=weights["b_weight"], name="B weight", mode="lines+markers"))
-    fig.update_layout(title="Entry Weights", template="plotly_white", height=320, yaxis_tickformat=".0%", hovermode="x unified")
+
+    signed_weights = weights.copy()
+    signed_weights["a_signed_weight"] = signed_weights["a_weight"] * signed_weights["a_sign"]
+    signed_weights["b_signed_weight"] = signed_weights["b_weight"] * signed_weights["b_sign"]
+
+    fig.add_trace(go.Scatter(
+        x=signed_weights["entry_date"],
+        y=signed_weights["a_signed_weight"],
+        name="A signed weight",
+        mode="lines+markers",
+        customdata=signed_weights[["direction", "a_weight"]],
+        hovertemplate=(
+            "Date: %{x}<br>"
+            "Direction: %{customdata[0]}<br>"
+            "A signed weight: %{y:.0%}<br>"
+            "A gross weight: %{customdata[1]:.0%}<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=signed_weights["entry_date"],
+        y=signed_weights["b_signed_weight"],
+        name="B signed weight",
+        mode="lines+markers",
+        customdata=signed_weights[["direction", "b_weight"]],
+        hovertemplate=(
+            "Date: %{x}<br>"
+            "Direction: %{customdata[0]}<br>"
+            "B signed weight: %{y:.0%}<br>"
+            "B gross weight: %{customdata[1]:.0%}<extra></extra>"
+        ),
+    ))
+    fig.add_hline(y=0, line_dash="dash", line_color="#6b7280")
+    fig.update_layout(title="Signed Entry Weights", template="plotly_white", height=320, yaxis_tickformat=".0%", hovermode="x unified")
     return fig
 
 
