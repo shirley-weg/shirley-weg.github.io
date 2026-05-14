@@ -10,16 +10,16 @@ import streamlit as st
 
 
 PRESET_PAIRS = [
-    ("3006", "晶豪科", "4967", "十銓", "semiconductor"),
-    ("2344", "華邦電", "2451", "創見", "semiconductor"),
-    ("2369", "菱生", "8150", "南茂", "semiconductor"),
-    ("3189", "景碩", "6271", "同欣電", "semiconductor"),
-    ("2329", "華泰", "2449", "京元電子", "semiconductor"),
-    ("2836", "高雄銀", "2838", "聯邦銀", "financial"),
-    ("2886", "兆豐金", "2891", "中信金", "financial"),
-    ("2880", "華南金", "2891", "中信金", "financial"),
-    ("2801", "彰銀", "2838", "聯邦銀", "financial"),
-    ("2886", "兆豐金", "2892", "第一金", "financial"),
+    ("3006", "晶豪科", "4967", "十銓"),
+    ("2344", "華邦電", "2451", "創見"),
+    ("2369", "菱生", "8150", "南茂"),
+    ("3189", "景碩", "6271", "同欣電"),
+    ("2329", "華泰", "2449", "京元電子"),
+    ("2836", "高雄銀", "2838", "聯邦銀"),
+    ("2886", "兆豐金", "2891", "中信金"),
+    ("2880", "華南金", "2891", "中信金"),
+    ("2801", "彰銀", "2838", "聯邦銀"),
+    ("2886", "兆豐金", "2892", "第一金"),
 ]
 
 KNOWN_NAMES = {
@@ -46,8 +46,7 @@ class Config:
     weight_step: float
 
 
-st.set_page_config(page_title="Trading Strategy Lab", layout="wide", page_icon="chart_with_upwards_trend")
-
+st.set_page_config(page_title="Trading Strategy Lab", layout="wide")
 st.markdown(
     """
     <style>
@@ -65,19 +64,15 @@ st.markdown(
 def main() -> None:
     st.title("Trading Strategy Lab")
     st.caption("Pair trading backtest with rolling hedge ratio and Sharpe-based leg weights.")
-
     settings = sidebar_settings()
     tab_backtest, tab_notes = st.tabs(["策略回測", "部署與限制"])
-
     with tab_backtest:
         render_backtest(settings)
-
     with tab_notes:
         st.subheader("GitHub Pages 與 Python app")
         st.write(
             "GitHub Pages 只能顯示靜態網頁，不能直接執行 Python、yfinance 或 TAIFEX 抓資料。"
-            "這個 repo 已包含 Streamlit app；請用 Streamlit Cloud 選擇 "
-            "`trading-strategy-lab/streamlit_app.py` 作為 main file，才能讓使用者在網頁上即時跑回測。"
+            "這份 Streamlit app 需要部署到 Streamlit Cloud、Render 或 Railway 這類 Python hosting。"
         )
         st.code(
             "Repository: shirley-weg/shirley-weg.github.io\n"
@@ -90,11 +85,10 @@ def main() -> None:
 def sidebar_settings() -> dict[str, object]:
     st.sidebar.header("回測設定")
     mode = st.sidebar.radio("標的來源", ["Notebook preset", "自訂 pair"], horizontal=True)
-    labels = [f"{a} {an} / {b} {bn}" for a, an, b, bn, _ in PRESET_PAIRS]
-
+    labels = [f"{a} {an} / {b} {bn}" for a, an, b, bn in PRESET_PAIRS]
     if mode == "Notebook preset":
         label = st.sidebar.selectbox("Pair", labels, index=6)
-        a_code, a_name, b_code, b_name, _ = PRESET_PAIRS[labels.index(label)]
+        a_code, a_name, b_code, b_name = PRESET_PAIRS[labels.index(label)]
     else:
         col_a, col_b = st.sidebar.columns(2)
         with col_a:
@@ -105,8 +99,8 @@ def sidebar_settings() -> dict[str, object]:
             b_name = st.text_input("B name", value=KNOWN_NAMES.get(b_code, ""))
 
     today = pd.Timestamp.today().date()
-    default_start = pd.Timestamp(today) - pd.DateOffset(years=2)
-    start = st.sidebar.date_input("Backtest start", value=default_start.date())
+    start_default = (pd.Timestamp(today) - pd.DateOffset(years=2)).date()
+    start = st.sidebar.date_input("Backtest start", value=start_default)
     end = st.sidebar.date_input("Backtest end", value=today)
     suffix = st.sidebar.text_input("Yahoo suffix", value=".TW")
     benchmark = st.sidebar.text_input("Benchmark", value="^TWII")
@@ -176,7 +170,6 @@ def render_backtest(settings: dict[str, object]) -> None:
     if not run:
         st.info("調整左側設定後按 Run backtest。")
         return
-
     if start >= end:
         st.error("Backtest start 必須早於 end。")
         return
@@ -263,11 +256,7 @@ def extract_price_field(raw: pd.DataFrame, field: str, codes: list[str], suffix:
             out = raw[field].copy()
         else:
             out = pd.concat(
-                {
-                    ticker: raw[(ticker, field)]
-                    for ticker in raw.columns.get_level_values(0).unique()
-                    if (ticker, field) in raw.columns
-                },
+                {ticker: raw[(ticker, field)] for ticker in raw.columns.get_level_values(0).unique() if (ticker, field) in raw.columns},
                 axis=1,
             )
     else:
@@ -290,7 +279,6 @@ def normalize_index(obj: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
 def rolling_spread_signal(close_df: pd.DataFrame, a_code: str, b_code: str, lookback: int) -> pd.DataFrame:
     logp = np.log(close_df[[a_code, b_code]].dropna())
     rows: list[dict[str, object]] = []
-
     for i in range(lookback, len(logp) - 1):
         signal_date = logp.index[i]
         exec_date = logp.index[i + 1]
@@ -303,39 +291,17 @@ def rolling_spread_signal(close_df: pd.DataFrame, a_code: str, b_code: str, look
             continue
         spread = float(logp.iloc[i][a_code] - alpha - beta * logp.iloc[i][b_code])
         zscore = (spread - spread_mean) / spread_std
-        rows.append(
-            {
-                "signal_date": signal_date,
-                "exec_date": exec_date,
-                "alpha": alpha,
-                "beta": beta,
-                "spread": spread,
-                "spread_mean": spread_mean,
-                "spread_std": spread_std,
-                "zscore": zscore,
-            }
-        )
-
+        rows.append({"signal_date": signal_date, "exec_date": exec_date, "alpha": alpha, "beta": beta, "spread": spread, "spread_mean": spread_mean, "spread_std": spread_std, "zscore": zscore})
     if not rows:
         return pd.DataFrame(columns=["exec_date", "alpha", "beta", "spread", "spread_mean", "spread_std", "zscore"]).rename_axis("signal_date")
     return pd.DataFrame(rows).set_index("signal_date")
 
 
-def run_backtest(
-    open_df: pd.DataFrame,
-    close_df: pd.DataFrame,
-    benchmark: pd.Series,
-    a_code: str,
-    b_code: str,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-    config: Config,
-) -> dict[str, object]:
+def run_backtest(open_df: pd.DataFrame, close_df: pd.DataFrame, benchmark: pd.Series, a_code: str, b_code: str, start: pd.Timestamp, end: pd.Timestamp, config: Config) -> dict[str, object]:
     full_close = close_df.loc[close_df.index <= end].copy()
     full_open = open_df.loc[open_df.index <= end].copy()
     if len(full_close) <= config.lookback + 5:
         raise ValueError("The selected date range is too short for this lookback.")
-
     signals = rolling_spread_signal(full_close, a_code, b_code, config.lookback)
     signals = signals.loc[(signals.index >= start) & (signals.index <= end)].copy()
     trades = backtest_pair(signals, full_open, full_close, a_code, b_code, config)
@@ -346,14 +312,14 @@ def run_backtest(
     comparison = return_comparison(equity, benchmark, config.capital)
     summary = summarize(equity, trades, config.capital)
     price_history = full_close.loc[(full_close.index >= start) & (full_close.index <= end), [a_code, b_code]]
-    weights = trades[["entry_date", "a_weight", "b_weight", "optimizer_sharpe", "weight_method"]].copy() if not trades.empty else pd.DataFrame()
+    weight_cols = ["entry_date", "a_weight", "b_weight", "optimizer_sharpe", "weight_method"]
+    weights = trades[weight_cols].copy() if not trades.empty else pd.DataFrame(columns=weight_cols)
     return {"signals": signals, "trades": trades, "equity": equity, "comparison": comparison, "summary": summary, "price_history": price_history, "weights": weights}
 
 
 def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.DataFrame, a_code: str, b_code: str, config: Config) -> pd.DataFrame:
     trades: list[dict[str, object]] = []
     current: dict[str, object] | None = None
-
     for signal_date, row in signals.iterrows():
         exec_date = row["exec_date"]
         if exec_date not in open_df.index:
@@ -364,7 +330,6 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
         beta = float(row["beta"])
         if not np.isfinite(beta) or beta <= 0:
             continue
-
         if current is None:
             direction, a_sign, b_sign = entry_direction(z, config.entry_z)
             if direction is None:
@@ -372,79 +337,27 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
             weights = choose_weights(signals, close_df, signal_date, beta, config, a_code, b_code)
             a_notional = config.capital * float(weights["a_weight"])
             b_notional = config.capital * float(weights["b_weight"])
-            if config.integer_shares:
-                a_shares = int(a_notional // a_price)
-                b_shares = int(b_notional // b_price)
-            else:
-                a_shares = a_notional / a_price
-                b_shares = b_notional / b_price
+            a_shares = int(a_notional // a_price) if config.integer_shares else a_notional / a_price
+            b_shares = int(b_notional // b_price) if config.integer_shares else b_notional / b_price
             if a_shares <= 0 or b_shares <= 0:
                 continue
-
             a_entry_notional = float(a_shares * a_price)
             b_entry_notional = float(b_shares * b_price)
             entry_cost = transaction_cost(a_entry_notional, "buy" if a_sign == 1 else "sell", config) + transaction_cost(b_entry_notional, "buy" if b_sign == 1 else "sell", config)
-            current = {
-                "direction": direction,
-                "entry_signal_date": signal_date,
-                "entry_date": exec_date,
-                "entry_zscore": z,
-                "entry_beta": beta,
-                "a_sign": a_sign,
-                "b_sign": b_sign,
-                "a_entry_price": a_price,
-                "b_entry_price": b_price,
-                "a_shares": a_shares,
-                "b_shares": b_shares,
-                "a_entry_notional": a_entry_notional,
-                "b_entry_notional": b_entry_notional,
-                "gross_exposure": a_entry_notional + b_entry_notional,
-                "entry_cost": entry_cost,
-                **weights,
-            }
+            current = {"a_code": a_code, "b_code": b_code, "direction": direction, "entry_signal_date": signal_date, "entry_date": exec_date, "entry_zscore": z, "entry_beta": beta, "a_sign": a_sign, "b_sign": b_sign, "a_entry_price": a_price, "b_entry_price": b_price, "a_shares": a_shares, "b_shares": b_shares, "a_entry_notional": a_entry_notional, "b_entry_notional": b_entry_notional, "gross_exposure": a_entry_notional + b_entry_notional, "entry_cost": entry_cost, **weights}
         else:
             if not should_exit(str(current["direction"]), z, config.exit_z):
                 continue
             exit_cost = transaction_cost(float(current["a_shares"]) * a_price, "sell" if current["a_sign"] == 1 else "buy", config) + transaction_cost(float(current["b_shares"]) * b_price, "sell" if current["b_sign"] == 1 else "buy", config)
             pnl = trade_pnl(current, a_price, b_price) - exit_cost
-            current.update(
-                {
-                    "exit_signal_date": signal_date,
-                    "exit_date": exec_date,
-                    "exit_zscore": z,
-                    "a_exit_price": a_price,
-                    "b_exit_price": b_price,
-                    "exit_cost": exit_cost,
-                    "total_cost": float(current["entry_cost"]) + exit_cost,
-                    "holding_days": (pd.Timestamp(exec_date) - pd.Timestamp(current["entry_date"])).days,
-                    "pnl": pnl,
-                    "return_on_gross_exposure": pnl / float(current["gross_exposure"]),
-                    "status": "closed",
-                }
-            )
+            current.update({"exit_signal_date": signal_date, "exit_date": exec_date, "exit_zscore": z, "a_exit_price": a_price, "b_exit_price": b_price, "exit_cost": exit_cost, "total_cost": float(current["entry_cost"]) + exit_cost, "holding_days": (pd.Timestamp(exec_date) - pd.Timestamp(current["entry_date"])).days, "pnl": pnl, "return_on_gross_exposure": pnl / float(current["gross_exposure"]), "status": "closed"})
             trades.append(current)
             current = None
-
     if current is not None:
         last_date = close_df.index[-1]
         pnl = trade_pnl(current, float(close_df.loc[last_date, a_code]), float(close_df.loc[last_date, b_code]))
-        current.update(
-            {
-                "exit_signal_date": pd.NaT,
-                "exit_date": pd.NaT,
-                "exit_zscore": np.nan,
-                "a_exit_price": np.nan,
-                "b_exit_price": np.nan,
-                "exit_cost": 0.0,
-                "total_cost": float(current["entry_cost"]),
-                "holding_days": (last_date - pd.Timestamp(current["entry_date"])).days,
-                "pnl": pnl,
-                "return_on_gross_exposure": pnl / float(current["gross_exposure"]),
-                "status": "open",
-            }
-        )
+        current.update({"exit_signal_date": pd.NaT, "exit_date": pd.NaT, "exit_zscore": np.nan, "a_exit_price": np.nan, "b_exit_price": np.nan, "exit_cost": 0.0, "total_cost": float(current["entry_cost"]), "holding_days": (last_date - pd.Timestamp(current["entry_date"])).days, "pnl": pnl, "return_on_gross_exposure": pnl / float(current["gross_exposure"]), "status": "open"})
         trades.append(current)
-
     return pd.DataFrame(trades)
 
 
@@ -452,12 +365,10 @@ def choose_weights(signals: pd.DataFrame, close_df: pd.DataFrame, signal_date: p
     ols_a = 1 / (1 + abs(beta))
     if config.weight_mode != "max_sharpe":
         return {"a_weight": float(ols_a), "b_weight": float(1 - ols_a), "optimizer_sharpe": np.nan, "weight_method": "ols_beta"}
-
     hist = signals.loc[signals.index < signal_date].tail(config.opt_lookback)
     returns = close_df[[a_code, b_code]].pct_change().reindex(hist.index).dropna()
     if len(returns) < 40:
         return {"a_weight": float(ols_a), "b_weight": float(1 - ols_a), "optimizer_sharpe": np.nan, "weight_method": "ols_fallback"}
-
     z = hist["zscore"].reindex(returns.index)
     positions = signal_positions(z, config.entry_z, config.exit_z).shift(1).fillna(0)
     best_w = None
@@ -479,31 +390,21 @@ def build_equity(trades: pd.DataFrame, close_df: pd.DataFrame, start: pd.Timesta
     pnl_curve = pd.Series(0.0, index=dates, name="cumulative_pnl")
     if trades.empty:
         return pd.DataFrame({"cumulative_pnl": pnl_curve, "equity": capital + pnl_curve})
-
     for _, tr in trades.iterrows():
         entry_date = pd.Timestamp(tr["entry_date"])
+        a_code = str(tr["a_code"])
+        b_code = str(tr["b_code"])
         if tr["status"] == "closed":
             exit_date = pd.Timestamp(tr["exit_date"])
             active = dates[(dates >= entry_date) & (dates < exit_date)]
             for day in active:
-                pnl_curve.loc[day] += trade_pnl(tr, float(close_df.loc[day, tr_name(tr, "a")]), float(close_df.loc[day, tr_name(tr, "b")]))
+                pnl_curve.loc[day] += trade_pnl(tr, float(close_df.loc[day, a_code]), float(close_df.loc[day, b_code]))
             pnl_curve.loc[dates >= exit_date] += float(tr["pnl"])
         else:
             active = dates[dates >= entry_date]
             for day in active:
-                pnl_curve.loc[day] += trade_pnl(tr, float(close_df.loc[day, tr_name(tr, "a")]), float(close_df.loc[day, tr_name(tr, "b")]))
+                pnl_curve.loc[day] += trade_pnl(tr, float(close_df.loc[day, a_code]), float(close_df.loc[day, b_code]))
     return pd.DataFrame({"cumulative_pnl": pnl_curve, "equity": capital + pnl_curve})
-
-
-def tr_name(tr: pd.Series, side: str) -> str:
-    # This app stores only the first two columns in price data; infer from share fields if missing.
-    # The caller passes trades generated for the same active pair, so fallback is handled in chart data.
-    if side == "a" and "a_code" in tr:
-        return str(tr["a_code"])
-    if side == "b" and "b_code" in tr:
-        return str(tr["b_code"])
-    # Backward-compatible fallback for this compact file.
-    return str(st.session_state.get(f"_{side}_code", ""))
 
 
 def return_comparison(equity: pd.DataFrame, benchmark: pd.Series, capital: float) -> pd.DataFrame:
@@ -512,44 +413,20 @@ def return_comparison(equity: pd.DataFrame, benchmark: pd.Series, capital: float
         return pd.DataFrame({"strategy_cumulative_return": strategy})
     bench = benchmark.reindex(strategy.index).ffill().dropna()
     strategy = strategy.reindex(bench.index).ffill().fillna(0)
-    return pd.DataFrame(
-        {
-            "strategy_cumulative_return": strategy,
-            "benchmark_cumulative_return": bench / bench.iloc[0] - 1,
-        }
-    )
+    return pd.DataFrame({"strategy_cumulative_return": strategy, "benchmark_cumulative_return": bench / bench.iloc[0] - 1})
 
 
 def summarize(equity: pd.DataFrame, trades: pd.DataFrame, capital: float) -> dict[str, float]:
     returns = equity["daily_return"].replace([np.inf, -np.inf], np.nan).dropna()
     ending = float(equity["equity"].iloc[-1])
-    total_return = ending / capital - 1
     closed = trades[trades["status"].eq("closed")] if not trades.empty else trades
     wins = closed[closed["pnl"] > 0] if not closed.empty else closed
-    win_rate = len(wins) / len(closed) if len(closed) else np.nan
     years = max((equity.index[-1] - equity.index[0]).days / 365.25, 1 / 365.25)
-    return {
-        "total_return": total_return,
-        "ending_equity": ending,
-        "cagr": (ending / capital) ** (1 / years) - 1 if capital > 0 else np.nan,
-        "volatility": returns.std(ddof=1) * np.sqrt(252) if len(returns) else np.nan,
-        "sharpe": sharpe(returns),
-        "max_drawdown": float(equity["drawdown"].min()),
-        "trade_count": float(len(trades)),
-        "win_rate": float(win_rate),
-        "total_pnl": ending - capital,
-    }
+    return {"total_return": ending / capital - 1, "ending_equity": ending, "cagr": (ending / capital) ** (1 / years) - 1, "volatility": returns.std(ddof=1) * np.sqrt(252) if len(returns) else np.nan, "sharpe": sharpe(returns), "max_drawdown": float(equity["drawdown"].min()), "trade_count": float(len(trades)), "win_rate": float(len(wins) / len(closed)) if len(closed) else np.nan, "total_pnl": ending - capital}
 
 
 def show_summary(summary: dict[str, float]) -> None:
-    metrics = [
-        ("Total Return", pct(summary["total_return"])),
-        ("Sharpe", num(summary["sharpe"])),
-        ("Max DD", pct(summary["max_drawdown"])),
-        ("CAGR", pct(summary["cagr"])),
-        ("Win Rate", pct(summary["win_rate"])),
-        ("Trades", f"{int(summary['trade_count'])}"),
-    ]
+    metrics = [("Total Return", pct(summary["total_return"])), ("Sharpe", num(summary["sharpe"])), ("Max DD", pct(summary["max_drawdown"])), ("CAGR", pct(summary["cagr"])), ("Win Rate", pct(summary["win_rate"])), ("Trades", f"{int(summary['trade_count'])}")]
     for i in range(0, len(metrics), 3):
         cols = st.columns(3)
         for col, (label, value) in zip(cols, metrics[i : i + 3]):
@@ -563,7 +440,6 @@ def show_charts(result: dict[str, object], a_code: str, b_code: str, benchmark_n
     equity: pd.DataFrame = result["equity"]  # type: ignore[assignment]
     trades: pd.DataFrame = result["trades"]  # type: ignore[assignment]
     weights: pd.DataFrame = result["weights"]  # type: ignore[assignment]
-
     left, right = st.columns([0.58, 0.42])
     with left:
         fig = go.Figure()
@@ -573,7 +449,6 @@ def show_charts(result: dict[str, object], a_code: str, b_code: str, benchmark_n
         st.plotly_chart(fig, use_container_width=True)
     with right:
         st.plotly_chart(spread_chart(signals, config), use_container_width=True)
-
     left, right = st.columns([0.58, 0.42])
     with left:
         fig = go.Figure()
@@ -587,7 +462,6 @@ def show_charts(result: dict[str, object], a_code: str, b_code: str, benchmark_n
         fig.add_trace(go.Scatter(x=equity.index, y=equity["drawdown"], name="Drawdown", mode="lines", fill="tozeroy"))
         fig.update_layout(title="Drawdown", template="plotly_white", height=350, yaxis_tickformat=".1%", hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
-
     left, right = st.columns(2)
     with left:
         st.plotly_chart(trade_chart(trades), use_container_width=True)
