@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import html
+import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 
@@ -55,6 +58,24 @@ st.markdown(
       background: #fff; border: 1px solid #e6e8ef; border-radius: 8px;
       padding: 14px 16px; box-shadow: 0 1px 2px rgba(20, 29, 47, 0.04);
     }
+    .strategy-card {
+      background: #ffffff;
+      border: 1px solid #e6e8ef;
+      border-radius: 12px;
+      padding: 24px 26px;
+      box-shadow: 0 1px 2px rgba(20, 29, 47, 0.04);
+      margin-top: 16px;
+      margin-bottom: 12px;
+    }
+    .strategy-card h3 {
+      margin-top: 0;
+      margin-bottom: 8px;
+    }
+    .strategy-card p {
+      color: #607080;
+      margin-bottom: 0;
+      line-height: 1.7;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -62,30 +83,58 @@ st.markdown(
 
 
 def main() -> None:
+    if "selected_strategy" not in st.session_state:
+        st.session_state["selected_strategy"] = None
+
+    if st.session_state["selected_strategy"] is None:
+        render_strategy_selector()
+        return
+
     st.title("Trading Strategy Lab")
     st.caption("Pair trading backtest with rolling hedge ratio and Sharpe-based leg weights.")
     settings = sidebar_settings()
-    tab_backtest, tab_notes = st.tabs(["策略回測", "部署與限制"])
-    with tab_backtest:
-        render_backtest(settings)
-    with tab_notes:
-        st.subheader("GitHub Pages 與 Python app")
-        st.write(
-            "GitHub Pages 只能顯示靜態網頁，不能直接執行 Python、yfinance 或 TAIFEX 抓資料。"
-            "這份 Streamlit app 需要部署到 Streamlit Cloud、Render 或 Railway 這類 Python hosting。"
-        )
-        st.code(
-            "Repository: shirley-weg/shirley-weg.github.io\n"
-            "Branch: main\n"
-            "Main file path: trading-strategy-lab/streamlit_app.py",
-            language="text",
-        )
+    render_backtest(settings)
+
+
+def render_strategy_selector() -> None:
+    st.title("Trading Strategy Lab")
+    st.caption("請先選擇要使用的交易策略。")
+
+    st.markdown(
+        """
+        <div class="strategy-card">
+          <h3>策略1：Pair Trading 回測</h3>
+          <p>
+            使用 rolling OLS 估計 spread 與 z-score，並可選擇 OLS hedge ratio
+            或 rolling max-Sharpe grid 作為雙邊部位權重。
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        if st.button("進入策略1", type="primary", use_container_width=True):
+            st.session_state["selected_strategy"] = "strategy_1"
+            st.rerun()
+
+    st.info("目前已開放策略1；後續可以在這個入口頁繼續新增策略2、策略3。")
 
 
 def sidebar_settings() -> dict[str, object]:
+    if st.sidebar.button("返回策略選擇"):
+        st.session_state["selected_strategy"] = None
+        st.rerun()
+
+    st.sidebar.caption("目前策略：策略1 Pair Trading")
+    st.sidebar.divider()
+
     st.sidebar.header("回測設定")
     mode = st.sidebar.radio("標的來源", ["Notebook preset", "自訂 pair"], horizontal=True)
+
     labels = [f"{a} {an} / {b} {bn}" for a, an, b, bn in PRESET_PAIRS]
+
     if mode == "Notebook preset":
         label = st.sidebar.selectbox("Pair", labels, index=6)
         a_code, a_name, b_code, b_name = PRESET_PAIRS[labels.index(label)]
@@ -93,10 +142,10 @@ def sidebar_settings() -> dict[str, object]:
         col_a, col_b = st.sidebar.columns(2)
         with col_a:
             a_code = st.text_input("A code", value="2886").strip().upper()
-            a_name = st.text_input("A name", value=KNOWN_NAMES.get(a_code, ""))
         with col_b:
             b_code = st.text_input("B code", value="2891").strip().upper()
-            b_name = st.text_input("B name", value=KNOWN_NAMES.get(b_code, ""))
+        a_name = ""
+        b_name = ""
 
     today = pd.Timestamp.today().date()
     start_default = (pd.Timestamp(today) - pd.DateOffset(years=2)).date()
@@ -104,6 +153,13 @@ def sidebar_settings() -> dict[str, object]:
     end = st.sidebar.date_input("Backtest end", value=today)
     suffix = st.sidebar.text_input("Yahoo suffix", value=".TW")
     benchmark = st.sidebar.text_input("Benchmark", value="^TWII")
+
+    if mode == "自訂 pair":
+        a_name = resolve_stock_name(a_code, suffix)
+        b_name = resolve_stock_name(b_code, suffix)
+        st.sidebar.caption(
+            f"辨識結果：{format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}"
+        )
 
     st.sidebar.divider()
     st.sidebar.header("策略參數")
@@ -151,6 +207,90 @@ def sidebar_settings() -> dict[str, object]:
     }
 
 
+def format_stock_label(code: str, name: str) -> str:
+    code = str(code).strip()
+    name = str(name).strip()
+    return f"{code} {name}" if name else code
+
+
+def resolve_stock_name(code: str, suffix: str = ".TW") -> str:
+    code = str(code).strip().upper()
+    if not code:
+        return ""
+
+    if code in KNOWN_NAMES:
+        return KNOWN_NAMES[code]
+
+    twse_name = fetch_twse_stock_name(code)
+    if twse_name:
+        return twse_name
+
+    yahoo_name = fetch_yahoo_tw_stock_name(code, suffix)
+    if yahoo_name:
+        return yahoo_name
+
+    return ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_twse_name_map() -> dict[str, str]:
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+
+    try:
+        response = requests.get(url, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return {}
+
+    name_map: dict[str, str] = {}
+    for row in data:
+        code = str(row.get("Code", "")).strip()
+        name = str(row.get("Name", "")).strip()
+        if code and name:
+            name_map[code] = name
+
+    return name_map
+
+
+def fetch_twse_stock_name(code: str) -> str:
+    name_map = fetch_twse_name_map()
+    return name_map.get(code, "")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_yahoo_tw_stock_name(code: str, suffix: str = ".TW") -> str:
+    ticker = to_yahoo_ticker(code, suffix)
+    url = f"https://tw.stock.yahoo.com/quote/{ticker}"
+
+    try:
+        response = requests.get(
+            url,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+    except Exception:
+        return ""
+
+    text = response.text
+    match = re.search(r"<title>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+
+    title = html.unescape(match.group(1))
+    title = re.sub(r"\s+", " ", title).strip()
+
+    # Yahoo Taiwan title usually looks like:
+    # 兆豐金 (2886.TW) 走勢圖 - Yahoo奇摩股市
+    if " (" in title:
+        candidate = title.split(" (", 1)[0].strip()
+        if candidate and candidate != code:
+            return candidate
+
+    return ""
+
+
 def render_backtest(settings: dict[str, object]) -> None:
     a_code = str(settings["a_code"])
     b_code = str(settings["b_code"])
@@ -162,7 +302,7 @@ def render_backtest(settings: dict[str, object]) -> None:
 
     left, right = st.columns([0.68, 0.32])
     with left:
-        st.subheader(f"{a_code} {a_name} / {b_code} {b_name}")
+        st.subheader(f"{format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}")
         st.write("訊號使用 t 日 Close；交易使用 t+1 日 Open。")
     with right:
         run = st.button("Run backtest", type="primary", use_container_width=True)
