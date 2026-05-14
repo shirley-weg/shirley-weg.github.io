@@ -10,27 +10,274 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller
 
 
-PRESET_PAIRS = [
-    ("3006", "晶豪科", "4967", "十銓"),
-    ("2344", "華邦電", "2451", "創見"),
-    ("2369", "菱生", "8150", "南茂"),
-    ("3189", "景碩", "6271", "同欣電"),
-    ("2329", "華泰", "2449", "京元電子"),
-    ("2836", "高雄銀", "2838", "聯邦銀"),
-    ("2886", "兆豐金", "2891", "中信金"),
-    ("2880", "華南金", "2891", "中信金"),
-    ("2801", "彰銀", "2838", "聯邦銀"),
-    ("2886", "兆豐金", "2892", "第一金"),
-]
+# Taiwan single-stock futures underlyings (ordinary stocks only; ETF futures excluded)
+# Fields: code, name, industry
+single_stock_futures = [{'code': '1101', 'name': '台泥', 'industry': '水泥工業'},
+ {'code': '1102', 'name': '亞泥', 'industry': '水泥工業'},
+ {'code': '1210', 'name': '大成', 'industry': '食品工業'},
+ {'code': '1216', 'name': '統一', 'industry': '食品工業'},
+ {'code': '1301', 'name': '台塑', 'industry': '塑膠工業'},
+ {'code': '1303', 'name': '南亞', 'industry': '塑膠工業'},
+ {'code': '1312', 'name': '國喬', 'industry': '塑膠工業'},
+ {'code': '1314', 'name': '中石化', 'industry': '塑膠工業'},
+ {'code': '1319', 'name': '東陽', 'industry': '汽車工業'},
+ {'code': '1326', 'name': '台化', 'industry': '塑膠工業'},
+ {'code': '1402', 'name': '遠東新', 'industry': '紡織纖維'},
+ {'code': '1440', 'name': '南紡', 'industry': '紡織纖維'},
+ {'code': '1476', 'name': '儒鴻', 'industry': '紡織纖維'},
+ {'code': '1477', 'name': '聚陽', 'industry': '紡織纖維'},
+ {'code': '1503', 'name': '士電', 'industry': '電機機械'},
+ {'code': '1504', 'name': '東元', 'industry': '電機機械'},
+ {'code': '1513', 'name': '中興電', 'industry': '電機機械'},
+ {'code': '1536', 'name': '和大', 'industry': '汽車工業'},
+ {'code': '1560', 'name': '中砂', 'industry': '電機機械'},
+ {'code': '1565', 'name': '精華', 'industry': '生技醫療業'},
+ {'code': '1590', 'name': '亞德客-KY', 'industry': '電機機械'},
+ {'code': '1605', 'name': '華新', 'industry': '電器電纜'},
+ {'code': '1608', 'name': '華榮', 'industry': '電器電纜'},
+ {'code': '1609', 'name': '大亞', 'industry': '電器電纜'},
+ {'code': '1717', 'name': '長興', 'industry': '化學工業'},
+ {'code': '1718', 'name': '中纖', 'industry': '化學工業'},
+ {'code': '1722', 'name': '台肥', 'industry': '化學工業'},
+ {'code': '1795', 'name': '美時', 'industry': '生技醫療業'},
+ {'code': '1802', 'name': '台玻', 'industry': '玻璃陶瓷'},
+ {'code': '1904', 'name': '正隆', 'industry': '造紙工業'},
+ {'code': '1905', 'name': '華紙', 'industry': '造紙工業'},
+ {'code': '1907', 'name': '永豐餘', 'industry': '造紙工業'},
+ {'code': '1909', 'name': '榮成', 'industry': '造紙工業'},
+ {'code': '2002', 'name': '中鋼', 'industry': '鋼鐵工業'},
+ {'code': '2006', 'name': '東和鋼鐵', 'industry': '鋼鐵工業'},
+ {'code': '2014', 'name': '中鴻', 'industry': '鋼鐵工業'},
+ {'code': '2027', 'name': '大成鋼', 'industry': '鋼鐵工業'},
+ {'code': '2049', 'name': '上銀', 'industry': '電機機械'},
+ {'code': '2059', 'name': '川湖', 'industry': '電子零組件業'},
+ {'code': '2105', 'name': '正新', 'industry': '橡膠工業'},
+ {'code': '2201', 'name': '裕隆', 'industry': '汽車工業'},
+ {'code': '2231', 'name': '為升', 'industry': '汽車工業'},
+ {'code': '2301', 'name': '光寶科', 'industry': '光電業'},
+ {'code': '2303', 'name': '聯電', 'industry': '半導體業'},
+ {'code': '2308', 'name': '台達電', 'industry': '電子零組件業'},
+ {'code': '2312', 'name': '金寶', 'industry': '其他電子業'},
+ {'code': '2313', 'name': '華通', 'industry': '電子零組件業'},
+ {'code': '2317', 'name': '鴻海', 'industry': '其他電子業'},
+ {'code': '2323', 'name': '中環', 'industry': '光電業'},
+ {'code': '2324', 'name': '仁寶', 'industry': '電腦及週邊設備業'},
+ {'code': '2327', 'name': '國巨', 'industry': '電子零組件業'},
+ {'code': '2328', 'name': '廣宇', 'industry': '電子零組件業'},
+ {'code': '2329', 'name': '華泰', 'industry': '半導體業'},
+ {'code': '2330', 'name': '台積電', 'industry': '半導體業'},
+ {'code': '2331', 'name': '精英', 'industry': '電腦及週邊設備業'},
+ {'code': '2332', 'name': '友訊', 'industry': '通信網路業'},
+ {'code': '2337', 'name': '旺宏', 'industry': '半導體業'},
+ {'code': '2338', 'name': '光罩', 'industry': '半導體業'},
+ {'code': '2340', 'name': '台亞', 'industry': '半導體業'},
+ {'code': '2344', 'name': '華邦電', 'industry': '半導體業'},
+ {'code': '2345', 'name': '智邦', 'industry': '通信網路業'},
+ {'code': '2347', 'name': '聯強', 'industry': '電子通路業'},
+ {'code': '2352', 'name': '佳世達', 'industry': '電腦及週邊設備業'},
+ {'code': '2353', 'name': '宏碁', 'industry': '電腦及週邊設備業'},
+ {'code': '2354', 'name': '鴻準', 'industry': '其他電子業'},
+ {'code': '2355', 'name': '敬鵬', 'industry': '電子零組件業'},
+ {'code': '2356', 'name': '英業達', 'industry': '電腦及週邊設備業'},
+ {'code': '2357', 'name': '華碩', 'industry': '電腦及週邊設備業'},
+ {'code': '2360', 'name': '致茂', 'industry': '其他電子業'},
+ {'code': '2367', 'name': '燿華', 'industry': '電子零組件業'},
+ {'code': '2368', 'name': '金像電', 'industry': '電子零組件業'},
+ {'code': '2371', 'name': '大同', 'industry': '電機機械'},
+ {'code': '2376', 'name': '技嘉', 'industry': '電腦及週邊設備業'},
+ {'code': '2377', 'name': '微星', 'industry': '電腦及週邊設備業'},
+ {'code': '2379', 'name': '瑞昱', 'industry': '半導體業'},
+ {'code': '2382', 'name': '廣達', 'industry': '電腦及週邊設備業'},
+ {'code': '2383', 'name': '台光電', 'industry': '電子零組件業'},
+ {'code': '2385', 'name': '群光', 'industry': '電子零組件業'},
+ {'code': '2388', 'name': '威盛', 'industry': '半導體業'},
+ {'code': '2392', 'name': '正崴', 'industry': '電子零組件業'},
+ {'code': '2393', 'name': '億光', 'industry': '光電業'},
+ {'code': '2395', 'name': '研華', 'industry': '電腦及週邊設備業'},
+ {'code': '2401', 'name': '凌陽', 'industry': '半導體業'},
+ {'code': '2404', 'name': '漢唐', 'industry': '其他電子業'},
+ {'code': '2408', 'name': '南亞科', 'industry': '半導體業'},
+ {'code': '2409', 'name': '友達', 'industry': '光電業'},
+ {'code': '2412', 'name': '中華電', 'industry': '通信網路業'},
+ {'code': '2421', 'name': '建準', 'industry': '電子零組件業'},
+ {'code': '2439', 'name': '美律', 'industry': '通信網路業'},
+ {'code': '2441', 'name': '超豐', 'industry': '半導體業'},
+ {'code': '2449', 'name': '京元電子', 'industry': '半導體業'},
+ {'code': '2454', 'name': '聯發科', 'industry': '半導體業'},
+ {'code': '2455', 'name': '全新', 'industry': '通信網路業'},
+ {'code': '2457', 'name': '飛宏', 'industry': '電子零組件業'},
+ {'code': '2458', 'name': '義隆', 'industry': '半導體業'},
+ {'code': '2474', 'name': '可成', 'industry': '其他電子業'},
+ {'code': '2481', 'name': '強茂', 'industry': '半導體業'},
+ {'code': '2485', 'name': '兆赫', 'industry': '通信網路業'},
+ {'code': '2486', 'name': '一詮', 'industry': '光電業'},
+ {'code': '2489', 'name': '瑞軒', 'industry': '光電業'},
+ {'code': '2492', 'name': '華新科', 'industry': '電子零組件業'},
+ {'code': '2498', 'name': '宏達電', 'industry': '通信網路業'},
+ {'code': '2515', 'name': '中工', 'industry': '建材營造業'},
+ {'code': '2520', 'name': '冠德', 'industry': '建材營造業'},
+ {'code': '2542', 'name': '興富發', 'industry': '建材營造業'},
+ {'code': '2548', 'name': '華固', 'industry': '建材營造業'},
+ {'code': '2603', 'name': '長榮', 'industry': '航運業'},
+ {'code': '2605', 'name': '新興', 'industry': '航運業'},
+ {'code': '2606', 'name': '裕民', 'industry': '航運業'},
+ {'code': '2609', 'name': '陽明', 'industry': '航運業'},
+ {'code': '2610', 'name': '華航', 'industry': '航運業'},
+ {'code': '2615', 'name': '萬海', 'industry': '航運業'},
+ {'code': '2618', 'name': '長榮航', 'industry': '航運業'},
+ {'code': '2633', 'name': '台灣高鐵', 'industry': '航運業'},
+ {'code': '2634', 'name': '漢翔', 'industry': '航運業'},
+ {'code': '2801', 'name': '彰銀', 'industry': '金融保險業'},
+ {'code': '2834', 'name': '臺企銀', 'industry': '金融保險業'},
+ {'code': '2880', 'name': '華南金', 'industry': '金融保險業'},
+ {'code': '2881', 'name': '富邦金', 'industry': '金融保險業'},
+ {'code': '2882', 'name': '國泰金', 'industry': '金融保險業'},
+ {'code': '2883', 'name': '凱基金', 'industry': '金融保險業'},
+ {'code': '2884', 'name': '玉山金', 'industry': '金融保險業'},
+ {'code': '2885', 'name': '元大金', 'industry': '金融保險業'},
+ {'code': '2886', 'name': '兆豐金', 'industry': '金融保險業'},
+ {'code': '2887', 'name': '台新新光金', 'industry': '金融保險業'},
+ {'code': '2890', 'name': '永豐金', 'industry': '金融保險業'},
+ {'code': '2891', 'name': '中信金', 'industry': '金融保險業'},
+ {'code': '2892', 'name': '第一金', 'industry': '金融保險業'},
+ {'code': '2913', 'name': '農林', 'industry': '貿易百貨業'},
+ {'code': '2915', 'name': '潤泰全', 'industry': '其他業'},
+ {'code': '3005', 'name': '神基', 'industry': '電腦及週邊設備業'},
+ {'code': '3006', 'name': '晶豪科', 'industry': '半導體業'},
+ {'code': '3008', 'name': '大立光', 'industry': '光電業'},
+ {'code': '3017', 'name': '奇鋐', 'industry': '電腦及週邊設備業'},
+ {'code': '3019', 'name': '亞光', 'industry': '光電業'},
+ {'code': '3034', 'name': '聯詠', 'industry': '半導體業'},
+ {'code': '3035', 'name': '智原', 'industry': '半導體業'},
+ {'code': '3036', 'name': '文曄', 'industry': '電子通路業'},
+ {'code': '3037', 'name': '欣興', 'industry': '電子零組件業'},
+ {'code': '3042', 'name': '晶技', 'industry': '電子零組件業'},
+ {'code': '3044', 'name': '健鼎', 'industry': '電子零組件業'},
+ {'code': '3045', 'name': '台灣大', 'industry': '通信網路業'},
+ {'code': '3078', 'name': '僑威', 'industry': '電子零組件業'},
+ {'code': '3081', 'name': '聯亞', 'industry': '通信網路業'},
+ {'code': '3105', 'name': '穩懋', 'industry': '半導體業'},
+ {'code': '3152', 'name': '璟德', 'industry': '通信網路業'},
+ {'code': '3189', 'name': '景碩', 'industry': '半導體業'},
+ {'code': '3211', 'name': '順達', 'industry': '電腦及週邊設備業'},
+ {'code': '3227', 'name': '原相', 'industry': '半導體業'},
+ {'code': '3231', 'name': '緯創', 'industry': '電腦及週邊設備業'},
+ {'code': '3260', 'name': '威剛', 'industry': '半導體業'},
+ {'code': '3264', 'name': '欣銓', 'industry': '半導體業'},
+ {'code': '3293', 'name': '鈊象', 'industry': '文化創意業'},
+ {'code': '3324', 'name': '雙鴻', 'industry': '電腦及週邊設備業'},
+ {'code': '3374', 'name': '精材', 'industry': '半導體業'},
+ {'code': '3376', 'name': '新日興', 'industry': '電子零組件業'},
+ {'code': '3380', 'name': '明泰', 'industry': '通信網路業'},
+ {'code': '3406', 'name': '玉晶光', 'industry': '光電業'},
+ {'code': '3443', 'name': '創意', 'industry': '半導體業'},
+ {'code': '3481', 'name': '群創', 'industry': '光電業'},
+ {'code': '3529', 'name': '力旺', 'industry': '半導體業'},
+ {'code': '3532', 'name': '台勝科', 'industry': '半導體業'},
+ {'code': '3533', 'name': '嘉澤', 'industry': '電子零組件業'},
+ {'code': '3552', 'name': '同致', 'industry': '汽車工業'},
+ {'code': '3653', 'name': '健策', 'industry': '電子零組件業'},
+ {'code': '3661', 'name': '世芯-KY', 'industry': '半導體業'},
+ {'code': '3665', 'name': '貿聯-KY', 'industry': '其他電子業'},
+ {'code': '3673', 'name': 'TPK-KY', 'industry': '光電業'},
+ {'code': '3680', 'name': '家登', 'industry': '其他電子業'},
+ {'code': '3691', 'name': '碩禾', 'industry': '光電業'},
+ {'code': '3702', 'name': '大聯大', 'industry': '電子通路業'},
+ {'code': '3706', 'name': '神達', 'industry': '電腦及週邊設備業'},
+ {'code': '3711', 'name': '日月光投控', 'industry': '半導體業'},
+ {'code': '3714', 'name': '富采', 'industry': '光電業'},
+ {'code': '4123', 'name': '晟德', 'industry': '生技醫療業'},
+ {'code': '4128', 'name': '中天', 'industry': '生技醫療業'},
+ {'code': '4162', 'name': '智擎', 'industry': '生技醫療業'},
+ {'code': '4736', 'name': '泰博', 'industry': '生技醫療業'},
+ {'code': '4743', 'name': '合一', 'industry': '生技醫療業'},
+ {'code': '4904', 'name': '遠傳', 'industry': '通信網路業'},
+ {'code': '4919', 'name': '新唐', 'industry': '半導體業'},
+ {'code': '4938', 'name': '和碩', 'industry': '電腦及週邊設備業'},
+ {'code': '4958', 'name': '臻鼎-KY', 'industry': '電子零組件業'},
+ {'code': '5009', 'name': '榮剛', 'industry': '鋼鐵工業'},
+ {'code': '5269', 'name': '祥碩', 'industry': '半導體業'},
+ {'code': '5274', 'name': '信驊', 'industry': '半導體業'},
+ {'code': '5347', 'name': '世界', 'industry': '半導體業'},
+ {'code': '5371', 'name': '中光電', 'industry': '光電業'},
+ {'code': '5388', 'name': '中磊', 'industry': '通信網路業'},
+ {'code': '5425', 'name': '台半', 'industry': '半導體業'},
+ {'code': '5457', 'name': '宣德', 'industry': '電子零組件業'},
+ {'code': '5483', 'name': '中美晶', 'industry': '半導體業'},
+ {'code': '5534', 'name': '長虹', 'industry': '建材營造業'},
+ {'code': '5871', 'name': '中租-KY', 'industry': '其他業'},
+ {'code': '5876', 'name': '上海商銀', 'industry': '金融保險業'},
+ {'code': '5880', 'name': '合庫金', 'industry': '金融保險業'},
+ {'code': '5904', 'name': '寶雅', 'industry': '貿易百貨業'},
+ {'code': '6005', 'name': '群益證', 'industry': '金融保險業'},
+ {'code': '6116', 'name': '彩晶', 'industry': '光電業'},
+ {'code': '6121', 'name': '新普', 'industry': '電腦及週邊設備業'},
+ {'code': '6139', 'name': '亞翔', 'industry': '其他電子業'},
+ {'code': '6147', 'name': '頎邦', 'industry': '半導體業'},
+ {'code': '6153', 'name': '嘉聯益', 'industry': '電子零組件業'},
+ {'code': '6173', 'name': '信昌電', 'industry': '電子零組件業'},
+ {'code': '6176', 'name': '瑞儀', 'industry': '光電業'},
+ {'code': '6182', 'name': '合晶', 'industry': '半導體業'},
+ {'code': '6188', 'name': '廣明', 'industry': '光電業'},
+ {'code': '6213', 'name': '聯茂', 'industry': '電子零組件業'},
+ {'code': '6223', 'name': '旺矽', 'industry': '半導體業'},
+ {'code': '6239', 'name': '力成', 'industry': '半導體業'},
+ {'code': '6245', 'name': '立端', 'industry': '電腦及週邊設備業'},
+ {'code': '6257', 'name': '矽格', 'industry': '半導體業'},
+ {'code': '6269', 'name': '台郡', 'industry': '電子零組件業'},
+ {'code': '6271', 'name': '同欣電', 'industry': '半導體業'},
+ {'code': '6274', 'name': '台燿', 'industry': '電子零組件業'},
+ {'code': '6278', 'name': '台表科', 'industry': '電子零組件業'},
+ {'code': '6279', 'name': '胡連', 'industry': '電子零組件業'},
+ {'code': '6282', 'name': '康舒', 'industry': '電子零組件業'},
+ {'code': '6285', 'name': '啟碁', 'industry': '通信網路業'},
+ {'code': '6290', 'name': '良維', 'industry': '電子零組件業'},
+ {'code': '6414', 'name': '樺漢', 'industry': '電腦及週邊設備業'},
+ {'code': '6443', 'name': '元晶', 'industry': '光電業'},
+ {'code': '6472', 'name': '保瑞', 'industry': '生技醫療業'},
+ {'code': '6488', 'name': '環球晶', 'industry': '半導體業'},
+ {'code': '6505', 'name': '台塑化', 'industry': '油電燃氣業'},
+ {'code': '6510', 'name': '精測', 'industry': '半導體業'},
+ {'code': '6526', 'name': '達發', 'industry': '半導體業'},
+ {'code': '6547', 'name': '高端疫苗', 'industry': '生技醫療業'},
+ {'code': '6669', 'name': '緯穎', 'industry': '電腦及週邊設備業'},
+ {'code': '6757', 'name': '台灣虎航', 'industry': '航運業'},
+ {'code': '6770', 'name': '力積電', 'industry': '半導體業'},
+ {'code': '8039', 'name': '台虹', 'industry': '電子零組件業'},
+ {'code': '8044', 'name': '網家', 'industry': '數位雲端'},
+ {'code': '8046', 'name': '南電', 'industry': '電子零組件業'},
+ {'code': '8069', 'name': '元太', 'industry': '光電業'},
+ {'code': '8086', 'name': '宏捷科', 'industry': '半導體業'},
+ {'code': '8112', 'name': '至上', 'industry': '電子通路業'},
+ {'code': '8150', 'name': '南茂', 'industry': '半導體業'},
+ {'code': '8163', 'name': '達方', 'industry': '電子零組件業'},
+ {'code': '8299', 'name': '群聯', 'industry': '半導體業'},
+ {'code': '8358', 'name': '金居', 'industry': '電子零組件業'},
+ {'code': '8436', 'name': '大江', 'industry': '生技醫療業'},
+ {'code': '9904', 'name': '寶成', 'industry': '運動休閒'},
+ {'code': '9914', 'name': '美利達', 'industry': '運動休閒'},
+ {'code': '9938', 'name': '百和', 'industry': '其他業'},
+ {'code': '9939', 'name': '宏全', 'industry': '其他業'},
+ {'code': '9945', 'name': '潤泰新', 'industry': '建材營造業'},
+ {'code': '9958', 'name': '世紀鋼', 'industry': '鋼鐵工業'}]
 
-KNOWN_NAMES = {
-    "2886": "兆豐金", "2891": "中信金", "2880": "華南金", "2892": "第一金",
-    "2836": "高雄銀", "2838": "聯邦銀", "2801": "彰銀", "2329": "華泰",
-    "2449": "京元電子", "2369": "菱生", "8150": "南茂", "3189": "景碩",
-    "6271": "同欣電", "3006": "晶豪科", "4967": "十銓", "2344": "華邦電", "2451": "創見",
-}
+KNOWN_NAMES = {item["code"]: item["name"] for item in single_stock_futures}
+
+PERIOD = "3y"
+INTERVAL = "1d"
+MIN_OBS = 60
+CORR_THRESHOLD = 0.9
+
+ADF_P_THRESHOLD = 0.05
+MIN_HALF_LIFE = 2
+MAX_HALF_LIFE = 60
+MAX_TREND_STRENGTH = 1.0
+MIN_CROSSINGS_PER_YEAR = 4
+TOP_N = 10
 
 
 @dataclass(frozen=True)
@@ -42,11 +289,6 @@ class Config:
     broker_fee: float
     sell_tax: float
     integer_shares: bool
-    weight_mode: str
-    opt_lookback: int
-    min_weight: float
-    max_weight: float
-    weight_step: float
 
 
 st.set_page_config(page_title="Trading Strategy Lab", layout="wide")
@@ -85,13 +327,17 @@ st.markdown(
 def main() -> None:
     if "selected_strategy" not in st.session_state:
         st.session_state["selected_strategy"] = None
+    if "a_code_input" not in st.session_state:
+        st.session_state["a_code_input"] = ""
+    if "b_code_input" not in st.session_state:
+        st.session_state["b_code_input"] = ""
 
     if st.session_state["selected_strategy"] is None:
         render_strategy_selector()
         return
 
     st.title("Trading Strategy Lab")
-    st.caption("Pair trading backtest with rolling hedge ratio and Sharpe-based leg weights.")
+    st.caption("Pair trading backtest with rolling OLS hedge ratio.")
     settings = sidebar_settings()
     render_backtest(settings)
 
@@ -105,8 +351,8 @@ def render_strategy_selector() -> None:
         <div class="strategy-card">
           <h3>策略1：Pair Trading 回測</h3>
           <p>
-            使用 rolling OLS 估計 spread 與 z-score，並可選擇 OLS hedge ratio
-            或 rolling max-Sharpe grid 作為雙邊部位權重。
+            使用 rolling OLS 估計 spread 與 z-score，並使用 OLS hedge ratio
+            作為雙邊部位權重。
           </p>
         </div>
         """,
@@ -131,21 +377,11 @@ def sidebar_settings() -> dict[str, object]:
     st.sidebar.divider()
 
     st.sidebar.header("回測設定")
-    mode = st.sidebar.radio("標的來源", ["Notebook preset", "自訂 pair"], horizontal=True)
-
-    labels = [f"{a} {an} / {b} {bn}" for a, an, b, bn in PRESET_PAIRS]
-
-    if mode == "Notebook preset":
-        label = st.sidebar.selectbox("Pair", labels, index=6)
-        a_code, a_name, b_code, b_name = PRESET_PAIRS[labels.index(label)]
-    else:
-        col_a, col_b = st.sidebar.columns(2)
-        with col_a:
-            a_code = st.text_input("A code", value="2886").strip().upper()
-        with col_b:
-            b_code = st.text_input("B code", value="2891").strip().upper()
-        a_name = ""
-        b_name = ""
+    col_a, col_b = st.sidebar.columns(2)
+    with col_a:
+        a_code = st.text_input("A code", key="a_code_input").strip().upper()
+    with col_b:
+        b_code = st.text_input("B code", key="b_code_input").strip().upper()
 
     today = pd.Timestamp.today().date()
     start_default = (pd.Timestamp(today) - pd.DateOffset(years=2)).date()
@@ -154,9 +390,9 @@ def sidebar_settings() -> dict[str, object]:
     suffix = st.sidebar.text_input("Yahoo suffix", value=".TW")
     benchmark = st.sidebar.text_input("Benchmark", value="^TWII")
 
-    if mode == "自訂 pair":
-        a_name = resolve_stock_name(a_code, suffix)
-        b_name = resolve_stock_name(b_code, suffix)
+    a_name = resolve_stock_name(a_code, suffix) if a_code else ""
+    b_name = resolve_stock_name(b_code, suffix) if b_code else ""
+    if a_code or b_code:
         st.sidebar.caption(
             f"辨識結果：{format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}"
         )
@@ -168,13 +404,6 @@ def sidebar_settings() -> dict[str, object]:
     exit_z = st.sidebar.slider("Exit z-score", -1.0, 1.0, 0.0, 0.1)
     capital = st.sidebar.number_input("Capital per pair", min_value=10_000, value=100_000, step=10_000)
     integer_shares = st.sidebar.toggle("整股交易", value=True)
-
-    st.sidebar.divider()
-    st.sidebar.header("權重最佳化")
-    weight_label = st.sidebar.selectbox("部位方法", ["Rolling max-Sharpe grid", "OLS hedge ratio"])
-    opt_lookback = st.sidebar.slider("Optimization lookback", 60, 360, 180, 20)
-    min_w, max_w = st.sidebar.slider("單邊 gross weight 範圍", 0.10, 0.90, (0.20, 0.80), 0.05)
-    weight_step = st.sidebar.select_slider("Grid step", options=[0.01, 0.025, 0.05, 0.10], value=0.05)
 
     st.sidebar.divider()
     st.sidebar.header("交易成本")
@@ -198,19 +427,471 @@ def sidebar_settings() -> dict[str, object]:
             broker_fee=float(broker_fee),
             sell_tax=float(sell_tax),
             integer_shares=integer_shares,
-            weight_mode="max_sharpe" if weight_label == "Rolling max-Sharpe grid" else "ols",
-            opt_lookback=opt_lookback,
-            min_weight=float(min_w),
-            max_weight=float(max_w),
-            weight_step=float(weight_step),
         ),
     }
+
+
+def render_backtest(settings: dict[str, object]) -> None:
+    a_code = str(settings["a_code"])
+    b_code = str(settings["b_code"])
+    a_name = str(settings["a_name"])
+    b_name = str(settings["b_name"])
+    start = pd.Timestamp(settings["start"])
+    end = pd.Timestamp(settings["end"])
+    config: Config = settings["config"]  # type: ignore[assignment]
+
+    left, right = st.columns([0.52, 0.48])
+
+    with left:
+        st.subheader("回測標的")
+        if a_code and b_code:
+            st.markdown(f"### {format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}")
+            st.write("訊號使用 t 日 Close；交易使用 t+1 日 Open。")
+        else:
+            st.info("請先在左側輸入 A code / B code，或從右側推薦 pair 套用到回測。")
+        run = st.button("Run backtest", type="primary", use_container_width=True)
+
+    with right:
+        render_pair_screening_panel(str(settings["suffix"]))
+
+    if not run:
+        st.info("調整左側設定後按 Run backtest。")
+        return
+    if not a_code or not b_code:
+        st.error("請先輸入 A code 和 B code，或從推薦 pair 套用到回測。")
+        return
+    if a_code == b_code:
+        st.error("A code 和 B code 不能相同。")
+        return
+    if start >= end:
+        st.error("Backtest start 必須早於 end。")
+        return
+
+    try:
+        with st.spinner("下載價格並執行回測..."):
+            warmup = max(config.lookback * 3, 365)
+            download_start = start - pd.DateOffset(days=warmup)
+            open_df, close_df = download_ohlc([a_code, b_code], download_start, end, str(settings["suffix"]))
+            benchmark = download_benchmark(str(settings["benchmark"]), download_start, end)
+            result = run_backtest(open_df, close_df, benchmark, a_code, b_code, start, end, config)
+    except Exception as exc:
+        st.error(f"回測失敗：{exc}")
+        return
+
+    show_summary(result["summary"])
+    show_charts(result, a_code, b_code, str(settings["benchmark"]), config)
+    show_tables(result)
+
+
+def render_pair_screening_panel(suffix: str) -> None:
+    st.subheader("細產業 Pair 推薦")
+    industry_groups = build_industry_groups()
+    industry_options = sorted(industry_groups.keys())
+
+    industry = st.selectbox("選擇細產業", industry_options, index=industry_options.index("半導體業") if "半導體業" in industry_options else 0)
+    stocks = industry_groups[industry]
+    st.caption(f"此細產業共有 {len(stocks)} 檔可篩選股票；篩選邏輯使用高相關性、ADF、half-life、trend strength 與 crossings。")
+
+    run_screen = st.button("篩選最佳 10 組 Pair", use_container_width=True)
+
+    if run_screen:
+        with st.spinner("下載價格並篩選 pair..."):
+            try:
+                best_pairs = screen_best_pairs_by_industry(industry, tuple(stocks), suffix)
+            except Exception as exc:
+                st.error(f"篩選失敗：{exc}")
+                return
+        st.session_state["screened_industry"] = industry
+        st.session_state["screened_pairs"] = best_pairs.to_dict("records")
+
+    records = st.session_state.get("screened_pairs", [])
+    screened_industry = st.session_state.get("screened_industry")
+
+    if not records or screened_industry != industry:
+        st.info("請選擇細產業後按「篩選最佳 10 組 Pair」。")
+        return
+
+    best_pairs_df = pd.DataFrame(records)
+    if best_pairs_df.empty:
+        st.warning("這個細產業目前沒有符合篩選條件的 pair。")
+        return
+
+    display_cols = [
+        "rank",
+        "stock_A_code", "stock_A_name",
+        "stock_B_code", "stock_B_name",
+        "correlation",
+        "beta_hedge_ratio",
+        "adf_pvalue",
+        "half_life",
+        "trend_strength",
+        "crossings_per_year",
+        "score",
+        "suitable",
+    ]
+    show_df = best_pairs_df[[c for c in display_cols if c in best_pairs_df.columns]].copy()
+    for c in ["correlation", "beta_hedge_ratio", "adf_pvalue", "half_life", "trend_strength", "crossings_per_year"]:
+        if c in show_df.columns:
+            show_df[c] = show_df[c].astype(float).round(4)
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    pair_labels = [
+        f"{int(row['rank'])}. {row['stock_A_code']} {row['stock_A_name']} / {row['stock_B_code']} {row['stock_B_name']} | corr={float(row['correlation']):.3f} | score={int(row['score'])}"
+        for _, row in best_pairs_df.iterrows()
+    ]
+    selected_label = st.selectbox("套用推薦 pair 到回測", pair_labels)
+    selected_idx = pair_labels.index(selected_label)
+    selected = best_pairs_df.iloc[selected_idx]
+
+    if st.button("套用選取 pair", type="primary", use_container_width=True):
+        st.session_state["a_code_input"] = str(selected["stock_A_code"])
+        st.session_state["b_code_input"] = str(selected["stock_B_code"])
+        st.rerun()
+
+
+def build_industry_groups() -> dict[str, list[tuple[str, str]]]:
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for item in single_stock_futures:
+        industry = str(item["industry"])
+        code = str(item["code"])
+        name = str(item["name"])
+        groups.setdefault(industry, []).append((code, name))
+    return groups
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], ...], suffix: str) -> pd.DataFrame:
+    if len(stocks) <= 1:
+        return pd.DataFrame()
+
+    price_df = download_screening_prices(stocks, PERIOD, INTERVAL, suffix)
+    group_price = get_group_price(price_df, stocks)
+
+    if group_price.shape[1] <= 1:
+        return pd.DataFrame()
+
+    log_price = np.log(group_price)
+    corr_pairs = extract_high_corr_pairs(industry, log_price, CORR_THRESHOLD)
+
+    if corr_pairs.empty:
+        return pd.DataFrame()
+
+    screening_records: list[dict[str, object]] = []
+
+    for _, row in corr_pairs.iterrows():
+        col_a = f"{row['stock_A_code']}_{row['stock_A_name']}"
+        col_b = f"{row['stock_B_code']}_{row['stock_B_name']}"
+
+        if col_a not in price_df.columns or col_b not in price_df.columns:
+            continue
+
+        pair_price = price_df[[col_a, col_b]].dropna().copy()
+        if len(pair_price) < MIN_OBS:
+            continue
+
+        pair_log = np.log(pair_price)
+        log_a = pair_log[col_a]
+        log_b = pair_log[col_b]
+
+        alpha, beta, fitted, spread = ols_spread(log_a, log_b)
+        spread_series = pd.Series(spread, index=pair_log.index)
+        spread_mean = float(spread_series.mean())
+        spread_std = float(spread_series.std())
+
+        adf_stat, adf_pvalue = adf_test(spread_series)
+        half_life = estimate_half_life(spread_series)
+        trend_slope, trend_pvalue, trend_strength = trend_strength_test(spread_series)
+        crossings, crossings_per_year = count_crossings(spread_series)
+
+        record = row.to_dict()
+        record.update({
+            "alpha": float(alpha),
+            "beta_hedge_ratio": float(beta),
+            "spread_mean": spread_mean,
+            "spread_std": spread_std,
+            "spread_min": float(spread_series.min()),
+            "spread_max": float(spread_series.max()),
+            "adf_stat": float(adf_stat),
+            "adf_pvalue": float(adf_pvalue),
+            "adf_pass_5pct": bool(adf_pvalue < ADF_P_THRESHOLD),
+            "half_life": float(half_life) if pd.notna(half_life) else np.nan,
+            "half_life_reasonable": bool(pd.notna(half_life) and MIN_HALF_LIFE <= half_life <= MAX_HALF_LIFE),
+            "trend_slope": float(trend_slope),
+            "trend_pvalue": float(trend_pvalue),
+            "trend_strength": float(trend_strength),
+            "no_obvious_trend": bool(trend_strength < MAX_TREND_STRENGTH),
+            "mean_crossings": int(crossings),
+            "crossings_per_year": float(crossings_per_year),
+            "enough_crossings": bool(crossings_per_year >= MIN_CROSSINGS_PER_YEAR),
+            "start_date": spread_series.index.min(),
+            "end_date": spread_series.index.max(),
+            "observations": int(len(spread_series)),
+        })
+        screening_records.append(record)
+
+    screening_df = pd.DataFrame(screening_records)
+    if screening_df.empty:
+        return pd.DataFrame()
+
+    screening_df["score"] = screening_df.apply(score_pair, axis=1)
+    screening_df["suitable"] = (
+        screening_df["adf_pass_5pct"]
+        & screening_df["half_life_reasonable"]
+        & screening_df["no_obvious_trend"]
+        & screening_df["enough_crossings"]
+    )
+
+    screening_df = screening_df.sort_values(
+        ["suitable", "score", "adf_pvalue", "trend_strength"],
+        ascending=[False, False, True, True],
+    ).reset_index(drop=True)
+
+    best_pairs_df = screening_df[screening_df["suitable"]].copy()
+    if best_pairs_df.empty:
+        best_pairs_df = screening_df.head(TOP_N).copy()
+    else:
+        best_pairs_df = best_pairs_df.head(TOP_N).copy()
+
+    best_pairs_df = best_pairs_df.reset_index(drop=True)
+    best_pairs_df.insert(0, "rank", np.arange(1, len(best_pairs_df) + 1))
+    return best_pairs_df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_screening_prices(stocks: tuple[tuple[str, str], ...], period: str, interval: str, suffix: str) -> pd.DataFrame:
+    import yfinance as yf
+
+    cache_dir = Path(__file__).resolve().parent / ".cache" / "yfinance"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if hasattr(yf, "set_tz_cache_location"):
+        yf.set_tz_cache_location(str(cache_dir))
+
+    tickers = [to_yahoo_ticker(code, suffix) for code, _ in stocks]
+
+    raw = yf.download(
+        tickers=tickers,
+        period=period,
+        interval=interval,
+        auto_adjust=True,
+        group_by="ticker",
+        progress=False,
+        threads=True,
+    )
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    price_dict: dict[str, pd.Series] = {}
+
+    for code, name in stocks:
+        ticker = to_yahoo_ticker(code, suffix)
+        try:
+            s = extract_close_series(raw, ticker)
+            s = s.dropna()
+            if len(s) >= MIN_OBS:
+                price_dict[f"{code}_{name}"] = s
+        except Exception:
+            continue
+
+    price_df = pd.DataFrame(price_dict).sort_index()
+    price_df = price_df.ffill().dropna(how="all")
+    return price_df
+
+
+def extract_close_series(raw: pd.DataFrame, ticker: str) -> pd.Series:
+    if isinstance(raw.columns, pd.MultiIndex):
+        level0 = raw.columns.get_level_values(0)
+        level1 = raw.columns.get_level_values(1)
+
+        if ticker in level0 and "Close" in raw[ticker].columns:
+            return raw[ticker]["Close"]
+
+        if "Close" in level0 and ticker in raw["Close"].columns:
+            return raw["Close"][ticker]
+
+        if ticker in level1 and "Close" in level0:
+            return raw[("Close", ticker)]
+
+        raise KeyError(f"Cannot find Close for {ticker}")
+
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        if ticker in close.columns:
+            return close[ticker]
+        return close.iloc[:, 0]
+    return close
+
+
+def get_group_price(price_df: pd.DataFrame, stock_list: tuple[tuple[str, str], ...]) -> pd.DataFrame:
+    cols = []
+    for code, name in stock_list:
+        col = f"{code}_{name}"
+        if col in price_df.columns:
+            cols.append(col)
+
+    if not cols:
+        return pd.DataFrame()
+
+    group_price = price_df[cols].copy()
+    group_price = group_price.dropna(axis=1, how="all")
+    group_price = group_price.ffill().dropna()
+    group_price = group_price.loc[:, (group_price > 0).all(axis=0)]
+
+    return group_price
+
+
+def extract_high_corr_pairs(group: str, log_price_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    corr = log_price_df.corr()
+    cols = corr.columns.tolist()
+
+    records = []
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            c = corr.iloc[i, j]
+            if pd.notna(c) and c > threshold:
+                code_a, name_a = cols[i].split("_", 1)
+                code_b, name_b = cols[j].split("_", 1)
+                records.append({
+                    "group": group,
+                    "stock_A_code": code_a,
+                    "stock_A_name": name_a,
+                    "stock_B_code": code_b,
+                    "stock_B_name": name_b,
+                    "correlation": float(c),
+                })
+
+    return pd.DataFrame(records)
+
+
+def ols_spread(log_a: pd.Series, log_b: pd.Series) -> tuple[float, float, np.ndarray, np.ndarray]:
+    y = np.asarray(log_a, dtype=float)
+    x = np.asarray(log_b, dtype=float)
+
+    X = np.column_stack([np.ones(len(x)), x])
+    alpha, beta = np.linalg.lstsq(X, y, rcond=None)[0]
+
+    fitted = alpha + beta * x
+    spread = y - fitted
+
+    return float(alpha), float(beta), fitted, spread
+
+
+def adf_test(spread: pd.Series) -> tuple[float, float]:
+    s = pd.Series(spread).dropna()
+    try:
+        result = adfuller(s, autolag="AIC")
+        return float(result[0]), float(result[1])
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def estimate_half_life(spread: pd.Series) -> float:
+    s = pd.Series(spread).dropna()
+    lagged = s.shift(1).dropna()
+    delta = s.diff().dropna()
+
+    idx = lagged.index.intersection(delta.index)
+    y = delta.loc[idx]
+    x = lagged.loc[idx]
+
+    if len(y) < 2:
+        return float("nan")
+
+    try:
+        X = sm.add_constant(x)
+        model = sm.OLS(y, X).fit()
+        beta = model.params.iloc[1]
+    except Exception:
+        return float("nan")
+
+    if beta >= 0:
+        return float("nan")
+
+    return float(-np.log(2) / beta)
+
+
+def trend_strength_test(spread: pd.Series) -> tuple[float, float, float]:
+    s = pd.Series(spread).dropna()
+    if len(s) < 2:
+        return float("nan"), float("nan"), float("inf")
+
+    t = np.arange(len(s))
+    try:
+        X = sm.add_constant(t)
+        model = sm.OLS(s.values, X).fit()
+        slope = model.params[1]
+        pvalue = model.pvalues[1]
+    except Exception:
+        return float("nan"), float("nan"), float("inf")
+
+    total_change = abs(slope) * len(s)
+    std = s.std()
+    strength = np.inf if std == 0 else total_change / std
+
+    return float(slope), float(pvalue), float(strength)
+
+
+def count_crossings(spread: pd.Series) -> tuple[int, float]:
+    s = pd.Series(spread).dropna()
+    centered = s - s.mean()
+    signs = np.sign(centered)
+
+    crossings = int(np.sum(signs.shift(1) * signs < 0))
+    years = len(s) / 252
+
+    return crossings, float(crossings / years if years > 0 else np.nan)
+
+
+def score_pair(row: pd.Series) -> int:
+    score = 0
+
+    adf_pvalue = row["adf_pvalue"]
+    if pd.notna(adf_pvalue):
+        if adf_pvalue < 0.01:
+            score += 35
+        elif adf_pvalue < 0.05:
+            score += 25
+        elif adf_pvalue < 0.10:
+            score += 10
+
+    hl = row["half_life"]
+    if pd.notna(hl) and MIN_HALF_LIFE <= hl <= MAX_HALF_LIFE:
+        score += 25
+        if 5 <= hl <= 30:
+            score += 10
+
+    trend_strength = row["trend_strength"]
+    if pd.notna(trend_strength):
+        if trend_strength < 0.5:
+            score += 20
+        elif trend_strength < MAX_TREND_STRENGTH:
+            score += 10
+
+    crossings_per_year = row["crossings_per_year"]
+    if pd.notna(crossings_per_year):
+        if crossings_per_year >= 12:
+            score += 10
+        elif crossings_per_year >= MIN_CROSSINGS_PER_YEAR:
+            score += 5
+
+    correlation = row["correlation"]
+    if pd.notna(correlation):
+        if correlation >= 0.95:
+            score += 10
+        elif correlation >= 0.90:
+            score += 7
+        elif correlation >= 0.80:
+            score += 3
+
+    return score
 
 
 def format_stock_label(code: str, name: str) -> str:
     code = str(code).strip()
     name = str(name).strip()
-    return f"{code} {name}" if name else code
+    if code and name:
+        return f"{code} {name}"
+    return code or "尚未選擇"
 
 
 def resolve_stock_name(code: str, suffix: str = ".TW") -> str:
@@ -289,45 +970,6 @@ def fetch_yahoo_tw_stock_name(code: str, suffix: str = ".TW") -> str:
             return candidate
 
     return ""
-
-
-def render_backtest(settings: dict[str, object]) -> None:
-    a_code = str(settings["a_code"])
-    b_code = str(settings["b_code"])
-    a_name = str(settings["a_name"])
-    b_name = str(settings["b_name"])
-    start = pd.Timestamp(settings["start"])
-    end = pd.Timestamp(settings["end"])
-    config: Config = settings["config"]  # type: ignore[assignment]
-
-    left, right = st.columns([0.68, 0.32])
-    with left:
-        st.subheader(f"{format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}")
-        st.write("訊號使用 t 日 Close；交易使用 t+1 日 Open。")
-    with right:
-        run = st.button("Run backtest", type="primary", use_container_width=True)
-
-    if not run:
-        st.info("調整左側設定後按 Run backtest。")
-        return
-    if start >= end:
-        st.error("Backtest start 必須早於 end。")
-        return
-
-    try:
-        with st.spinner("下載價格並執行回測..."):
-            warmup = max(config.lookback * 3, config.opt_lookback * 2, 365)
-            download_start = start - pd.DateOffset(days=warmup)
-            open_df, close_df = download_ohlc([a_code, b_code], download_start, end, str(settings["suffix"]))
-            benchmark = download_benchmark(str(settings["benchmark"]), download_start, end)
-            result = run_backtest(open_df, close_df, benchmark, a_code, b_code, start, end, config)
-    except Exception as exc:
-        st.error(f"回測失敗：{exc}")
-        return
-
-    show_summary(result["summary"])
-    show_charts(result, a_code, b_code, str(settings["benchmark"]), config)
-    show_tables(result)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -452,7 +1094,7 @@ def run_backtest(open_df: pd.DataFrame, close_df: pd.DataFrame, benchmark: pd.Se
     comparison = return_comparison(equity, benchmark, config.capital)
     summary = summarize(equity, trades, config.capital)
     price_history = full_close.loc[(full_close.index >= start) & (full_close.index <= end), [a_code, b_code]]
-    weight_cols = ["entry_date", "a_weight", "b_weight", "optimizer_sharpe", "weight_method"]
+    weight_cols = ["entry_date", "a_weight", "b_weight", "weight_method"]
     weights = trades[weight_cols].copy() if not trades.empty else pd.DataFrame(columns=weight_cols)
     return {"signals": signals, "trades": trades, "equity": equity, "comparison": comparison, "summary": summary, "price_history": price_history, "weights": weights}
 
@@ -474,7 +1116,7 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
             direction, a_sign, b_sign = entry_direction(z, config.entry_z)
             if direction is None:
                 continue
-            weights = choose_weights(signals, close_df, signal_date, beta, config, a_code, b_code)
+            weights = choose_weights(beta)
             a_notional = config.capital * float(weights["a_weight"])
             b_notional = config.capital * float(weights["b_weight"])
             a_shares = int(a_notional // a_price) if config.integer_shares else a_notional / a_price
@@ -501,28 +1143,9 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
     return pd.DataFrame(trades)
 
 
-def choose_weights(signals: pd.DataFrame, close_df: pd.DataFrame, signal_date: pd.Timestamp, beta: float, config: Config, a_code: str, b_code: str) -> dict[str, object]:
+def choose_weights(beta: float) -> dict[str, object]:
     ols_a = 1 / (1 + abs(beta))
-    if config.weight_mode != "max_sharpe":
-        return {"a_weight": float(ols_a), "b_weight": float(1 - ols_a), "optimizer_sharpe": np.nan, "weight_method": "ols_beta"}
-    hist = signals.loc[signals.index < signal_date].tail(config.opt_lookback)
-    returns = close_df[[a_code, b_code]].pct_change().reindex(hist.index).dropna()
-    if len(returns) < 40:
-        return {"a_weight": float(ols_a), "b_weight": float(1 - ols_a), "optimizer_sharpe": np.nan, "weight_method": "ols_fallback"}
-    z = hist["zscore"].reindex(returns.index)
-    positions = signal_positions(z, config.entry_z, config.exit_z).shift(1).fillna(0)
-    best_w = None
-    best_s = -np.inf
-    for a_weight in np.arange(config.min_weight, config.max_weight + config.weight_step / 2, config.weight_step):
-        b_weight = 1 - a_weight
-        strategy_returns = positions * (a_weight * returns[a_code] - b_weight * returns[b_code])
-        s = sharpe(strategy_returns)
-        if np.isfinite(s) and s > best_s:
-            best_s = s
-            best_w = float(a_weight)
-    if best_w is None:
-        return {"a_weight": float(ols_a), "b_weight": float(1 - ols_a), "optimizer_sharpe": np.nan, "weight_method": "ols_fallback"}
-    return {"a_weight": best_w, "b_weight": float(1 - best_w), "optimizer_sharpe": float(best_s), "weight_method": "rolling_max_sharpe_grid"}
+    return {"a_weight": float(ols_a), "b_weight": float(1 - ols_a), "weight_method": "ols_beta"}
 
 
 def build_equity(trades: pd.DataFrame, close_df: pd.DataFrame, start: pd.Timestamp, capital: float) -> pd.DataFrame:
@@ -654,7 +1277,7 @@ def show_tables(result: dict[str, object]) -> None:
     if trades.empty:
         st.warning("這段期間沒有觸發交易。")
     else:
-        cols = ["direction", "entry_date", "exit_date", "entry_zscore", "exit_zscore", "a_weight", "b_weight", "optimizer_sharpe", "gross_exposure", "pnl", "return_on_gross_exposure", "holding_days", "status"]
+        cols = ["direction", "entry_date", "exit_date", "entry_zscore", "exit_zscore", "a_weight", "b_weight", "gross_exposure", "pnl", "return_on_gross_exposure", "holding_days", "status"]
         st.dataframe(trades[[c for c in cols if c in trades.columns]], use_container_width=True)
         st.download_button("Download trades CSV", trades.to_csv(index=False).encode("utf-8-sig"), "pair_trades.csv", "text/csv")
     with st.expander("Signal data"):
@@ -677,23 +1300,6 @@ def entry_direction(z: float, entry_z: float) -> tuple[str | None, int, int]:
 
 def should_exit(direction: str, z: float, exit_z: float) -> bool:
     return (direction == "long_spread" and z >= exit_z) or (direction == "short_spread" and z <= -exit_z)
-
-
-def signal_positions(zscores: pd.Series, entry_z: float, exit_z: float) -> pd.Series:
-    pos = 0.0
-    rows = []
-    for z in zscores:
-        if pos == 0:
-            if z <= -entry_z:
-                pos = 1.0
-            elif z >= entry_z:
-                pos = -1.0
-        elif pos > 0 and z >= exit_z:
-            pos = 0.0
-        elif pos < 0 and z <= -exit_z:
-            pos = 0.0
-        rows.append(pos)
-    return pd.Series(rows, index=zscores.index, dtype=float)
 
 
 def transaction_cost(notional: float, side: str, config: Config) -> float:
