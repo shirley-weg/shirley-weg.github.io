@@ -1399,7 +1399,7 @@ def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: s
         stop_loss_text = "是" if stop_loss_count > 0 else "否"
         exit_text = "是" if exit_count > 0 else "否"
 
-    render_status_cards([
+    render_latest_cards([
         ("最新日期", latest_date.strftime("%Y-%m-%d")),
         ("最新 z-score", f"{latest_z:.2f}"),
         ("是否停損", stop_loss_text),
@@ -1439,7 +1439,7 @@ def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: s
     total_b_signed_shares = float(open_positions["b_signed_shares"].sum())
     total_open_pnl = float(open_positions["pnl"].sum()) if "pnl" in open_positions.columns else np.nan
 
-    render_status_cards([
+    render_latest_cards([
         ("未平倉筆數", f"{len(open_positions)}"),
         (f"{a_code} 淨股數", format_shares(total_a_signed_shares)),
         (f"{b_code} 淨股數", format_shares(total_b_signed_shares)),
@@ -1456,61 +1456,6 @@ def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: s
         if col in position_df.columns:
             position_df[col] = position_df[col].astype(float).round(4)
     st.dataframe(position_df, use_container_width=True, hide_index=True)
-
-
-def render_status_cards(items: list[tuple[str, str]]) -> None:
-    cards = []
-    for label, value in items:
-        cards.append(
-            f"""
-            <div class=\"latest-card\">
-              <div class=\"latest-card-label\">{html.escape(str(label))}</div>
-              <div class=\"latest-card-value\">{html.escape(str(value))}</div>
-            </div>
-            """
-        )
-
-    st.markdown(
-        """
-        <style>
-        .latest-card-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-          gap: 12px;
-          margin: 0.25rem 0 1rem 0;
-        }
-        .latest-card {
-          background: #ffffff;
-          border: 1px solid #e6e8ef;
-          border-radius: 10px;
-          padding: 14px 16px;
-          min-width: 0;
-          overflow: visible;
-          box-shadow: 0 1px 2px rgba(20, 29, 47, 0.04);
-        }
-        .latest-card-label {
-          color: #334155;
-          font-size: 0.92rem;
-          font-weight: 600;
-          margin-bottom: 8px;
-          white-space: normal;
-        }
-        .latest-card-value {
-          color: #17202a;
-          font-size: clamp(1.25rem, 2.8vw, 1.9rem);
-          line-height: 1.2;
-          font-weight: 500;
-          white-space: normal;
-          overflow-wrap: anywhere;
-          word-break: break-word;
-        }
-        </style>
-        """
-        + "<div class='latest-card-grid'>"
-        + "".join(cards)
-        + "</div>",
-        unsafe_allow_html=True,
-    )
 
 
 def action_text(sign: int | float) -> str:
@@ -1533,6 +1478,60 @@ def format_shares(value: float | int) -> str:
     if abs(float(value) - int(float(value))) < 1e-9:
         return f"{int(value):,}"
     return f"{float(value):,.2f}"
+
+
+def render_latest_cards(items: list[tuple[str, str]]) -> None:
+    cards = ""
+    for label, value in items:
+        safe_label = html.escape(str(label))
+        safe_value = html.escape(str(value))
+        cards += (
+            '<div class="latest-signal-card">'
+            f'<div class="latest-signal-label">{safe_label}</div>'
+            f'<div class="latest-signal-value">{safe_value}</div>'
+            '</div>'
+        )
+
+    st.markdown(
+        f"""
+        <style>
+        .latest-signal-grid {{
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 12px;
+          margin: 0.4rem 0 1rem 0;
+        }}
+        .latest-signal-card {{
+          background: #ffffff;
+          border: 1px solid #e6e8ef;
+          border-radius: 8px;
+          padding: 14px 16px;
+          box-shadow: 0 1px 2px rgba(20, 29, 47, 0.04);
+          min-height: 92px;
+        }}
+        .latest-signal-label {{
+          color: #344054;
+          font-size: 0.95rem;
+          font-weight: 600;
+          line-height: 1.35;
+          margin-bottom: 8px;
+        }}
+        .latest-signal-value {{
+          color: #17202a;
+          font-size: clamp(1.25rem, 2.4vw, 2.05rem);
+          font-weight: 500;
+          line-height: 1.15;
+          white-space: normal;
+          overflow-wrap: anywhere;
+          word-break: break-word;
+        }}
+        </style>
+        <div class="latest-signal-grid">
+          {cards}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def show_charts(result: dict[str, object], a_code: str, b_code: str, benchmark_name: str, config: Config) -> None:
