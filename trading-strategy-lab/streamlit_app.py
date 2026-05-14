@@ -1101,45 +1101,122 @@ def run_backtest(open_df: pd.DataFrame, close_df: pd.DataFrame, benchmark: pd.Se
 
 def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.DataFrame, a_code: str, b_code: str, config: Config) -> pd.DataFrame:
     trades: list[dict[str, object]] = []
-    current: dict[str, object] | None = None
+    open_positions: list[dict[str, object]] = []
+
     for signal_date, row in signals.iterrows():
         exec_date = row["exec_date"]
         if exec_date not in open_df.index:
             continue
+
         a_price = float(open_df.loc[exec_date, a_code])
         b_price = float(open_df.loc[exec_date, b_code])
         z = float(row["zscore"])
         beta = float(row["beta"])
+
         if not np.isfinite(beta) or beta <= 0:
             continue
-        if current is None:
-            direction, a_sign, b_sign = entry_direction(z, config.entry_z)
-            if direction is None:
-                continue
-            weights = choose_weights(beta)
-            a_notional = config.capital * float(weights["a_weight"])
-            b_notional = config.capital * float(weights["b_weight"])
-            a_shares = int(a_notional // a_price) if config.integer_shares else a_notional / a_price
-            b_shares = int(b_notional // b_price) if config.integer_shares else b_notional / b_price
-            if a_shares <= 0 or b_shares <= 0:
-                continue
-            a_entry_notional = float(a_shares * a_price)
-            b_entry_notional = float(b_shares * b_price)
-            entry_cost = transaction_cost(a_entry_notional, "buy" if a_sign == 1 else "sell", config) + transaction_cost(b_entry_notional, "buy" if b_sign == 1 else "sell", config)
-            current = {"a_code": a_code, "b_code": b_code, "direction": direction, "entry_signal_date": signal_date, "entry_date": exec_date, "entry_zscore": z, "entry_beta": beta, "a_sign": a_sign, "b_sign": b_sign, "a_entry_price": a_price, "b_entry_price": b_price, "a_shares": a_shares, "b_shares": b_shares, "a_entry_notional": a_entry_notional, "b_entry_notional": b_entry_notional, "gross_exposure": a_entry_notional + b_entry_notional, "entry_cost": entry_cost, **weights}
-        else:
-            if not should_exit(str(current["direction"]), z, config.exit_z):
-                continue
-            exit_cost = transaction_cost(float(current["a_shares"]) * a_price, "sell" if current["a_sign"] == 1 else "buy", config) + transaction_cost(float(current["b_shares"]) * b_price, "sell" if current["b_sign"] == 1 else "buy", config)
-            pnl = trade_pnl(current, a_price, b_price) - exit_cost
-            current.update({"exit_signal_date": signal_date, "exit_date": exec_date, "exit_zscore": z, "a_exit_price": a_price, "b_exit_price": b_price, "exit_cost": exit_cost, "total_cost": float(current["entry_cost"]) + exit_cost, "holding_days": (pd.Timestamp(exec_date) - pd.Timestamp(current["entry_date"])).days, "pnl": pnl, "return_on_gross_exposure": pnl / float(current["gross_exposure"]), "status": "closed"})
-            trades.append(current)
-            current = None
-    if current is not None:
+
+        still_open: list[dict[str, object]] = []
+        for position in open_positions:
+            if should_exit(str(position["direction"]), z, config.exit_z):
+                exit_cost = transaction_cost(
+                    float(position["a_shares"]) * a_price,
+                    "sell" if position["a_sign"] == 1 else "buy",
+                    config,
+                ) + transaction_cost(
+                    float(position["b_shares"]) * b_price,
+                    "sell" if position["b_sign"] == 1 else "buy",
+                    config,
+                )
+                pnl = trade_pnl(position, a_price, b_price) - exit_cost
+                position.update({
+                    "exit_signal_date": signal_date,
+                    "exit_date": exec_date,
+                    "exit_zscore": z,
+                    "a_exit_price": a_price,
+                    "b_exit_price": b_price,
+                    "exit_cost": exit_cost,
+                    "total_cost": float(position["entry_cost"]) + exit_cost,
+                    "holding_days": (pd.Timestamp(exec_date) - pd.Timestamp(position["entry_date"])).days,
+                    "pnl": pnl,
+                    "return_on_gross_exposure": pnl / float(position["gross_exposure"]),
+                    "status": "closed",
+                })
+                trades.append(position)
+            else:
+                still_open.append(position)
+
+        open_positions = still_open
+
+        direction, a_sign, b_sign = entry_direction(z, config.entry_z)
+        if direction is None:
+            continue
+
+        weights = choose_weights(beta)
+        a_notional = config.capital * float(weights["a_weight"])
+        b_notional = config.capital * float(weights["b_weight"])
+        a_shares = int(a_notional // a_price) if config.integer_shares else a_notional / a_price
+        b_shares = int(b_notional // b_price) if config.integer_shares else b_notional / b_price
+
+        if a_shares <= 0 or b_shares <= 0:
+            continue
+
+        a_entry_notional = float(a_shares * a_price)
+        b_entry_notional = float(b_shares * b_price)
+        entry_cost = transaction_cost(
+            a_entry_notional,
+            "buy" if a_sign == 1 else "sell",
+            config,
+        ) + transaction_cost(
+            b_entry_notional,
+            "buy" if b_sign == 1 else "sell",
+            config,
+        )
+
+        open_positions.append({
+            "a_code": a_code,
+            "b_code": b_code,
+            "direction": direction,
+            "entry_signal_date": signal_date,
+            "entry_date": exec_date,
+            "entry_zscore": z,
+            "entry_beta": beta,
+            "a_sign": a_sign,
+            "b_sign": b_sign,
+            "a_entry_price": a_price,
+            "b_entry_price": b_price,
+            "a_shares": a_shares,
+            "b_shares": b_shares,
+            "a_entry_notional": a_entry_notional,
+            "b_entry_notional": b_entry_notional,
+            "gross_exposure": a_entry_notional + b_entry_notional,
+            "entry_cost": entry_cost,
+            **weights,
+        })
+
+    if open_positions:
         last_date = close_df.index[-1]
-        pnl = trade_pnl(current, float(close_df.loc[last_date, a_code]), float(close_df.loc[last_date, b_code]))
-        current.update({"exit_signal_date": pd.NaT, "exit_date": pd.NaT, "exit_zscore": np.nan, "a_exit_price": np.nan, "b_exit_price": np.nan, "exit_cost": 0.0, "total_cost": float(current["entry_cost"]), "holding_days": (last_date - pd.Timestamp(current["entry_date"])).days, "pnl": pnl, "return_on_gross_exposure": pnl / float(current["gross_exposure"]), "status": "open"})
-        trades.append(current)
+        for position in open_positions:
+            pnl = trade_pnl(
+                position,
+                float(close_df.loc[last_date, a_code]),
+                float(close_df.loc[last_date, b_code]),
+            )
+            position.update({
+                "exit_signal_date": pd.NaT,
+                "exit_date": pd.NaT,
+                "exit_zscore": np.nan,
+                "a_exit_price": np.nan,
+                "b_exit_price": np.nan,
+                "exit_cost": 0.0,
+                "total_cost": float(position["entry_cost"]),
+                "holding_days": (last_date - pd.Timestamp(position["entry_date"])).days,
+                "pnl": pnl,
+                "return_on_gross_exposure": pnl / float(position["gross_exposure"]),
+                "status": "open",
+            })
+            trades.append(position)
+
     return pd.DataFrame(trades)
 
 
@@ -1239,12 +1316,39 @@ def spread_chart(signals: pd.DataFrame, config: Config) -> go.Figure:
     if signals.empty:
         fig.update_layout(title="Spread Signal", template="plotly_white", height=370)
         return fig
+
     upper = signals["spread_mean"] + config.entry_z * signals["spread_std"]
     lower = signals["spread_mean"] - config.entry_z * signals["spread_std"]
+    long_signals = signals[signals["zscore"] <= -config.entry_z]
+    short_signals = signals[signals["zscore"] >= config.entry_z]
+
     fig.add_trace(go.Scatter(x=signals.index, y=signals["spread"], name="spread", mode="lines"))
     fig.add_trace(go.Scatter(x=signals.index, y=signals["spread_mean"], name="rolling mean", mode="lines"))
     fig.add_trace(go.Scatter(x=signals.index, y=upper, name="+entry band", mode="lines", line=dict(dash="dash")))
     fig.add_trace(go.Scatter(x=signals.index, y=lower, name="-entry band", mode="lines", line=dict(dash="dash")))
+
+    if not short_signals.empty:
+        fig.add_trace(go.Scatter(
+            x=short_signals.index,
+            y=short_signals["spread"],
+            name="short signal",
+            mode="markers",
+            marker=dict(symbol="triangle-down", size=11),
+            customdata=short_signals[["zscore"]],
+            hovertemplate="short signal<br>%{x}<br>spread=%{y:.4f}<br>z=%{customdata[0]:.2f}<extra></extra>",
+        ))
+
+    if not long_signals.empty:
+        fig.add_trace(go.Scatter(
+            x=long_signals.index,
+            y=long_signals["spread"],
+            name="long signal",
+            mode="markers",
+            marker=dict(symbol="triangle-up", size=11),
+            customdata=long_signals[["zscore"]],
+            hovertemplate="long signal<br>%{x}<br>spread=%{y:.4f}<br>z=%{customdata[0]:.2f}<extra></extra>",
+        ))
+
     fig.update_layout(title="Spread Signal", template="plotly_white", height=370, hovermode="x unified")
     return fig
 
