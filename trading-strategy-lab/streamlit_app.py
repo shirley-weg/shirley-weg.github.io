@@ -1939,24 +1939,24 @@ def ols(y: np.ndarray, x: np.ndarray) -> tuple[float, float]:
 
 
 def entry_direction(z: float, spread: float, ma5: float, entry_z: float) -> tuple[str | None, int, int]:
-    if z >= entry_z:
+    if not np.isfinite(ma5):
+        return None, 0, 0
+
+    if z >= entry_z and spread > ma5:
         return "short_spread", -1, 1
 
-    if z <= -entry_z:
+    if z <= -entry_z and spread < ma5:
         return "long_spread", 1, -1
 
     return None, 0, 0
 
 
 def should_exit(direction: str, z: float, spread: float, ma5: float) -> bool:
-    if not np.isfinite(ma5):
-        return False
-
     if direction == "short_spread":
-        return spread <= ma5 or z <= 0
+        return z <= 0
 
     if direction == "long_spread":
-        return spread >= ma5 or z >= 0
+        return z >= 0
 
     return False
 
