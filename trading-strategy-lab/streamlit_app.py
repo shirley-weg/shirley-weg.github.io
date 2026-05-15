@@ -1408,7 +1408,8 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
     return pd.DataFrame(trades)
 
 def choose_weights(beta: float) -> dict[str, object]:
-    return {"a_weight": 0.5, "b_weight": 0.5, "weight_method": "fixed_50_50"}
+    ols_a = 1 / (1 + abs(beta))
+    return {"a_weight": float(ols_a), "b_weight": float(1 - ols_a), "weight_method": "ols_beta"}
 
 
 def build_equity(trades: pd.DataFrame, close_df: pd.DataFrame, start: pd.Timestamp, capital: float) -> pd.DataFrame:
