@@ -288,6 +288,7 @@ MIN_CROSSINGS_PER_YEAR = 4
 TOP_N = 10
 STOP_Z = 3.5
 MAX_OPEN_POSITIONS_PER_DIRECTION = 3
+MA_WINDOW = 5
 
 
 @dataclass(frozen=True)
@@ -1156,22 +1157,42 @@ def normalize_index(obj: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
 def rolling_spread_signal(close_df: pd.DataFrame, a_code: str, b_code: str, lookback: int) -> pd.DataFrame:
     logp = np.log(close_df[[a_code, b_code]].dropna())
     rows: list[dict[str, object]] = []
+
     for i in range(lookback, len(logp) - 1):
         signal_date = logp.index[i]
         exec_date = logp.index[i + 1]
         train = logp.iloc[i - lookback : i]
+
         alpha, beta = ols(train[a_code].to_numpy(), train[b_code].to_numpy())
         train_spread = train[a_code].to_numpy() - (alpha + beta * train[b_code].to_numpy())
         spread_mean = float(train_spread.mean())
         spread_std = float(train_spread.std(ddof=1))
+
         if not np.isfinite(spread_std) or spread_std == 0:
             continue
+
         spread = float(logp.iloc[i][a_code] - alpha - beta * logp.iloc[i][b_code])
         zscore = (spread - spread_mean) / spread_std
-        rows.append({"signal_date": signal_date, "exec_date": exec_date, "alpha": alpha, "beta": beta, "spread": spread, "spread_mean": spread_mean, "spread_std": spread_std, "zscore": zscore})
+
+        rows.append({
+            "signal_date": signal_date,
+            "exec_date": exec_date,
+            "alpha": alpha,
+            "beta": beta,
+            "spread": spread,
+            "spread_mean": spread_mean,
+            "spread_std": spread_std,
+            "zscore": zscore,
+        })
+
     if not rows:
-        return pd.DataFrame(columns=["exec_date", "alpha", "beta", "spread", "spread_mean", "spread_std", "zscore"]).rename_axis("signal_date")
-    return pd.DataFrame(rows).set_index("signal_date")
+        return pd.DataFrame(
+            columns=["exec_date", "alpha", "beta", "spread", "spread_mean", "spread_std", "zscore", "ma5"]
+        ).rename_axis("signal_date")
+
+    out = pd.DataFrame(rows).set_index("signal_date")
+    out["ma5"] = out["spread"].rolling(MA_WINDOW).mean()
+    return out
 
 
 def latest_spread_signal(close_df: pd.DataFrame, a_code: str, b_code: str, lookback: int) -> dict[str, object]:
@@ -1179,31 +1200,57 @@ def latest_spread_signal(close_df: pd.DataFrame, a_code: str, b_code: str, lookb
     if len(logp) <= lookback:
         return {}
 
-    signal_date = logp.index[-1]
-    train = logp.iloc[-lookback - 1 : -1]
-    if len(train) < lookback:
+    rows: list[dict[str, object]] = []
+
+    # Include the latest available close, even though it has no next-day exec_date yet.
+    for i in range(lookback, len(logp)):
+        signal_date = logp.index[i]
+        train = logp.iloc[i - lookback : i]
+
+        if len(train) < lookback:
+            continue
+
+        alpha, beta = ols(train[a_code].to_numpy(), train[b_code].to_numpy())
+        train_spread = train[a_code].to_numpy() - (alpha + beta * train[b_code].to_numpy())
+        spread_mean = float(train_spread.mean())
+        spread_std = float(train_spread.std(ddof=1))
+
+        if not np.isfinite(spread_std) or spread_std == 0:
+            continue
+
+        spread = float(logp.iloc[i][a_code] - alpha - beta * logp.iloc[i][b_code])
+        zscore = (spread - spread_mean) / spread_std
+
+        rows.append({
+            "signal_date": signal_date,
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "spread": spread,
+            "spread_mean": spread_mean,
+            "spread_std": spread_std,
+            "zscore": float(zscore),
+        })
+
+    if not rows:
         return {}
 
-    alpha, beta = ols(train[a_code].to_numpy(), train[b_code].to_numpy())
-    train_spread = train[a_code].to_numpy() - (alpha + beta * train[b_code].to_numpy())
-    spread_mean = float(train_spread.mean())
-    spread_std = float(train_spread.std(ddof=1))
-    if not np.isfinite(spread_std) or spread_std == 0:
-        return {}
+    latest_df = pd.DataFrame(rows).set_index("signal_date")
+    latest_df["ma5"] = latest_df["spread"].rolling(MA_WINDOW).mean()
 
-    spread = float(logp.iloc[-1][a_code] - alpha - beta * logp.iloc[-1][b_code])
-    zscore = (spread - spread_mean) / spread_std
+    latest_date = latest_df.index[-1]
+    row = latest_df.iloc[-1]
 
     return {
-        "signal_date": signal_date,
-        "alpha": float(alpha),
-        "beta": float(beta),
-        "spread": spread,
-        "spread_mean": spread_mean,
-        "spread_std": spread_std,
-        "zscore": float(zscore),
-        "a_close": float(close_df.loc[signal_date, a_code]),
-        "b_close": float(close_df.loc[signal_date, b_code]),
+        "signal_date": latest_date,
+        "alpha": float(row["alpha"]),
+        "beta": float(row["beta"]),
+        "spread": float(row["spread"]),
+        "spread_mean": float(row["spread_mean"]),
+        "spread_std": float(row["spread_std"]),
+        "ma5": float(row["ma5"]) if pd.notna(row["ma5"]) else np.nan,
+        "zscore": float(row["zscore"]),
+        "a_close": float(close_df.loc[latest_date, a_code]),
+        "b_close": float(close_df.loc[latest_date, b_code]),
     }
 
 
@@ -1228,6 +1275,97 @@ def run_backtest(open_df: pd.DataFrame, close_df: pd.DataFrame, benchmark: pd.Se
     return {"signals": signals, "latest_signal": latest_signal, "trades": trades, "equity": equity, "comparison": comparison, "summary": summary, "price_history": price_history, "weights": weights}
 
 
+def dollar_neutral_sizing(a_price: float, b_price: float, capital: float, integer_shares: bool) -> dict[str, float]:
+    """
+    Dollar-neutral sizing.
+
+    Goal:
+        A notional ≈ B notional
+
+    Example:
+        If A is 300 and B is 100, then 1 share of A should pair with
+        about 3 shares of B, so signed notional is close to zero.
+    """
+    if a_price <= 0 or b_price <= 0:
+        raise ValueError("Prices must be positive.")
+
+    target_leg_notional = capital / 2
+
+    if not integer_shares:
+        a_shares = target_leg_notional / a_price
+        b_shares = target_leg_notional / b_price
+        a_notional = a_shares * a_price
+        b_notional = b_shares * b_price
+        gross_exposure = a_notional + b_notional
+
+        return {
+            "a_shares": float(a_shares),
+            "b_shares": float(b_shares),
+            "a_entry_notional": float(a_notional),
+            "b_entry_notional": float(b_notional),
+            "gross_exposure": float(gross_exposure),
+            "net_exposure_abs": float(abs(a_notional - b_notional)),
+            "a_weight": float(a_notional / gross_exposure) if gross_exposure else np.nan,
+            "b_weight": float(b_notional / gross_exposure) if gross_exposure else np.nan,
+            "weight_method": "dollar_neutral",
+        }
+
+    a_base = max(1, int(target_leg_notional // a_price))
+    b_base = max(1, int(target_leg_notional // b_price))
+    candidates: list[dict[str, float]] = []
+
+    for a_shares in range(max(1, a_base - 10), a_base + 11):
+        a_notional = float(a_shares * a_price)
+        b_shares = max(1, int(round(a_notional / b_price)))
+        b_notional = float(b_shares * b_price)
+        gross_exposure = a_notional + b_notional
+        net_exposure_abs = abs(a_notional - b_notional)
+        capital_error = abs(gross_exposure - capital)
+        score = net_exposure_abs + 0.01 * capital_error
+        candidates.append({
+            "a_shares": float(a_shares),
+            "b_shares": float(b_shares),
+            "a_entry_notional": a_notional,
+            "b_entry_notional": b_notional,
+            "gross_exposure": gross_exposure,
+            "net_exposure_abs": net_exposure_abs,
+            "score": score,
+        })
+
+    for b_shares in range(max(1, b_base - 10), b_base + 11):
+        b_notional = float(b_shares * b_price)
+        a_shares = max(1, int(round(b_notional / a_price)))
+        a_notional = float(a_shares * a_price)
+        gross_exposure = a_notional + b_notional
+        net_exposure_abs = abs(a_notional - b_notional)
+        capital_error = abs(gross_exposure - capital)
+        score = net_exposure_abs + 0.01 * capital_error
+        candidates.append({
+            "a_shares": float(a_shares),
+            "b_shares": float(b_shares),
+            "a_entry_notional": a_notional,
+            "b_entry_notional": b_notional,
+            "gross_exposure": gross_exposure,
+            "net_exposure_abs": net_exposure_abs,
+            "score": score,
+        })
+
+    best = min(candidates, key=lambda row: row["score"])
+    gross_exposure = float(best["gross_exposure"])
+
+    return {
+        "a_shares": float(best["a_shares"]),
+        "b_shares": float(best["b_shares"]),
+        "a_entry_notional": float(best["a_entry_notional"]),
+        "b_entry_notional": float(best["b_entry_notional"]),
+        "gross_exposure": gross_exposure,
+        "net_exposure_abs": float(best["net_exposure_abs"]),
+        "a_weight": float(best["a_entry_notional"] / gross_exposure) if gross_exposure else np.nan,
+        "b_weight": float(best["b_entry_notional"] / gross_exposure) if gross_exposure else np.nan,
+        "weight_method": "dollar_neutral",
+    }
+
+
 def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.DataFrame, a_code: str, b_code: str, config: Config) -> pd.DataFrame:
     trades: list[dict[str, object]] = []
     open_positions: list[dict[str, object]] = []
@@ -1240,6 +1378,8 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
         a_price = float(open_df.loc[exec_date, a_code])
         b_price = float(open_df.loc[exec_date, b_code])
         z = float(row["zscore"])
+        spread = float(row["spread"])
+        ma5 = float(row["ma5"]) if "ma5" in row and pd.notna(row["ma5"]) else np.nan
         beta = float(row["beta"])
 
         if not np.isfinite(beta) or beta <= 0:
@@ -1248,7 +1388,7 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
         still_open: list[dict[str, object]] = []
         for position in open_positions:
             stop_loss = should_stop_loss(str(position["direction"]), z)
-            normal_exit = should_exit(str(position["direction"]), z, config.exit_z)
+            normal_exit = should_exit(str(position["direction"]), z, spread, ma5)
 
             if stop_loss or normal_exit:
                 exit_cost = transaction_cost(
@@ -1265,6 +1405,8 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
                     "exit_signal_date": signal_date,
                     "exit_date": exec_date,
                     "exit_zscore": z,
+                    "exit_spread": spread,
+                    "exit_ma5": ma5,
                     "a_exit_price": a_price,
                     "b_exit_price": b_price,
                     "exit_cost": exit_cost,
@@ -1281,7 +1423,7 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
 
         open_positions = still_open
 
-        direction, a_sign, b_sign = entry_direction(z, config.entry_z)
+        direction, a_sign, b_sign = entry_direction(z, spread, ma5, config.entry_z)
         if direction is None:
             continue
 
@@ -1295,17 +1437,21 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
         if same_direction_open_count >= MAX_OPEN_POSITIONS_PER_DIRECTION:
             continue
 
-        weights = choose_weights(beta)
-        a_notional = config.capital * float(weights["a_weight"])
-        b_notional = config.capital * float(weights["b_weight"])
-        a_shares = int(a_notional // a_price) if config.integer_shares else a_notional / a_price
-        b_shares = int(b_notional // b_price) if config.integer_shares else b_notional / b_price
+        sizing = dollar_neutral_sizing(
+            a_price=a_price,
+            b_price=b_price,
+            capital=config.capital,
+            integer_shares=config.integer_shares,
+        )
+
+        a_shares = sizing["a_shares"]
+        b_shares = sizing["b_shares"]
 
         if a_shares <= 0 or b_shares <= 0:
             continue
 
-        a_entry_notional = float(a_shares * a_price)
-        b_entry_notional = float(b_shares * b_price)
+        a_entry_notional = float(sizing["a_entry_notional"])
+        b_entry_notional = float(sizing["b_entry_notional"])
         entry_cost = transaction_cost(
             a_entry_notional,
             "buy" if a_sign == 1 else "sell",
@@ -1323,6 +1469,8 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
             "entry_signal_date": signal_date,
             "entry_date": exec_date,
             "entry_zscore": z,
+            "entry_spread": spread,
+            "entry_ma5": ma5,
             "entry_beta": beta,
             "a_sign": a_sign,
             "b_sign": b_sign,
@@ -1332,10 +1480,13 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
             "b_shares": b_shares,
             "a_entry_notional": a_entry_notional,
             "b_entry_notional": b_entry_notional,
-            "gross_exposure": a_entry_notional + b_entry_notional,
+            "gross_exposure": float(sizing["gross_exposure"]),
+            "net_exposure_abs": float(sizing["net_exposure_abs"]),
             "entry_cost": entry_cost,
             "entry_layer": same_direction_open_count + 1,
-            **weights,
+            "a_weight": float(sizing["a_weight"]),
+            "b_weight": float(sizing["b_weight"]),
+            "weight_method": str(sizing["weight_method"]),
         })
 
     if open_positions:
@@ -1350,6 +1501,8 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
                 "exit_signal_date": pd.NaT,
                 "exit_date": pd.NaT,
                 "exit_zscore": np.nan,
+                "exit_spread": np.nan,
+                "exit_ma5": np.nan,
                 "a_exit_price": np.nan,
                 "b_exit_price": np.nan,
                 "exit_cost": 0.0,
@@ -1363,6 +1516,7 @@ def backtest_pair(signals: pd.DataFrame, open_df: pd.DataFrame, close_df: pd.Dat
             trades.append(position)
 
     return pd.DataFrame(trades)
+
 
 def choose_weights(beta: float) -> dict[str, object]:
     ols_a = 1 / (1 + abs(beta))
@@ -1430,11 +1584,13 @@ def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: s
     latest_date = pd.Timestamp(latest_signal["signal_date"])
     latest_z = float(latest_signal["zscore"])
     latest_beta = float(latest_signal["beta"])
+    latest_spread = float(latest_signal["spread"])
+    latest_ma5 = float(latest_signal["ma5"]) if "ma5" in latest_signal and pd.notna(latest_signal["ma5"]) else np.nan
     a_close = float(latest_signal["a_close"])
     b_close = float(latest_signal["b_close"])
 
     open_positions = trades[trades["status"].eq("open")].copy() if not trades.empty and "status" in trades.columns else pd.DataFrame()
-    direction, a_sign, b_sign = entry_direction(latest_z, config.entry_z)
+    direction, a_sign, b_sign = entry_direction(latest_z, latest_spread, latest_ma5, config.entry_z)
     in_stop_zone = is_stop_zone(latest_z)
 
     if direction is None:
@@ -1470,13 +1626,16 @@ def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: s
             a_suggested_shares = 0
             b_suggested_shares = 0
         else:
-            weights = choose_weights(latest_beta)
-            a_signed_weight = float(weights["a_weight"]) * a_sign
-            b_signed_weight = float(weights["b_weight"]) * b_sign
-            a_notional = config.capital * float(weights["a_weight"])
-            b_notional = config.capital * float(weights["b_weight"])
-            a_suggested_shares = int(a_notional // a_close) if config.integer_shares else a_notional / a_close
-            b_suggested_shares = int(b_notional // b_close) if config.integer_shares else b_notional / b_close
+            sizing = dollar_neutral_sizing(
+                a_price=a_close,
+                b_price=b_close,
+                capital=config.capital,
+                integer_shares=config.integer_shares,
+            )
+            a_signed_weight = float(sizing["a_weight"]) * a_sign
+            b_signed_weight = float(sizing["b_weight"]) * b_sign
+            a_suggested_shares = sizing["a_shares"]
+            b_suggested_shares = sizing["b_shares"]
             layer_text = f"第 {same_direction_open_count + 1} 層 / 最多 {MAX_OPEN_POSITIONS_PER_DIRECTION} 層"
             signal_text = f"新進場訊號：{direction}"
             a_action = action_text(a_sign)
@@ -1487,7 +1646,7 @@ def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: s
         exit_text = "無持倉"
     else:
         stop_loss_count = int(open_positions["direction"].astype(str).apply(lambda d: should_stop_loss(d, latest_z)).sum())
-        exit_count = int(open_positions["direction"].astype(str).apply(lambda d: should_exit(d, latest_z, config.exit_z)).sum())
+        exit_count = int(open_positions["direction"].astype(str).apply(lambda d: should_exit(d, latest_z, latest_spread, latest_ma5)).sum())
         stop_loss_text = "是" if stop_loss_count > 0 else "否"
         exit_text = "是" if exit_count > 0 else "否"
 
@@ -1524,7 +1683,7 @@ def show_latest_trading_signal(result: dict[str, object], a_code: str, b_code: s
     open_positions["b_signed_weight"] = open_positions["b_weight"].astype(float) * open_positions["b_sign"].astype(float)
     open_positions["current_zscore"] = latest_z
     open_positions["current_action"] = open_positions["direction"].astype(str).apply(
-        lambda d: "停損出場" if should_stop_loss(d, latest_z) else ("正常出場" if should_exit(d, latest_z, config.exit_z) else "續抱")
+        lambda d: "停損出場" if should_stop_loss(d, latest_z) else ("正常出場" if should_exit(d, latest_z, latest_spread, latest_ma5) else "續抱")
     )
 
     total_a_signed_shares = float(open_positions["a_signed_shares"].sum())
@@ -1672,10 +1831,11 @@ def spread_chart(signals: pd.DataFrame, config: Config) -> go.Figure:
 
     upper = signals["spread_mean"] + config.entry_z * signals["spread_std"]
     lower = signals["spread_mean"] - config.entry_z * signals["spread_std"]
-    long_signals = signals[signals["zscore"] <= -config.entry_z]
-    short_signals = signals[signals["zscore"] >= config.entry_z]
+    long_signals = signals[(signals["zscore"] <= -config.entry_z) & (signals["spread"] < signals["ma5"])]
+    short_signals = signals[(signals["zscore"] >= config.entry_z) & (signals["spread"] > signals["ma5"])]
 
     fig.add_trace(go.Scatter(x=signals.index, y=signals["spread"], name="spread", mode="lines"))
+    fig.add_trace(go.Scatter(x=signals.index, y=signals["ma5"], name="5MA", mode="lines"))
     fig.add_trace(go.Scatter(x=signals.index, y=signals["spread_mean"], name="rolling mean", mode="lines"))
     fig.add_trace(go.Scatter(x=signals.index, y=upper, name="+entry band", mode="lines", line=dict(dash="dash")))
     fig.add_trace(go.Scatter(x=signals.index, y=lower, name="-entry band", mode="lines", line=dict(dash="dash")))
@@ -1687,8 +1847,8 @@ def spread_chart(signals: pd.DataFrame, config: Config) -> go.Figure:
             name="short signal",
             mode="markers",
             marker=dict(symbol="triangle-down", size=11),
-            customdata=short_signals[["zscore"]],
-            hovertemplate="short signal<br>%{x}<br>spread=%{y:.4f}<br>z=%{customdata[0]:.2f}<extra></extra>",
+            customdata=short_signals[["zscore", "ma5"]],
+            hovertemplate="short signal<br>%{x}<br>spread=%{y:.4f}<br>MA5=%{customdata[1]:.4f}<br>z=%{customdata[0]:.2f}<extra></extra>",
         ))
 
     if not long_signals.empty:
@@ -1698,13 +1858,12 @@ def spread_chart(signals: pd.DataFrame, config: Config) -> go.Figure:
             name="long signal",
             mode="markers",
             marker=dict(symbol="triangle-up", size=11),
-            customdata=long_signals[["zscore"]],
-            hovertemplate="long signal<br>%{x}<br>spread=%{y:.4f}<br>z=%{customdata[0]:.2f}<extra></extra>",
+            customdata=long_signals[["zscore", "ma5"]],
+            hovertemplate="long signal<br>%{x}<br>spread=%{y:.4f}<br>MA5=%{customdata[1]:.4f}<br>z=%{customdata[0]:.2f}<extra></extra>",
         ))
 
     fig.update_layout(title="Spread Signal", template="plotly_white", height=370, hovermode="x unified")
     return fig
-
 
 def trade_chart(trades: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
@@ -1779,16 +1938,30 @@ def ols(y: np.ndarray, x: np.ndarray) -> tuple[float, float]:
     return float(alpha), float(beta)
 
 
-def entry_direction(z: float, entry_z: float) -> tuple[str | None, int, int]:
-    if z <= -entry_z:
-        return "long_spread", 1, -1
-    if z >= entry_z:
+def entry_direction(z: float, spread: float, ma5: float, entry_z: float) -> tuple[str | None, int, int]:
+    if not np.isfinite(ma5):
+        return None, 0, 0
+
+    if z >= entry_z and spread > ma5:
         return "short_spread", -1, 1
+
+    if z <= -entry_z and spread < ma5:
+        return "long_spread", 1, -1
+
     return None, 0, 0
 
 
-def should_exit(direction: str, z: float, exit_z: float) -> bool:
-    return (direction == "long_spread" and z >= exit_z) or (direction == "short_spread" and z <= -exit_z)
+def should_exit(direction: str, z: float, spread: float, ma5: float) -> bool:
+    if not np.isfinite(ma5):
+        return False
+
+    if direction == "short_spread":
+        return spread <= ma5 or z <= 0
+
+    if direction == "long_spread":
+        return spread >= ma5 or z >= 0
+
+    return False
 
 
 def should_stop_loss(direction: str, z: float) -> bool:
