@@ -353,7 +353,7 @@ def render_strategy_selector() -> None:
         <div class="strategy-card">
           <h3>策略1：Pair Trading 回測</h3>
           <p>
-            使用 rolling OLS 估計 spread 與 z-score，並使用 OLS hedge ratio
+            使用 rolling OLS 估計 spread 與 z-score，並使用 OLS beta
             作為雙邊部位權重。
           </p>
         </div>
