@@ -1831,8 +1831,8 @@ def spread_chart(signals: pd.DataFrame, config: Config) -> go.Figure:
 
     upper = signals["spread_mean"] + config.entry_z * signals["spread_std"]
     lower = signals["spread_mean"] - config.entry_z * signals["spread_std"]
-    long_signals = signals[(signals["zscore"] <= -config.entry_z) & (signals["spread"] < signals["ma5"])]
-    short_signals = signals[(signals["zscore"] >= config.entry_z) & (signals["spread"] > signals["ma5"])]
+    long_signals = signals[signals["zscore"] <= -config.entry_z]
+    short_signals = signals[signals["zscore"] >= config.entry_z]
 
     fig.add_trace(go.Scatter(x=signals.index, y=signals["spread"], name="spread", mode="lines"))
     fig.add_trace(go.Scatter(x=signals.index, y=signals["ma5"], name="5MA", mode="lines"))
@@ -1939,13 +1939,10 @@ def ols(y: np.ndarray, x: np.ndarray) -> tuple[float, float]:
 
 
 def entry_direction(z: float, spread: float, ma5: float, entry_z: float) -> tuple[str | None, int, int]:
-    if not np.isfinite(ma5):
-        return None, 0, 0
-
-    if z >= entry_z and spread > ma5:
+    if z >= entry_z:
         return "short_spread", -1, 1
 
-    if z <= -entry_z and spread < ma5:
+    if z <= -entry_z:
         return "long_spread", 1, -1
 
     return None, 0, 0
