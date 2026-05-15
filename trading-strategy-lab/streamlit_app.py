@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import html
 import re
+import contextlib
+import io
+import logging
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -12,6 +16,10 @@ import requests
 import streamlit as st
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
+
+
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore")
 
 
 # Taiwan single-stock futures underlyings (ordinary stocks only; ETF futures excluded)
@@ -389,11 +397,10 @@ def sidebar_settings() -> dict[str, object]:
     start_default = (pd.Timestamp(today) - pd.DateOffset(years=2)).date()
     start = st.sidebar.date_input("Backtest start", value=start_default)
     end = st.sidebar.date_input("Backtest end", value=today)
-    suffix = st.sidebar.text_input("Yahoo suffix", value=".TW")
     benchmark = st.sidebar.text_input("Benchmark", value="^TWII")
 
-    a_name = resolve_stock_name(a_code, suffix) if a_code else ""
-    b_name = resolve_stock_name(b_code, suffix) if b_code else ""
+    a_name = resolve_stock_name(a_code) if a_code else ""
+    b_name = resolve_stock_name(b_code) if b_code else ""
     if a_code or b_code:
         st.sidebar.caption(
             f"辨識結果：{format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}"
@@ -419,7 +426,6 @@ def sidebar_settings() -> dict[str, object]:
         "b_name": b_name,
         "start": pd.Timestamp(start),
         "end": pd.Timestamp(end),
-        "suffix": suffix,
         "benchmark": benchmark,
         "config": Config(
             lookback=lookback,
@@ -454,7 +460,7 @@ def render_backtest(settings: dict[str, object]) -> None:
         run = st.button("Run backtest", type="primary", use_container_width=True)
 
     with right:
-        render_pair_screening_panel(str(settings["suffix"]))
+        render_pair_screening_panel()
 
     if not run:
         st.info("調整左側設定後按 Run backtest。")
@@ -473,7 +479,7 @@ def render_backtest(settings: dict[str, object]) -> None:
         with st.spinner("下載價格並執行回測..."):
             warmup = max(config.lookback * 3, 365)
             download_start = start - pd.DateOffset(days=warmup)
-            open_df, close_df = download_ohlc([a_code, b_code], download_start, end, str(settings["suffix"]))
+            open_df, close_df = download_ohlc([a_code, b_code], download_start, end)
             benchmark = download_benchmark(str(settings["benchmark"]), download_start, end)
             result = run_backtest(open_df, close_df, benchmark, a_code, b_code, start, end, config)
     except Exception as exc:
@@ -486,21 +492,24 @@ def render_backtest(settings: dict[str, object]) -> None:
     show_tables(result)
 
 
-def render_pair_screening_panel(suffix: str) -> None:
+def render_pair_screening_panel() -> None:
     st.subheader("細產業 Pair 推薦")
     industry_groups = build_industry_groups()
     industry_options = sorted(industry_groups.keys())
 
     industry = st.selectbox("選擇細產業", industry_options, index=industry_options.index("半導體業") if "半導體業" in industry_options else 0)
     stocks = industry_groups[industry]
-    st.caption(f"此細產業共有 {len(stocks)} 檔可篩選股票；篩選邏輯使用高相關性、ADF、half-life、trend strength 與 crossings。")
+    st.caption(
+        f"此細產業共有 {len(stocks)} 檔可篩選股票；"
+        "篩選邏輯為 log(price) 高相關 + OLS regression spread 趨勢不明顯。"
+    )
 
     run_screen = st.button("篩選最佳 10 組 Pair", use_container_width=True)
 
     if run_screen:
         with st.spinner("下載價格並篩選 pair..."):
             try:
-                best_pairs = screen_best_pairs_by_industry(industry, tuple(stocks), suffix)
+                best_pairs = screen_best_pairs_by_industry(industry, tuple(stocks))
             except Exception as exc:
                 st.error(f"篩選失敗：{exc}")
                 return
@@ -525,21 +534,23 @@ def render_pair_screening_panel(suffix: str) -> None:
         "stock_B_code", "stock_B_name",
         "correlation",
         "beta_hedge_ratio",
-        "adf_pvalue",
-        "half_life",
+        "spread_method",
         "trend_strength",
-        "crossings_per_year",
-        "score",
+        "trend_pvalue",
+        "spread_mean",
+        "spread_std",
         "suitable",
     ]
     show_df = best_pairs_df[[c for c in display_cols if c in best_pairs_df.columns]].copy()
-    for c in ["correlation", "beta_hedge_ratio", "adf_pvalue", "half_life", "trend_strength", "crossings_per_year"]:
+    for c in ["correlation", "beta_hedge_ratio", "trend_strength", "trend_pvalue", "spread_mean", "spread_std"]:
         if c in show_df.columns:
             show_df[c] = show_df[c].astype(float).round(4)
     st.dataframe(show_df, use_container_width=True, hide_index=True)
 
     pair_labels = [
-        f"{int(row['rank'])}. {row['stock_A_code']} {row['stock_A_name']} / {row['stock_B_code']} {row['stock_B_name']} | corr={float(row['correlation']):.3f} | score={int(row['score'])}"
+        f"{int(row['rank'])}. {row['stock_A_code']} {row['stock_A_name']} / "
+        f"{row['stock_B_code']} {row['stock_B_name']} | "
+        f"corr={float(row['correlation']):.3f} | trend={float(row['trend_strength']):.3f}"
         for _, row in best_pairs_df.iterrows()
     ]
     selected_label = st.selectbox("套用推薦 pair 到回測", pair_labels)
@@ -562,12 +573,75 @@ def build_industry_groups() -> dict[str, list[tuple[str, str]]]:
     return groups
 
 
+
+def candidate_yahoo_tickers(code: str) -> list[str]:
+    code = str(code).strip().upper()
+    if not code:
+        return []
+    if "." in code or code.startswith("^") or "-" in code or "=" in code:
+        return [code]
+    return [f"{code}.TW", f"{code}.TWO"]
+
+
+def extract_close_series_from_single_download(raw: pd.DataFrame) -> pd.Series:
+    if raw is None or raw.empty:
+        return pd.Series(dtype=float)
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" in raw.columns.get_level_values(0):
+            close = raw["Close"]
+            if isinstance(close, pd.DataFrame):
+                return close.iloc[:, 0]
+            return close
+
+        if "Close" in raw.columns.get_level_values(1):
+            for col in raw.columns:
+                if col[1] == "Close":
+                    return raw[col]
+
+        return pd.Series(dtype=float)
+
+    if "Close" not in raw.columns:
+        return pd.Series(dtype=float)
+
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        return close.iloc[:, 0]
+    return close
+
+
+def extract_ohlc_from_single_download(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        data: dict[str, pd.Series] = {}
+        for field in ["Open", "Close"]:
+            if field in raw.columns.get_level_values(0):
+                obj = raw[field]
+                data[field] = obj.iloc[:, 0] if isinstance(obj, pd.DataFrame) else obj
+            elif field in raw.columns.get_level_values(1):
+                for col in raw.columns:
+                    if col[1] == field:
+                        data[field] = raw[col]
+                        break
+        if "Open" in data and "Close" in data:
+            return pd.DataFrame(data)
+        return pd.DataFrame()
+
+    if "Open" not in raw.columns or "Close" not in raw.columns:
+        return pd.DataFrame()
+
+    return raw[["Open", "Close"]].copy()
+
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], ...], suffix: str) -> pd.DataFrame:
+def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], ...]) -> pd.DataFrame:
     if len(stocks) <= 1:
         return pd.DataFrame()
 
-    price_df = download_screening_prices(stocks, PERIOD, INTERVAL, suffix)
+    price_df = download_screening_prices(stocks, PERIOD, INTERVAL)
     group_price = get_group_price(price_df, stocks)
 
     if group_price.shape[1] <= 1:
@@ -596,36 +670,35 @@ def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], 
         log_a = pair_log[col_a]
         log_b = pair_log[col_b]
 
+        # 保留 regression spread 的做法：
+        # log(A) = alpha + beta * log(B)
+        # spread = log(A) - (alpha + beta * log(B))
         alpha, beta, fitted, spread = ols_spread(log_a, log_b)
         spread_series = pd.Series(spread, index=pair_log.index)
         spread_mean = float(spread_series.mean())
         spread_std = float(spread_series.std())
 
-        adf_stat, adf_pvalue = adf_test(spread_series)
-        half_life = estimate_half_life(spread_series)
         trend_slope, trend_pvalue, trend_strength = trend_strength_test(spread_series)
-        crossings, crossings_per_year = count_crossings(spread_series)
+        if not np.isfinite(trend_strength):
+            continue
+
+        if trend_strength >= MAX_TREND_STRENGTH:
+            continue
 
         record = row.to_dict()
         record.update({
             "alpha": float(alpha),
             "beta_hedge_ratio": float(beta),
+            "spread_method": "ols_regression_residual",
             "spread_mean": spread_mean,
             "spread_std": spread_std,
             "spread_min": float(spread_series.min()),
             "spread_max": float(spread_series.max()),
-            "adf_stat": float(adf_stat),
-            "adf_pvalue": float(adf_pvalue),
-            "adf_pass_5pct": bool(adf_pvalue < ADF_P_THRESHOLD),
-            "half_life": float(half_life) if pd.notna(half_life) else np.nan,
-            "half_life_reasonable": bool(pd.notna(half_life) and MIN_HALF_LIFE <= half_life <= MAX_HALF_LIFE),
             "trend_slope": float(trend_slope),
             "trend_pvalue": float(trend_pvalue),
             "trend_strength": float(trend_strength),
             "no_obvious_trend": bool(trend_strength < MAX_TREND_STRENGTH),
-            "mean_crossings": int(crossings),
-            "crossings_per_year": float(crossings_per_year),
-            "enough_crossings": bool(crossings_per_year >= MIN_CROSSINGS_PER_YEAR),
+            "suitable": bool(trend_strength < MAX_TREND_STRENGTH),
             "start_date": spread_series.index.min(),
             "end_date": spread_series.index.max(),
             "observations": int(len(spread_series)),
@@ -636,32 +709,19 @@ def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], 
     if screening_df.empty:
         return pd.DataFrame()
 
-    screening_df["score"] = screening_df.apply(score_pair, axis=1)
-    screening_df["suitable"] = (
-        screening_df["adf_pass_5pct"]
-        & screening_df["half_life_reasonable"]
-        & screening_df["no_obvious_trend"]
-        & screening_df["enough_crossings"]
-    )
-
     screening_df = screening_df.sort_values(
-        ["suitable", "score", "adf_pvalue", "trend_strength"],
-        ascending=[False, False, True, True],
+        ["correlation", "trend_strength"],
+        ascending=[False, True],
     ).reset_index(drop=True)
 
-    best_pairs_df = screening_df[screening_df["suitable"]].copy()
-    if best_pairs_df.empty:
-        best_pairs_df = screening_df.head(TOP_N).copy()
-    else:
-        best_pairs_df = best_pairs_df.head(TOP_N).copy()
-
+    best_pairs_df = screening_df.head(TOP_N).copy()
     best_pairs_df = best_pairs_df.reset_index(drop=True)
     best_pairs_df.insert(0, "rank", np.arange(1, len(best_pairs_df) + 1))
     return best_pairs_df
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def download_screening_prices(stocks: tuple[tuple[str, str], ...], period: str, interval: str, suffix: str) -> pd.DataFrame:
+def download_screening_prices(stocks: tuple[tuple[str, str], ...], period: str, interval: str) -> pd.DataFrame:
     import yfinance as yf
 
     cache_dir = Path(__file__).resolve().parent / ".cache" / "yfinance"
@@ -669,32 +729,35 @@ def download_screening_prices(stocks: tuple[tuple[str, str], ...], period: str, 
     if hasattr(yf, "set_tz_cache_location"):
         yf.set_tz_cache_location(str(cache_dir))
 
-    tickers = [to_yahoo_ticker(code, suffix) for code, _ in stocks]
-
-    raw = yf.download(
-        tickers=tickers,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        group_by="ticker",
-        progress=False,
-        threads=True,
-    )
-
-    if raw.empty:
-        return pd.DataFrame()
-
     price_dict: dict[str, pd.Series] = {}
 
     for code, name in stocks:
-        ticker = to_yahoo_ticker(code, suffix)
-        try:
-            s = extract_close_series(raw, ticker)
-            s = s.dropna()
-            if len(s) >= MIN_OBS:
-                price_dict[f"{code}_{name}"] = s
-        except Exception:
-            continue
+        series = pd.Series(dtype=float)
+
+        for ticker in candidate_yahoo_tickers(code):
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        raw = yf.download(
+                            tickers=ticker,
+                            period=period,
+                            interval=interval,
+                            auto_adjust=True,
+                            progress=False,
+                            threads=False,
+                        )
+
+                series = extract_close_series_from_single_download(raw)
+                series = pd.to_numeric(series, errors="coerce").dropna()
+                series = series[series > 0]
+
+                if len(series) >= MIN_OBS:
+                    break
+            except Exception:
+                series = pd.Series(dtype=float)
+
+        if len(series) >= MIN_OBS:
+            price_dict[f"{code}_{name}"] = series
 
     price_df = pd.DataFrame(price_dict).sort_index()
     price_df = price_df.ffill().dropna(how="all")
@@ -897,7 +960,7 @@ def format_stock_label(code: str, name: str) -> str:
     return code or "尚未選擇"
 
 
-def resolve_stock_name(code: str, suffix: str = ".TW") -> str:
+def resolve_stock_name(code: str) -> str:
     code = str(code).strip().upper()
     if not code:
         return ""
@@ -909,7 +972,7 @@ def resolve_stock_name(code: str, suffix: str = ".TW") -> str:
     if twse_name:
         return twse_name
 
-    yahoo_name = fetch_yahoo_tw_stock_name(code, suffix)
+    yahoo_name = fetch_yahoo_tw_stock_name(code)
     if yahoo_name:
         return yahoo_name
 
@@ -943,40 +1006,40 @@ def fetch_twse_stock_name(code: str) -> str:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_yahoo_tw_stock_name(code: str, suffix: str = ".TW") -> str:
-    ticker = to_yahoo_ticker(code, suffix)
-    url = f"https://tw.stock.yahoo.com/quote/{ticker}"
+def fetch_yahoo_tw_stock_name(code: str) -> str:
+    for ticker in candidate_yahoo_tickers(code):
+        url = f"https://tw.stock.yahoo.com/quote/{ticker}"
 
-    try:
-        response = requests.get(
-            url,
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        response.raise_for_status()
-    except Exception:
-        return ""
+        try:
+            response = requests.get(
+                url,
+                timeout=8,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+        except Exception:
+            continue
 
-    text = response.text
-    match = re.search(r"<title>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return ""
+        text = response.text
+        match = re.search(r"<title>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
 
-    title = html.unescape(match.group(1))
-    title = re.sub(r"\s+", " ", title).strip()
+        title = html.unescape(match.group(1))
+        title = re.sub(r"\s+", " ", title).strip()
 
-    # Yahoo Taiwan title usually looks like:
-    # 兆豐金 (2886.TW) 走勢圖 - Yahoo奇摩股市
-    if " (" in title:
-        candidate = title.split(" (", 1)[0].strip()
-        if candidate and candidate != code:
-            return candidate
+        # Yahoo Taiwan title usually looks like:
+        # 兆豐金 (2886.TW) 走勢圖 - Yahoo奇摩股市
+        if " (" in title:
+            candidate = title.split(" (", 1)[0].strip()
+            if candidate and candidate != code:
+                return candidate
 
     return ""
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def download_ohlc(codes: list[str], start: pd.Timestamp, end: pd.Timestamp, suffix: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def download_ohlc(codes: list[str], start: pd.Timestamp, end: pd.Timestamp) -> tuple[pd.DataFrame, pd.DataFrame]:
     import yfinance as yf
 
     cache_dir = Path(__file__).resolve().parent / ".cache" / "yfinance"
@@ -985,26 +1048,55 @@ def download_ohlc(codes: list[str], start: pd.Timestamp, end: pd.Timestamp, suff
         yf.set_tz_cache_location(str(cache_dir))
 
     clean_codes = sorted({c.strip().upper() for c in codes if c.strip()})
-    tickers = [to_yahoo_ticker(code, suffix) for code in clean_codes]
-    raw = yf.download(
-        tickers=tickers,
-        start=start.strftime("%Y-%m-%d"),
-        end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
-    if raw.empty:
-        raise ValueError("Yahoo Finance returned no price data.")
+    open_series: dict[str, pd.Series] = {}
+    close_series: dict[str, pd.Series] = {}
 
-    open_df = extract_price_field(raw, "Open", clean_codes, suffix)
-    close_df = extract_price_field(raw, "Close", clean_codes, suffix)
+    for code in clean_codes:
+        downloaded = pd.DataFrame()
+
+        for ticker in candidate_yahoo_tickers(code):
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        raw = yf.download(
+                            tickers=ticker,
+                            start=start.strftime("%Y-%m-%d"),
+                            end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                            interval="1d",
+                            auto_adjust=True,
+                            progress=False,
+                            threads=False,
+                        )
+
+                downloaded = extract_ohlc_from_single_download(raw)
+                downloaded = downloaded.apply(pd.to_numeric, errors="coerce").dropna()
+                downloaded = downloaded[(downloaded["Open"] > 0) & (downloaded["Close"] > 0)]
+
+                if not downloaded.empty:
+                    break
+            except Exception:
+                downloaded = pd.DataFrame()
+
+        if downloaded.empty:
+            raise ValueError(
+                f"Yahoo Finance returned no price data for {code}. "
+                f"Tried {', '.join(candidate_yahoo_tickers(code))}."
+            )
+
+        downloaded.index = pd.to_datetime(downloaded.index).tz_localize(None).normalize()
+        open_series[code] = downloaded["Open"]
+        close_series[code] = downloaded["Close"]
+
+    open_df = pd.DataFrame(open_series).sort_index()
+    close_df = pd.DataFrame(close_series).sort_index()
+
     valid = open_df.notna().all(axis=1) & close_df.notna().all(axis=1)
     open_df = normalize_index(open_df.loc[valid].sort_index())
     close_df = normalize_index(close_df.loc[valid].sort_index())
+
     if open_df.empty or close_df.empty:
         raise ValueError("Downloaded data has no complete Open/Close rows.")
+
     return open_df, close_df
 
 
@@ -1029,7 +1121,7 @@ def download_benchmark(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> p
     return normalize_index(close.dropna())
 
 
-def to_yahoo_ticker(code: str, suffix: str) -> str:
+def to_yahoo_ticker(code: str, suffix: str = ".TW") -> str:
     if "." in code or code.startswith("^") or "-" in code or "=" in code:
         return code
     return f"{code}{suffix}"
