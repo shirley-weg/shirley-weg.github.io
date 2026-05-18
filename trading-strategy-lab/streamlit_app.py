@@ -615,717 +615,264 @@ def sidebar_strategy2_settings() -> dict[str, object]:
         st.session_state["selected_strategy"] = None
         st.rerun()
 
-    st.sidebar.caption("目前策略：策略2 Cointegration Pairs 台股實證")
+    st.sidebar.caption("目前策略：策略2 Cointegration 單一 Pair 實證")
     st.sidebar.divider()
 
-    industry_groups = build_industry_groups()
-    industry_options = sorted(industry_groups.keys())
-    default_industry = "半導體業" if "半導體業" in industry_options else industry_options[0]
+    st.sidebar.header("回測標的")
+    col_a, col_b = st.sidebar.columns(2)
+    with col_a:
+        a_code = st.text_input("A code", key="s2_a_code_input", value="2330").strip().upper()
+    with col_b:
+        b_code = st.text_input("B code", key="s2_b_code_input", value="2303").strip().upper()
 
-    st.sidebar.header("Universe 設定")
-    use_custom_codes = st.sidebar.toggle("使用自訂股票代碼", value=False)
-    if use_custom_codes:
-        custom_codes = st.sidebar.text_area(
-            "自訂股票代碼",
-            value="2330 2303 2454 3034 3711",
-            help="可用空白、逗號或換行分隔，例如：2330 2303 2454。",
+    a_name = resolve_stock_name(a_code) if a_code else ""
+    b_name = resolve_stock_name(b_code) if b_code else ""
+    if a_code or b_code:
+        st.sidebar.caption(
+            f"辨識結果：{format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}"
         )
-        industry = ""
-    else:
-        industry = st.sidebar.selectbox(
-            "選擇細產業",
-            industry_options,
-            index=industry_options.index(default_industry),
-        )
-        custom_codes = ""
 
-    period = st.sidebar.selectbox("資料期間", ["1y", "2y", "3y", "5y", "10y"], index=2)
-    max_symbols = st.sidebar.slider(
-        "最多下載股票數",
-        min_value=5,
-        max_value=80,
-        value=40,
-        step=5,
-        help="同產業股票太多時，可先限制下載數量以加快實證。",
+    today = pd.Timestamp.today().date()
+    start_default = (pd.Timestamp(today) - pd.DateOffset(years=3)).date()
+    start = st.sidebar.date_input("Full sample start", value=start_default, key="s2_start")
+    end = st.sidebar.date_input("Full sample end", value=today, key="s2_end")
+    benchmark = st.sidebar.text_input("Benchmark", value="^TWII", key="s2_benchmark")
+
+    st.sidebar.divider()
+    st.sidebar.header("Formation / Test 設定")
+    formation_ratio = st.sidebar.slider(
+        "Formation ratio",
+        min_value=0.50,
+        max_value=0.85,
+        value=0.70,
+        step=0.05,
+        help="前段資料用來檢查 cointegration；後段資料用策略1同樣的圖表與交易流程回測。",
     )
-
-    st.sidebar.divider()
-    st.sidebar.header("Pair 篩選參數")
-    formation_ratio = st.sidebar.slider("Formation ratio", 0.50, 0.85, 0.70, 0.05)
-    corr_threshold = st.sidebar.slider("Return correlation threshold", 0.50, 0.98, 0.80, 0.01)
     adf_pvalue = st.sidebar.selectbox("ADF p-value threshold", [0.01, 0.05, 0.10], index=1)
-    top_n = st.sidebar.slider("回測 Top N pairs", 1, 20, 10, 1)
 
     st.sidebar.divider()
-    st.sidebar.header("交易參數")
-    lookback = st.sidebar.slider("Rolling OLS lookback", 40, 260, 120, 10)
-    entry_z = st.sidebar.slider("Entry z-score", 0.5, 4.0, 2.0, 0.1)
-    exit_z = st.sidebar.slider("Exit z-score", 0.0, 1.5, 0.3, 0.1)
-    stop_z = st.sidebar.slider("Stop z-score", 2.0, 6.0, 3.5, 0.1)
-    capital_per_pair = st.sidebar.number_input(
-        "Capital per pair",
-        min_value=10_000,
-        value=1_000_000,
-        step=50_000,
-    )
-    integer_shares = st.sidebar.toggle("整股交易", value=True)
+    st.sidebar.header("策略參數")
+    lookback = st.sidebar.slider("Rolling OLS lookback", 40, 260, 120, 10, key="s2_lookback")
+    entry_z = st.sidebar.slider("Entry z-score", 0.5, 4.0, 2.0, 0.1, key="s2_entry_z")
+    exit_z = st.sidebar.slider("Exit z-score", -1.0, 1.0, 0.0, 0.1, key="s2_exit_z")
+    capital = st.sidebar.number_input("Capital per pair", min_value=10_000, value=100_000, step=10_000, key="s2_capital")
+    integer_shares = st.sidebar.toggle("整股交易", value=True, key="s2_integer_shares")
 
     st.sidebar.divider()
     st.sidebar.header("交易成本")
-    broker_fee = st.sidebar.number_input("Broker fee", min_value=0.0, value=0.001425, step=0.0001, format="%.6f")
-    sell_tax = st.sidebar.number_input("Sell tax", min_value=0.0, value=0.001425, step=0.0001, format="%.6f")
+    broker_fee = st.sidebar.number_input("Broker fee", min_value=0.0, value=0.001425, step=0.0001, format="%.6f", key="s2_broker_fee")
+    sell_tax = st.sidebar.number_input("Sell tax", min_value=0.0, value=0.001425, step=0.0001, format="%.6f", key="s2_sell_tax")
 
     return {
-        "industry": industry,
-        "use_custom_codes": use_custom_codes,
-        "custom_codes": custom_codes,
-        "max_symbols": max_symbols,
-        "config": CointegrationResearchConfig(
-            period=period,
-            formation_ratio=float(formation_ratio),
-            corr_threshold=float(corr_threshold),
-            adf_pvalue=float(adf_pvalue),
-            top_n=int(top_n),
-            lookback=int(lookback),
-            entry_z=float(entry_z),
-            exit_z=float(exit_z),
-            stop_z=float(stop_z),
-            capital_per_pair=float(capital_per_pair),
+        "a_code": a_code,
+        "a_name": a_name,
+        "b_code": b_code,
+        "b_name": b_name,
+        "start": pd.Timestamp(start),
+        "end": pd.Timestamp(end),
+        "benchmark": benchmark,
+        "formation_ratio": float(formation_ratio),
+        "adf_pvalue": float(adf_pvalue),
+        "config": Config(
+            lookback=lookback,
+            entry_z=entry_z,
+            exit_z=exit_z,
+            capital=float(capital),
             broker_fee=float(broker_fee),
             sell_tax=float(sell_tax),
-            integer_shares=bool(integer_shares),
+            integer_shares=integer_shares,
         ),
     }
 
 
 def render_cointegration_research(settings: dict[str, object]) -> None:
-    st.subheader("策略2：Cointegration Pairs 台股實證")
+    a_code = str(settings["a_code"])
+    b_code = str(settings["b_code"])
+    a_name = str(settings["a_name"])
+    b_name = str(settings["b_name"])
+    start = pd.Timestamp(settings["start"])
+    end = pd.Timestamp(settings["end"])
+    formation_ratio = float(settings["formation_ratio"])
+    adf_pvalue = float(settings["adf_pvalue"])
+    config: Config = settings["config"]  # type: ignore[assignment]
 
-    config: CointegrationResearchConfig = settings["config"]  # type: ignore[assignment]
-    selected_stocks = get_strategy2_stock_list(
-        industry=str(settings["industry"]),
-        use_custom_codes=bool(settings["use_custom_codes"]),
-        custom_codes=str(settings["custom_codes"]),
-        max_symbols=int(settings["max_symbols"]),
-    )
+    st.subheader("策略2：Cointegration 單一 Pair 實證")
 
-    selected_df = pd.DataFrame(
-        [{"code": code, "name": name, "industry": resolve_stock_industry(code)} for code, name in selected_stocks]
-    )
+    left, right = st.columns([0.58, 0.42])
+    with left:
+        if a_code and b_code:
+            st.markdown(f"### {format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}")
+            st.write("策略2會先用 formation period 檢查 pair 的共整合特性，再用 test period 進行與策略1相同格式的回測顯示。")
+        else:
+            st.info("請先在左側輸入 A code / B code。")
+    with right:
+        st.metric("Formation ratio", f"{formation_ratio:.0%}")
+        st.metric("ADF threshold", f"{adf_pvalue:.2f}")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Universe stocks", f"{len(selected_stocks)}")
-    c2.metric("Period", config.period)
-    c3.metric("Formation ratio", f"{config.formation_ratio:.0%}")
-    c4.metric("Top N", f"{config.top_n}")
-
-    with st.expander("查看本次實證 universe", expanded=False):
-        st.dataframe(selected_df, use_container_width=True, hide_index=True)
-
-    run = st.button("Run 策略2 Cointegration 實證", type="primary", use_container_width=True)
+    run = st.button("Run 策略2單一 Pair 回測", type="primary", use_container_width=True)
     if not run:
-        st.info("設定左側參數後，按 Run 開始下載資料、篩選 pair 與回測。")
+        st.info("輸入兩檔股票代號並設定參數後，按 Run 開始回測。")
         return
 
-    if len(selected_stocks) < 2:
-        st.error("策略2至少需要兩檔股票。")
+    if not a_code or not b_code:
+        st.error("請先輸入 A code 和 B code。")
+        return
+    if a_code == b_code:
+        st.error("A code 和 B code 不能相同。")
+        return
+    if start >= end:
+        st.error("Full sample start 必須早於 end。")
         return
 
     try:
-        with st.spinner("下載台股價格、篩選共整合 pair 並回測中..."):
-            result = run_strategy2_cointegration_research(tuple(selected_stocks), config)
+        with st.spinner("下載價格、執行 cointegration diagnostics 與回測..."):
+            warmup = max(config.lookback * 3, 365)
+            download_start = start - pd.DateOffset(days=warmup)
+            open_df, close_df = download_ohlc([a_code, b_code], download_start, end)
+            benchmark = download_benchmark(str(settings["benchmark"]), download_start, end)
+            test_start = determine_strategy2_test_start(close_df, a_code, b_code, start, end, formation_ratio, config.lookback)
+            diagnostics = analyze_strategy2_cointegration_pair(
+                close_df=close_df,
+                a_code=a_code,
+                b_code=b_code,
+                start=start,
+                test_start=test_start,
+                adf_pvalue=adf_pvalue,
+            )
+            result = run_backtest(open_df, close_df, benchmark, a_code, b_code, test_start, end, config)
     except Exception as exc:
         st.error(f"策略2執行失敗：{exc}")
         return
 
-    show_strategy2_result(result, config)
+    show_strategy2_diagnostics(diagnostics, a_code, b_code, a_name, b_name)
+    show_summary(result["summary"])
+    show_latest_trading_signal(result, a_code, b_code, a_name, b_name, config)
+    show_charts(result, a_code, b_code, str(settings["benchmark"]), config)
+    show_tables(result)
 
 
-def get_strategy2_stock_list(
-    industry: str,
-    use_custom_codes: bool,
-    custom_codes: str,
-    max_symbols: int,
-) -> list[tuple[str, str]]:
-    if use_custom_codes:
-        codes = parse_strategy2_codes(custom_codes)
-        stocks: list[tuple[str, str]] = []
-        for code in codes:
-            name = resolve_stock_name(code) or KNOWN_NAMES.get(code, "")
-            stocks.append((code, name or code))
-        return stocks[:max_symbols]
+def determine_strategy2_test_start(
+    close_df: pd.DataFrame,
+    a_code: str,
+    b_code: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    formation_ratio: float,
+    lookback: int,
+) -> pd.Timestamp:
+    pair_close = close_df.loc[(close_df.index >= start) & (close_df.index <= end), [a_code, b_code]].dropna()
+    if len(pair_close) <= lookback + 10:
+        raise ValueError("資料長度不足，請延長回測期間或降低 Rolling OLS lookback。")
 
-    industry_groups = build_industry_groups()
-    stocks = industry_groups.get(industry, [])
-    return list(stocks[:max_symbols])
+    split_idx = int(len(pair_close) * formation_ratio)
+    split_idx = max(lookback, min(split_idx, len(pair_close) - 5))
+    if split_idx <= 5 or split_idx >= len(pair_close) - 1:
+        raise ValueError("formation/test 切分後資料不足，請調整 Formation ratio 或日期區間。")
 
-
-def parse_strategy2_codes(text: str) -> list[str]:
-    tokens = re.split(r"[\s,，、;；]+", str(text).strip())
-    codes = []
-    seen = set()
-    for token in tokens:
-        code = token.strip().upper()
-        if not code:
-            continue
-        if code not in seen:
-            codes.append(code)
-            seen.add(code)
-    return codes
+    return pd.Timestamp(pair_close.index[split_idx])
 
 
-def resolve_stock_industry(code: str) -> str:
-    code = str(code).strip().upper()
-    for item in single_stock_futures:
-        if str(item["code"]).upper() == code:
-            return str(item["industry"])
-    return ""
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def run_strategy2_cointegration_research(
-    stocks: tuple[tuple[str, str], ...],
-    config: CointegrationResearchConfig,
-) -> dict[str, object]:
-    price_df = download_screening_prices(stocks, config.period, INTERVAL)
-    group_price = get_group_price(price_df, stocks)
-
-    if group_price.shape[1] < 2:
-        raise ValueError("下載後可用股票少於兩檔，無法做 pair screening。")
-
-    group_price = group_price.dropna(axis=1, thresh=max(MIN_OBS, config.lookback + 5))
-    group_price = group_price.ffill().dropna()
-    group_price = group_price.loc[:, (group_price > 0).all(axis=0)]
-
-    if group_price.shape[1] < 2:
-        raise ValueError("清理缺失值後可用股票少於兩檔。")
-
-    split_idx = int(len(group_price) * config.formation_ratio)
-    split_idx = max(config.lookback + 5, min(split_idx, len(group_price) - 30))
-    if split_idx <= config.lookback or split_idx >= len(group_price) - 5:
-        raise ValueError("資料長度不足，請降低 lookback、延長 period，或調整 formation ratio。")
-
-    formation_price = group_price.iloc[:split_idx].copy()
-    test_start = group_price.index[split_idx]
-
-    candidates = screen_strategy2_cointegration_pairs(
-        formation_price=formation_price,
-        stocks=stocks,
-        corr_threshold=config.corr_threshold,
-        adf_pvalue=config.adf_pvalue,
-    )
-
-    if candidates.empty:
-        return {
-            "price": group_price,
-            "candidates": pd.DataFrame(),
-            "selected_pairs": pd.DataFrame(),
-            "summary": pd.DataFrame(),
-            "all_trades": pd.DataFrame(),
-            "pair_details": {},
-            "test_start": test_start,
-        }
-
-    selected_pairs = candidates.head(config.top_n).copy()
-
-    pair_details: dict[str, dict[str, pd.DataFrame]] = {}
-    summary_rows: list[dict[str, object]] = []
-    all_trade_frames: list[pd.DataFrame] = []
-
-    for _, row in selected_pairs.iterrows():
-        col_a = f"{row['stock_A_code']}_{row['stock_A_name']}"
-        col_b = f"{row['stock_B_code']}_{row['stock_B_name']}"
-        pair_key = f"{col_a} / {col_b}"
-
-        if col_a not in group_price.columns or col_b not in group_price.columns:
-            continue
-
-        pair_prices = group_price[[col_a, col_b]].dropna()
-        equity, trades, signals = backtest_strategy2_pair_close_to_close(
-            pair_prices=pair_prices,
-            col_a=col_a,
-            col_b=col_b,
-            test_start=test_start,
-            config=config,
-        )
-
-        pair_details[pair_key] = {
-            "equity": equity,
-            "trades": trades,
-            "signals": signals,
-        }
-
-        if not trades.empty:
-            trades = trades.copy()
-            trades.insert(0, "pair", pair_key)
-            all_trade_frames.append(trades)
-
-        stats = summarize_strategy2_pair(equity, trades, config.capital_per_pair)
-        summary_rows.append({
-            "pair": pair_key,
-            "stock_A_code": row["stock_A_code"],
-            "stock_A_name": row["stock_A_name"],
-            "stock_B_code": row["stock_B_code"],
-            "stock_B_name": row["stock_B_name"],
-            "industry": row.get("group", ""),
-            "formation_correlation": row.get("correlation", np.nan),
-            "formation_beta": row.get("beta_hedge_ratio", np.nan),
-            "formation_adf_pvalue": row.get("adf_pvalue", np.nan),
-            "formation_half_life": row.get("half_life", np.nan),
-            "formation_score": row.get("score", np.nan),
-            **stats,
-        })
-
-    summary = pd.DataFrame(summary_rows)
-    all_trades = pd.concat(all_trade_frames, ignore_index=True) if all_trade_frames else pd.DataFrame()
-
-    return {
-        "price": group_price,
-        "candidates": candidates,
-        "selected_pairs": selected_pairs,
-        "summary": summary,
-        "all_trades": all_trades,
-        "pair_details": pair_details,
-        "test_start": test_start,
-    }
-
-
-def screen_strategy2_cointegration_pairs(
-    formation_price: pd.DataFrame,
-    stocks: tuple[tuple[str, str], ...],
-    corr_threshold: float,
-    adf_pvalue: float,
-) -> pd.DataFrame:
-    if formation_price.shape[1] < 2:
-        return pd.DataFrame()
-
-    stock_name_map = {str(code): str(name) for code, name in stocks}
-    log_price = np.log(formation_price.dropna())
-    returns = log_price.diff().dropna()
-    corr = returns.corr()
-
-    records: list[dict[str, object]] = []
-    columns = list(log_price.columns)
-
-    for col_a, col_b in itertools.combinations(columns, 2):
-        c = corr.loc[col_a, col_b]
-        if pd.isna(c) or float(c) < corr_threshold:
-            continue
-
-        pair_log = log_price[[col_a, col_b]].dropna()
-        if len(pair_log) < MIN_OBS:
-            continue
-
-        log_a = pair_log[col_a]
-        log_b = pair_log[col_b]
-        alpha, beta, _, spread = ols_spread(log_a, log_b)
-
-        spread_series = pd.Series(spread, index=pair_log.index)
-        adf_stat, adf_p = adf_test(spread_series)
-        half_life = estimate_half_life(spread_series)
-        trend_slope, trend_pvalue, trend_strength = trend_strength_test(spread_series)
-        crossings, crossings_per_year = count_crossings(spread_series)
-
-        code_a, fallback_name_a = col_a.split("_", 1)
-        code_b, fallback_name_b = col_b.split("_", 1)
-        name_a = stock_name_map.get(code_a, fallback_name_a)
-        name_b = stock_name_map.get(code_b, fallback_name_b)
-        industry_a = resolve_stock_industry(code_a)
-        industry_b = resolve_stock_industry(code_b)
-        group = industry_a if industry_a == industry_b else f"{industry_a}/{industry_b}".strip("/")
-
-        record = {
-            "group": group,
-            "stock_A_code": code_a,
-            "stock_A_name": name_a,
-            "stock_B_code": code_b,
-            "stock_B_name": name_b,
-            "correlation": float(c),
-            "alpha": float(alpha),
-            "beta_hedge_ratio": float(beta),
-            "spread_method": "formation_ols_regression_residual",
-            "spread_mean": float(spread_series.mean()),
-            "spread_std": float(spread_series.std()),
-            "spread_min": float(spread_series.min()),
-            "spread_max": float(spread_series.max()),
-            "adf_stat": float(adf_stat),
-            "adf_pvalue": float(adf_p),
-            "adf_pass_5pct": bool(pd.notna(adf_p) and adf_p < adf_pvalue),
-            "half_life": float(half_life) if pd.notna(half_life) else np.nan,
-            "half_life_reasonable": bool(pd.notna(half_life) and MIN_HALF_LIFE <= half_life <= MAX_HALF_LIFE),
-            "trend_slope": float(trend_slope),
-            "trend_pvalue": float(trend_pvalue),
-            "trend_strength": float(trend_strength),
-            "no_obvious_trend": bool(trend_strength < MAX_TREND_STRENGTH),
-            "mean_crossings": int(crossings),
-            "crossings_per_year": float(crossings_per_year),
-            "enough_crossings": bool(crossings_per_year >= MIN_CROSSINGS_PER_YEAR),
-            "start_date": spread_series.index.min(),
-            "end_date": spread_series.index.max(),
-            "observations": int(len(spread_series)),
-        }
-        records.append(record)
-
-    screening_df = pd.DataFrame(records)
-    if screening_df.empty:
-        return pd.DataFrame()
-
-    screening_df["score"] = screening_df.apply(score_pair, axis=1)
-    screening_df["suitable"] = (
-        screening_df["adf_pass_5pct"]
-        & screening_df["half_life_reasonable"]
-        & screening_df["no_obvious_trend"]
-        & screening_df["enough_crossings"]
-    )
-    screening_df = screening_df.sort_values(
-        ["suitable", "score", "adf_pvalue", "trend_strength", "correlation"],
-        ascending=[False, False, True, True, False],
-    ).reset_index(drop=True)
-    screening_df.insert(0, "rank", np.arange(1, len(screening_df) + 1))
-    return screening_df
-
-
-def backtest_strategy2_pair_close_to_close(
-    pair_prices: pd.DataFrame,
-    col_a: str,
-    col_b: str,
+def analyze_strategy2_cointegration_pair(
+    close_df: pd.DataFrame,
+    a_code: str,
+    b_code: str,
+    start: pd.Timestamp,
     test_start: pd.Timestamp,
-    config: CointegrationResearchConfig,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    pair_prices = pair_prices[[col_a, col_b]].dropna().copy()
-    logp = np.log(pair_prices)
+    adf_pvalue: float,
+) -> dict[str, object]:
+    formation_close = close_df.loc[(close_df.index >= start) & (close_df.index < test_start), [a_code, b_code]].dropna()
+    if len(formation_close) < MIN_OBS:
+        raise ValueError("formation period 資料不足，無法進行 cointegration diagnostics。")
 
-    rows: list[dict[str, object]] = []
-    trades: list[dict[str, object]] = []
+    log_price = np.log(formation_close)
+    returns = log_price.diff().dropna()
+    correlation = float(returns[a_code].corr(returns[b_code])) if len(returns) else np.nan
 
-    equity = float(config.capital_per_pair)
-    current_position = 0
-    open_trade: dict[str, object] | None = None
+    alpha, beta, _, spread = ols_spread(log_price[a_code], log_price[b_code])
+    spread_series = pd.Series(spread, index=log_price.index, name="formation_spread")
+    adf_stat, adf_p = adf_test(spread_series)
+    half_life = estimate_half_life(spread_series)
+    trend_slope, trend_pvalue, trend_strength = trend_strength_test(spread_series)
+    crossings, crossings_per_year = count_crossings(spread_series)
 
-    for i in range(config.lookback, len(logp) - 1):
-        signal_date = logp.index[i]
-        next_date = logp.index[i + 1]
+    adf_pass = bool(pd.notna(adf_p) and adf_p < adf_pvalue)
+    half_life_reasonable = bool(pd.notna(half_life) and MIN_HALF_LIFE <= half_life <= MAX_HALF_LIFE)
+    no_obvious_trend = bool(pd.notna(trend_strength) and trend_strength < MAX_TREND_STRENGTH)
+    enough_crossings = bool(pd.notna(crossings_per_year) and crossings_per_year >= MIN_CROSSINGS_PER_YEAR)
+    suitable = adf_pass and half_life_reasonable and no_obvious_trend and enough_crossings
 
-        if next_date < test_start:
-            continue
-
-        train = logp.iloc[i - config.lookback : i]
-        alpha, beta, _, train_spread_arr = ols_spread(train[col_a], train[col_b])
-        train_spread = pd.Series(train_spread_arr, index=train.index)
-        spread_mean = float(train_spread.mean())
-        spread_std = float(train_spread.std(ddof=1))
-
-        if not np.isfinite(spread_std) or spread_std <= 0:
-            continue
-
-        spread = float(logp.iloc[i][col_a] - (alpha + beta * logp.iloc[i][col_b]))
-        z = float((spread - spread_mean) / spread_std)
-
-        new_position = current_position
-        exit_reason = ""
-
-        if current_position == 0:
-            if z >= config.entry_z:
-                new_position = -1
-                exit_reason = "entry_short_spread"
-            elif z <= -config.entry_z:
-                new_position = 1
-                exit_reason = "entry_long_spread"
-        else:
-            if abs(z) <= config.exit_z:
-                new_position = 0
-                exit_reason = "normal_exit"
-            elif abs(z) >= config.stop_z:
-                new_position = 0
-                exit_reason = "z_stop_loss"
-
-        beta_abs = abs(float(beta))
-        if not np.isfinite(beta_abs) or beta_abs <= 0:
-            beta_abs = 1.0
-
-        a_weight = 1.0 / (1.0 + beta_abs)
-        b_weight = beta_abs / (1.0 + beta_abs)
-
-        a_ret_next = float(pair_prices[col_a].iloc[i + 1] / pair_prices[col_a].iloc[i] - 1.0)
-        b_ret_next = float(pair_prices[col_b].iloc[i + 1] / pair_prices[col_b].iloc[i] - 1.0)
-
-        gross_return = new_position * (a_weight * a_ret_next - b_weight * b_ret_next)
-        turnover = abs(new_position - current_position) * (a_weight + b_weight)
-        cost_rate = turnover * (config.broker_fee + 0.5 * config.sell_tax)
-        daily_pnl = config.capital_per_pair * (gross_return - cost_rate)
-        equity += daily_pnl
-
-        if current_position == 0 and new_position != 0:
-            open_trade = {
-                "entry_date": next_date,
-                "direction": "long_spread" if new_position == 1 else "short_spread",
-                "entry_zscore": z,
-                "entry_spread": spread,
-                "entry_beta": float(beta),
-                "entry_equity": equity - daily_pnl,
-                "a_weight": a_weight,
-                "b_weight": b_weight,
-            }
-        elif current_position != 0 and new_position == 0 and open_trade is not None:
-            trade = dict(open_trade)
-            trade.update({
-                "exit_date": next_date,
-                "exit_zscore": z,
-                "exit_spread": spread,
-                "exit_reason": exit_reason,
-                "exit_equity": equity,
-                "pnl": equity - float(open_trade["entry_equity"]),
-                "return_on_capital": (equity - float(open_trade["entry_equity"])) / config.capital_per_pair,
-                "holding_days": (pd.Timestamp(next_date) - pd.Timestamp(open_trade["entry_date"])).days,
-                "status": "closed",
-            })
-            trades.append(trade)
-            open_trade = None
-
-        rows.append({
-            "date": next_date,
-            "signal_date": signal_date,
-            "alpha": float(alpha),
-            "beta": float(beta),
-            "spread": spread,
-            "spread_mean": spread_mean,
-            "spread_std": spread_std,
-            "zscore": z,
-            "position": int(new_position),
-            "a_weight": a_weight,
-            "b_weight": b_weight,
-            "a_return_next": a_ret_next,
-            "b_return_next": b_ret_next,
-            "gross_return": gross_return,
-            "cost_rate": cost_rate,
-            "daily_pnl": daily_pnl,
-            "equity": equity,
-            "action": exit_reason,
-        })
-
-        current_position = new_position
-
-    signals = pd.DataFrame(rows)
-    if signals.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    equity_df = signals.set_index("date")[["daily_pnl", "equity"]].copy()
-    equity_df["daily_return"] = equity_df["daily_pnl"] / config.capital_per_pair
-    equity_df["cumulative_return"] = equity_df["equity"] / config.capital_per_pair - 1.0
-    equity_df["drawdown"] = equity_df["equity"] / equity_df["equity"].cummax() - 1.0
-
-    trades_df = pd.DataFrame(trades)
-    return equity_df, trades_df, signals
-
-
-def summarize_strategy2_pair(equity: pd.DataFrame, trades: pd.DataFrame, capital: float) -> dict[str, object]:
-    if equity.empty:
-        return {
-            "total_return": np.nan,
-            "ending_equity": capital,
-            "sharpe": np.nan,
-            "max_drawdown": np.nan,
-            "trade_count": 0,
-            "win_rate": np.nan,
-            "total_pnl": 0.0,
-        }
-
-    returns = equity["daily_return"].replace([np.inf, -np.inf], np.nan).dropna()
-    ending = float(equity["equity"].iloc[-1])
-    closed = trades[trades["status"].eq("closed")] if not trades.empty and "status" in trades.columns else trades
-
-    if len(returns) > 2 and returns.std(ddof=1) > 0:
-        sharpe_value = float(np.sqrt(252) * returns.mean() / returns.std(ddof=1))
-    else:
-        sharpe_value = float("nan")
-
-    win_rate = float((closed["pnl"] > 0).mean()) if not closed.empty and "pnl" in closed.columns else np.nan
+    row = pd.Series({
+        "adf_pvalue": adf_p,
+        "half_life": half_life,
+        "trend_strength": trend_strength,
+        "crossings_per_year": crossings_per_year,
+        "correlation": correlation,
+    })
 
     return {
-        "total_return": ending / capital - 1.0,
-        "ending_equity": ending,
-        "sharpe": sharpe_value,
-        "max_drawdown": float(equity["drawdown"].min()) if "drawdown" in equity.columns else np.nan,
-        "trade_count": int(len(closed)),
-        "win_rate": win_rate,
-        "total_pnl": ending - capital,
+        "formation_start": formation_close.index.min(),
+        "formation_end": formation_close.index.max(),
+        "test_start": test_start,
+        "observations": int(len(formation_close)),
+        "correlation": correlation,
+        "alpha": float(alpha),
+        "beta_hedge_ratio": float(beta),
+        "spread_mean": float(spread_series.mean()),
+        "spread_std": float(spread_series.std(ddof=1)),
+        "adf_stat": float(adf_stat),
+        "adf_pvalue": float(adf_p),
+        "adf_pass": adf_pass,
+        "half_life": float(half_life) if pd.notna(half_life) else np.nan,
+        "half_life_reasonable": half_life_reasonable,
+        "trend_slope": float(trend_slope),
+        "trend_pvalue": float(trend_pvalue),
+        "trend_strength": float(trend_strength),
+        "no_obvious_trend": no_obvious_trend,
+        "mean_crossings": int(crossings),
+        "crossings_per_year": float(crossings_per_year),
+        "enough_crossings": enough_crossings,
+        "score": score_pair(row),
+        "suitable": suitable,
     }
 
 
-def show_strategy2_result(result: dict[str, object], config: CointegrationResearchConfig) -> None:
-    candidates: pd.DataFrame = result["candidates"]  # type: ignore[assignment]
-    selected_pairs: pd.DataFrame = result["selected_pairs"]  # type: ignore[assignment]
-    summary: pd.DataFrame = result["summary"]  # type: ignore[assignment]
-    all_trades: pd.DataFrame = result["all_trades"]  # type: ignore[assignment]
-    pair_details: dict[str, dict[str, pd.DataFrame]] = result["pair_details"]  # type: ignore[assignment]
-    test_start = pd.Timestamp(result["test_start"])  # type: ignore[arg-type]
-
-    st.success(f"策略2完成。Out-of-sample test start：{test_start.strftime('%Y-%m-%d')}")
-
-    if candidates.empty:
-        st.warning("沒有找到符合基本條件的 cointegration pair。請降低 correlation threshold、放寬 ADF p-value 或延長資料期間。")
-        return
+def show_strategy2_diagnostics(
+    diagnostics: dict[str, object],
+    a_code: str,
+    b_code: str,
+    a_name: str,
+    b_name: str,
+) -> None:
+    st.subheader("Formation Period Cointegration Diagnostics")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Candidate pairs", f"{len(candidates)}")
-    c2.metric("Selected pairs", f"{len(selected_pairs)}")
-    c3.metric("Backtested pairs", f"{len(summary)}")
-    c4.metric("Test start", test_start.strftime("%Y-%m-%d"))
+    c1.metric("Test start", pd.Timestamp(diagnostics["test_start"]).strftime("%Y-%m-%d"))
+    c2.metric("ADF p-value", num(float(diagnostics["adf_pvalue"])))
+    c3.metric("Half-life", num(float(diagnostics["half_life"])))
+    c4.metric("Suitable", "Yes" if diagnostics["suitable"] else "No")
 
-    st.subheader("Pair Screening Results")
-    screening_cols = [
-        "rank",
-        "stock_A_code", "stock_A_name",
-        "stock_B_code", "stock_B_name",
-        "group",
-        "correlation",
-        "beta_hedge_ratio",
-        "adf_pvalue",
-        "half_life",
-        "trend_strength",
-        "crossings_per_year",
-        "score",
-        "suitable",
-    ]
-    show_candidates = candidates[[c for c in screening_cols if c in candidates.columns]].copy()
-    for c in ["correlation", "beta_hedge_ratio", "adf_pvalue", "half_life", "trend_strength", "crossings_per_year"]:
-        if c in show_candidates.columns:
-            show_candidates[c] = pd.to_numeric(show_candidates[c], errors="coerce").round(4)
-    st.dataframe(show_candidates, use_container_width=True, hide_index=True)
+    diagnostics_df = pd.DataFrame([{
+        "pair": f"{format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}",
+        "formation_start": pd.Timestamp(diagnostics["formation_start"]).strftime("%Y-%m-%d"),
+        "formation_end": pd.Timestamp(diagnostics["formation_end"]).strftime("%Y-%m-%d"),
+        "observations": diagnostics["observations"],
+        "correlation": diagnostics["correlation"],
+        "alpha": diagnostics["alpha"],
+        "beta_hedge_ratio": diagnostics["beta_hedge_ratio"],
+        "adf_stat": diagnostics["adf_stat"],
+        "adf_pvalue": diagnostics["adf_pvalue"],
+        "adf_pass": diagnostics["adf_pass"],
+        "half_life": diagnostics["half_life"],
+        "trend_strength": diagnostics["trend_strength"],
+        "crossings_per_year": diagnostics["crossings_per_year"],
+        "score": diagnostics["score"],
+        "suitable": diagnostics["suitable"],
+    }])
 
-    st.download_button(
-        "Download pair_screening.csv",
-        candidates.to_csv(index=False).encode("utf-8-sig"),
-        "strategy2_pair_screening.csv",
-        "text/csv",
-    )
+    for col in ["correlation", "alpha", "beta_hedge_ratio", "adf_stat", "adf_pvalue", "half_life", "trend_strength", "crossings_per_year"]:
+        diagnostics_df[col] = pd.to_numeric(diagnostics_df[col], errors="coerce").round(4)
 
-    st.subheader("Selected Pairs Backtest Summary")
-    if summary.empty:
-        st.warning("沒有 pair 產生回測結果。")
-    else:
-        show_summary_df = summary.copy()
-        for c in [
-            "formation_correlation",
-            "formation_beta",
-            "formation_adf_pvalue",
-            "formation_half_life",
-            "formation_score",
-            "total_return",
-            "sharpe",
-            "max_drawdown",
-            "win_rate",
-            "total_pnl",
-        ]:
-            if c in show_summary_df.columns:
-                show_summary_df[c] = pd.to_numeric(show_summary_df[c], errors="coerce").round(4)
-        st.dataframe(show_summary_df, use_container_width=True, hide_index=True)
-
-        st.download_button(
-            "Download backtest_summary.csv",
-            summary.to_csv(index=False).encode("utf-8-sig"),
-            "strategy2_backtest_summary.csv",
-            "text/csv",
-        )
-
-    st.subheader("單一 Pair 表現")
-    if pair_details:
-        pair_names = list(pair_details.keys())
-        selected_pair_name = st.selectbox("選擇 pair", pair_names)
-        detail = pair_details[selected_pair_name]
-        signals = detail.get("signals", pd.DataFrame())
-        equity = detail.get("equity", pd.DataFrame())
-        trades = detail.get("trades", pd.DataFrame())
-
-        pair_summary = summary[summary["pair"].eq(selected_pair_name)].copy() if not summary.empty and "pair" in summary.columns else pd.DataFrame()
-        if not pair_summary.empty:
-            row = pair_summary.iloc[0]
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Pair Total Return", pct(float(row.get("total_return", np.nan))))
-            m2.metric("Pair Sharpe", num(float(row.get("sharpe", np.nan))))
-            m3.metric("Pair Max DD", pct(float(row.get("max_drawdown", np.nan))))
-            m4.metric("Trades", f"{int(row.get('trade_count', 0))}")
-
-        if not signals.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=signals["date"], y=signals["zscore"], name="z-score", mode="lines"))
-            fig.add_hline(y=config.entry_z, line_dash="dash", annotation_text="+entry")
-            fig.add_hline(y=-config.entry_z, line_dash="dash", annotation_text="-entry")
-            fig.add_hline(y=config.exit_z, line_dash="dot", annotation_text="+exit")
-            fig.add_hline(y=-config.exit_z, line_dash="dot", annotation_text="-exit")
-            fig.add_hline(y=config.stop_z, line_dash="dashdot", annotation_text="+stop")
-            fig.add_hline(y=-config.stop_z, line_dash="dashdot", annotation_text="-stop")
-            fig.update_layout(
-                title=f"{selected_pair_name} Rolling Z-score",
-                template="plotly_white",
-                height=450,
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=signals["date"], y=signals["spread"], name="spread", mode="lines"))
-            fig.add_trace(go.Scatter(x=signals["date"], y=signals["spread_mean"], name="rolling mean", mode="lines"))
-            upper = signals["spread_mean"] + config.entry_z * signals["spread_std"]
-            lower = signals["spread_mean"] - config.entry_z * signals["spread_std"]
-            fig.add_trace(go.Scatter(x=signals["date"], y=upper, name="+entry band", mode="lines", line=dict(dash="dash")))
-            fig.add_trace(go.Scatter(x=signals["date"], y=lower, name="-entry band", mode="lines", line=dict(dash="dash")))
-            fig.update_layout(
-                title=f"{selected_pair_name} Spread",
-                template="plotly_white",
-                height=450,
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        if not equity.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=equity.index, y=equity["cumulative_return"], name="Pair cumulative return", mode="lines"))
-            fig.update_layout(
-                title=f"{selected_pair_name} Cumulative Return",
-                template="plotly_white",
-                height=420,
-                yaxis_tickformat=".1%",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=equity.index,
-                y=equity["drawdown"],
-                name="Pair drawdown",
-                mode="lines",
-                fill="tozeroy",
-            ))
-            fig.update_layout(
-                title=f"{selected_pair_name} Drawdown",
-                template="plotly_white",
-                height=380,
-                yaxis_tickformat=".1%",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("Signals / Trades"):
-            if not signals.empty:
-                st.markdown("##### Signals")
-                st.dataframe(signals.tail(300), use_container_width=True, hide_index=True)
-            if not trades.empty:
-                st.markdown("##### Trades")
-                st.dataframe(trades, use_container_width=True, hide_index=True)
-
-    st.subheader("All Trades")
-    if all_trades.empty:
-        st.info("本次策略2沒有已平倉交易。")
-    else:
-        st.dataframe(all_trades, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download all_trades.csv",
-            all_trades.to_csv(index=False).encode("utf-8-sig"),
-            "strategy2_all_trades.csv",
-            "text/csv",
-        )
+    st.dataframe(diagnostics_df, use_container_width=True, hide_index=True)
 
 def build_industry_groups() -> dict[str, list[tuple[str, str]]]:
     groups: dict[str, list[tuple[str, str]]] = {}
