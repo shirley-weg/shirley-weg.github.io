@@ -17,6 +17,7 @@ import requests
 import streamlit as st
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
+from statsmodels.stats.multitest import multipletests
 
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -288,7 +289,7 @@ MAX_TREND_STRENGTH = 1.0
 MIN_CROSSINGS_PER_YEAR = 4
 TOP_N = 10
 STOP_Z = 3.5
-MAX_OPEN_POSITIONS_PER_DIRECTION = 3
+MAX_OPEN_POSITIONS_PER_DIRECTION = 1
 MA_WINDOW = 5
 
 
@@ -793,19 +794,24 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
     corr_threshold = float(settings["corr_threshold"])
     adf_pvalue = float(settings["adf_pvalue"])
     top_n = int(settings["top_n"])
+    start = pd.Timestamp(settings["start"])
+    end = pd.Timestamp(settings["end"])
+    formation_ratio = float(settings["formation_ratio"])
+    config: Config = settings["config"]  # type: ignore[assignment]
 
     industry_groups = build_industry_groups()
     stocks = tuple(industry_groups.get(industry, []))
 
     st.caption(
-        f"細產業：{industry}｜股票數：{len(stocks)}｜資料期間：{period}｜"
-        f"Correlation threshold：{corr_threshold:.2f}｜Top N：{top_n}"
+        f"細產業：{industry}｜股票數：{len(stocks)}｜下載資料期間：{period}｜"
+        f"Correlation threshold：{corr_threshold:.2f}｜Top N：{top_n}｜"
+        "篩選只使用 formation period，避免使用 test period 未來資料。"
     )
 
     run_screen = st.button("篩選策略2最佳 Pair", use_container_width=True)
 
     if run_screen:
-        with st.spinner("下載價格並篩選最佳 pair..."):
+        with st.spinner("下載價格並只用 formation period 篩選最佳 pair..."):
             try:
                 best_pairs = screen_best_pairs_by_industry(
                     industry,
@@ -814,6 +820,10 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
                     top_n=top_n,
                     period=period,
                     adf_pvalue=adf_pvalue,
+                    start=start,
+                    end=end,
+                    formation_ratio=formation_ratio,
+                    lookback=config.lookback,
                 )
             except Exception as exc:
                 st.error(f"篩選失敗：{exc}")
@@ -824,6 +834,10 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
         st.session_state["s2_screened_corr_threshold"] = corr_threshold
         st.session_state["s2_screened_adf_pvalue"] = adf_pvalue
         st.session_state["s2_screened_top_n"] = top_n
+        st.session_state["s2_screened_start"] = str(start.date())
+        st.session_state["s2_screened_end"] = str(end.date())
+        st.session_state["s2_screened_formation_ratio"] = formation_ratio
+        st.session_state["s2_screened_lookback"] = int(config.lookback)
         st.session_state["s2_screened_pairs"] = best_pairs.to_dict("records")
 
     records = st.session_state.get("s2_screened_pairs", [])
@@ -833,16 +847,25 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
         and float(st.session_state.get("s2_screened_corr_threshold", -1)) == corr_threshold
         and float(st.session_state.get("s2_screened_adf_pvalue", -1)) == adf_pvalue
         and int(st.session_state.get("s2_screened_top_n", -1)) == top_n
+        and st.session_state.get("s2_screened_start") == str(start.date())
+        and st.session_state.get("s2_screened_end") == str(end.date())
+        and float(st.session_state.get("s2_screened_formation_ratio", -1)) == formation_ratio
+        and int(st.session_state.get("s2_screened_lookback", -1)) == int(config.lookback)
     )
 
     if not records or not same_setting:
-        st.info("按「篩選策略2最佳 Pair」後，這裡會列出符合相關性門檻與 ADF 條件排序後的最佳幾對。")
+        st.info("按「篩選策略2最佳 Pair」後，這裡會列出只用 formation period 篩選出的最佳幾對。")
         return
 
     best_pairs_df = pd.DataFrame(records)
     if best_pairs_df.empty:
-        st.warning("這個設定下沒有找到符合基本條件的 pair。可降低 correlation threshold、放寬 ADF threshold，或延長篩選資料期間。")
+        st.warning("這個設定下沒有找到符合基本條件的 pair。可降低 correlation threshold、放寬 ADF/FDR threshold，或延長篩選資料期間。")
         return
+
+    if "selection_start" in best_pairs_df.columns and "selection_end" in best_pairs_df.columns:
+        selection_start = pd.Timestamp(best_pairs_df["selection_start"].iloc[0]).strftime("%Y-%m-%d")
+        selection_end = pd.Timestamp(best_pairs_df["selection_end"].iloc[0]).strftime("%Y-%m-%d")
+        st.caption(f"本次 pair screening 使用區間：{selection_start} ~ {selection_end}；未使用 test period 資料。")
 
     display_cols = [
         "rank",
@@ -851,6 +874,7 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
         "correlation",
         "beta_hedge_ratio",
         "adf_pvalue",
+        "adf_qvalue",
         "half_life",
         "trend_strength",
         "crossings_per_year",
@@ -858,7 +882,7 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
         "suitable",
     ]
     show_df = best_pairs_df[[c for c in display_cols if c in best_pairs_df.columns]].copy()
-    for c in ["correlation", "beta_hedge_ratio", "adf_pvalue", "half_life", "trend_strength", "crossings_per_year"]:
+    for c in ["correlation", "beta_hedge_ratio", "adf_pvalue", "adf_qvalue", "half_life", "trend_strength", "crossings_per_year"]:
         if c in show_df.columns:
             show_df[c] = pd.to_numeric(show_df[c], errors="coerce").round(4)
     st.dataframe(show_df, use_container_width=True, hide_index=True)
@@ -866,7 +890,8 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
     pair_labels = [
         f"{int(row['rank'])}. {row['stock_A_code']} {row['stock_A_name']} / "
         f"{row['stock_B_code']} {row['stock_B_name']} | "
-        f"corr={float(row['correlation']):.3f} | ADF p={float(row['adf_pvalue']):.4f} | score={int(row['score'])}"
+        f"ret_corr={float(row['correlation']):.3f} | "
+        f"ADF q={float(row['adf_qvalue']):.4f} | score={int(row['score'])}"
         for _, row in best_pairs_df.iterrows()
     ]
     selected_label = st.selectbox("套用最佳 pair 到策略2回測", pair_labels, key="s2_selected_best_pair")
@@ -1082,6 +1107,10 @@ def screen_best_pairs_by_industry(
     top_n: int = TOP_N,
     period: str = PERIOD,
     adf_pvalue: float = ADF_P_THRESHOLD,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+    formation_ratio: float | None = None,
+    lookback: int | None = None,
 ) -> pd.DataFrame:
     if len(stocks) <= 1:
         return pd.DataFrame()
@@ -1092,8 +1121,46 @@ def screen_best_pairs_by_industry(
     if group_price.shape[1] <= 1:
         return pd.DataFrame()
 
+    selection_start = group_price.index.min()
+    selection_end = group_price.index.max()
+
+    # Strategy 2 should not select pairs using future test-period data.
+    # When start/end/formation_ratio are provided, keep only the formation window
+    # for correlation, cointegration, half-life, trend and crossings diagnostics.
+    if start is not None and end is not None and formation_ratio is not None:
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end)
+        full_sample_price = group_price.loc[
+            (group_price.index >= start_ts) & (group_price.index <= end_ts)
+        ].copy()
+
+        if full_sample_price.shape[1] <= 1 or len(full_sample_price) < MIN_OBS:
+            return pd.DataFrame()
+
+        required_lookback = int(lookback) if lookback is not None else MIN_OBS
+        if len(full_sample_price) <= required_lookback + 10:
+            return pd.DataFrame()
+
+        split_idx = int(len(full_sample_price) * float(formation_ratio))
+        split_idx = max(required_lookback, min(split_idx, len(full_sample_price) - 5))
+        if split_idx <= 5 or split_idx >= len(full_sample_price) - 1:
+            return pd.DataFrame()
+
+        formation_end = pd.Timestamp(full_sample_price.index[split_idx])
+        group_price = full_sample_price.loc[full_sample_price.index < formation_end].copy()
+
+        if group_price.shape[1] <= 1 or len(group_price) < MIN_OBS:
+            return pd.DataFrame()
+
+        selection_start = group_price.index.min()
+        selection_end = group_price.index.max()
+
     log_price = np.log(group_price)
-    corr_pairs = extract_high_corr_pairs(industry, log_price, corr_threshold)
+
+    # Use log-return correlation as the first filter.
+    # Price-level correlation can be spuriously high for two trending stocks.
+    log_returns = log_price.diff().dropna()
+    corr_pairs = extract_high_corr_pairs(industry, log_returns, corr_threshold)
 
     if corr_pairs.empty:
         return pd.DataFrame()
@@ -1107,7 +1174,7 @@ def screen_best_pairs_by_industry(
         if col_a not in price_df.columns or col_b not in price_df.columns:
             continue
 
-        pair_price = price_df[[col_a, col_b]].dropna().copy()
+        pair_price = group_price[[col_a, col_b]].dropna().copy()
         if len(pair_price) < MIN_OBS:
             continue
 
@@ -1136,7 +1203,7 @@ def screen_best_pairs_by_industry(
             "spread_max": float(spread_series.max()),
             "adf_stat": float(adf_stat),
             "adf_pvalue": float(adf_p_val),
-            "adf_pass_5pct": bool(pd.notna(adf_p_val) and adf_p_val < adf_pvalue),
+            "adf_pass_5pct": False,
             "half_life": float(half_life) if pd.notna(half_life) else np.nan,
             "half_life_reasonable": bool(pd.notna(half_life) and MIN_HALF_LIFE <= half_life <= MAX_HALF_LIFE),
             "trend_slope": float(trend_slope),
@@ -1148,6 +1215,8 @@ def screen_best_pairs_by_industry(
             "enough_crossings": bool(crossings_per_year >= MIN_CROSSINGS_PER_YEAR),
             "start_date": spread_series.index.min(),
             "end_date": spread_series.index.max(),
+            "selection_start": selection_start,
+            "selection_end": selection_end,
             "observations": int(len(spread_series)),
         })
         screening_records.append(record)
@@ -1155,6 +1224,22 @@ def screen_best_pairs_by_industry(
     screening_df = pd.DataFrame(screening_records)
     if screening_df.empty:
         return pd.DataFrame()
+
+    screening_df["adf_qvalue"] = np.nan
+    valid_adf = screening_df["adf_pvalue"].notna()
+    if valid_adf.any():
+        screening_df.loc[valid_adf, "adf_qvalue"] = multipletests(
+            screening_df.loc[valid_adf, "adf_pvalue"].astype(float),
+            alpha=adf_pvalue,
+            method="fdr_bh",
+        )[1]
+
+    # Keep the original column name for compatibility, but now it means
+    # "passes the user-selected ADF/FDR threshold after multiple-testing correction".
+    screening_df["adf_pass_5pct"] = (
+        screening_df["adf_qvalue"].notna()
+        & (screening_df["adf_qvalue"] < adf_pvalue)
+    )
 
     screening_df["score"] = screening_df.apply(score_pair, axis=1)
     screening_df["suitable"] = (
@@ -1165,7 +1250,7 @@ def screen_best_pairs_by_industry(
     )
 
     screening_df = screening_df.sort_values(
-        ["suitable", "score", "adf_pvalue", "trend_strength"],
+        ["suitable", "score", "adf_qvalue", "trend_strength"],
         ascending=[False, False, True, True],
     ).reset_index(drop=True)
 
@@ -1265,8 +1350,8 @@ def get_group_price(price_df: pd.DataFrame, stock_list: tuple[tuple[str, str], .
     return group_price
 
 
-def extract_high_corr_pairs(group: str, log_price_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    corr = log_price_df.corr()
+def extract_high_corr_pairs(group: str, log_return_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    corr = log_return_df.corr()
     cols = corr.columns.tolist()
 
     records = []
@@ -1283,6 +1368,7 @@ def extract_high_corr_pairs(group: str, log_price_df: pd.DataFrame, threshold: f
                     "stock_B_code": code_b,
                     "stock_B_name": name_b,
                     "correlation": float(c),
+                    "correlation_method": "log_return_correlation",
                 })
 
     return pd.DataFrame(records)
@@ -1370,13 +1456,13 @@ def count_crossings(spread: pd.Series) -> tuple[int, float]:
 def score_pair(row: pd.Series) -> int:
     score = 0
 
-    adf_pvalue = row["adf_pvalue"]
-    if pd.notna(adf_pvalue):
-        if adf_pvalue < 0.01:
+    adf_value = row["adf_qvalue"] if "adf_qvalue" in row and pd.notna(row["adf_qvalue"]) else row["adf_pvalue"]
+    if pd.notna(adf_value):
+        if adf_value < 0.01:
             score += 35
-        elif adf_pvalue < 0.05:
+        elif adf_value < 0.05:
             score += 25
-        elif adf_pvalue < 0.10:
+        elif adf_value < 0.10:
             score += 10
 
     hl = row["half_life"]
