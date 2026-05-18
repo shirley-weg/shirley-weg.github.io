@@ -301,6 +301,7 @@ st.markdown(
 )
 
 StrategyName = Literal["distance", "cointegration"]
+APP_VERSION = "2026-05-18-v2-sidebar-settings-fixed"
 
 
 @dataclass(frozen=True)
@@ -331,6 +332,245 @@ class AppSettings:
     @property
     def preselect_n(self) -> int:
         return int(self.k_final * self.preselect_multiplier)
+
+
+
+
+def sidebar_settings(strategy: StrategyName) -> AppSettings:
+    """Render left sidebar controls and return an AppSettings object.
+
+    This function is intentionally shared by both strategies.  Strategy-specific
+    controls are kept minimal: cointegration uses the p-value threshold, while
+    distance simply carries the value without using it.
+    """
+
+    default_data_start = pd.Timestamp("2022-01-01").date()
+    default_trading_start = pd.Timestamp("2024-01-01").date()
+    default_trading_end = pd.Timestamp.today().date()
+
+    universe_all = stock_pool_df()
+    industries = sorted(universe_all["industry"].dropna().unique().tolist())
+    industry_options = ["全部"] + industries
+    default_industry_index = industry_options.index("金融保險業") if "金融保險業" in industry_options else 0
+
+    with st.sidebar:
+        st.header("參數設定")
+        st.caption(f"版本：{APP_VERSION}")
+
+        if st.button("← 返回策略選單", use_container_width=True, key=f"back_to_selector_{strategy}"):
+            st.session_state["selected_strategy"] = None
+            st.rerun()
+
+        st.divider()
+        st.subheader("股票池")
+        industry = st.selectbox(
+            "細產業股票池",
+            options=industry_options,
+            index=default_industry_index,
+            key=f"industry_{strategy}",
+            help="選擇要進行配對篩選的細產業。選『全部』會使用完整股票池，速度會較慢。",
+        )
+
+        st.subheader("資料與回測期間")
+        data_start = st.date_input(
+            "資料下載起日",
+            value=default_data_start,
+            key=f"data_start_{strategy}",
+            help="必須早於正式回測起日，因為 rolling formation 需要過去歷史資料。",
+        )
+        trading_start = st.date_input(
+            "正式回測起日",
+            value=default_trading_start,
+            key=f"trading_start_{strategy}",
+        )
+        use_latest = st.checkbox(
+            "回測到最新資料",
+            value=True,
+            key=f"use_latest_{strategy}",
+        )
+        if use_latest:
+            trading_end = None
+        else:
+            trading_end = st.date_input(
+                "正式回測結束日",
+                value=default_trading_end,
+                key=f"trading_end_{strategy}",
+            )
+        market_ticker = st.text_input(
+            "Beta benchmark",
+            value="^TWII",
+            key=f"market_ticker_{strategy}",
+        ).strip()
+        auto_adjust = st.checkbox(
+            "使用 yfinance auto_adjust",
+            value=True,
+            key=f"auto_adjust_{strategy}",
+        )
+
+        st.subheader("Pair 篩選參數")
+        lookback_days = int(st.number_input(
+            "Rolling formation lookback days",
+            min_value=60,
+            max_value=1000,
+            value=252,
+            step=21,
+            key=f"lookback_days_{strategy}",
+        ))
+        weekly_freq = st.selectbox(
+            "每週重選頻率標記",
+            options=["W-FRI", "W-THU", "W-WED", "W-TUE", "W-MON"],
+            index=0,
+            key=f"weekly_freq_{strategy}",
+            help="以該週期分組後取每組第一個實際交易日作為重新篩選日。",
+        )
+        min_obs = int(st.number_input(
+            "Formation 最少共同資料筆數",
+            min_value=30,
+            max_value=1000,
+            value=200,
+            step=10,
+            key=f"min_obs_{strategy}",
+        ))
+        k_final = int(st.number_input(
+            "候選 pair 數量 final_k",
+            min_value=1,
+            max_value=50,
+            value=10,
+            step=1,
+            key=f"k_final_{strategy}",
+            help="模式一顯示的最終候選數；模式二內部仍先取 Top 5，再交易最佳 n 組。",
+        ))
+        preselect_multiplier = int(st.number_input(
+            "初選倍數 multiplier",
+            min_value=1,
+            max_value=50,
+            value=10,
+            step=1,
+            key=f"preselect_multiplier_{strategy}",
+        ))
+        beta_diff_threshold = float(st.number_input(
+            "Beta 差距門檻",
+            min_value=0.0,
+            max_value=5.0,
+            value=0.2,
+            step=0.05,
+            format="%.3f",
+            key=f"beta_diff_threshold_{strategy}",
+        ))
+        top_n_display = int(st.number_input(
+            "候選 pair 表格顯示筆數",
+            min_value=1,
+            max_value=100,
+            value=20,
+            step=1,
+            key=f"top_n_display_{strategy}",
+        ))
+
+        if strategy == "cointegration":
+            pvalue_threshold = float(st.number_input(
+                "共整合 p-value 門檻",
+                min_value=0.001,
+                max_value=0.5,
+                value=0.05,
+                step=0.01,
+                format="%.3f",
+                key=f"pvalue_threshold_{strategy}",
+            ))
+        else:
+            pvalue_threshold = 0.05
+
+        st.subheader("交易規則")
+        entry_z = float(st.number_input(
+            "Entry z-score",
+            min_value=0.1,
+            max_value=10.0,
+            value=2.0,
+            step=0.1,
+            format="%.2f",
+            key=f"entry_z_{strategy}",
+        ))
+        exit_z = float(st.number_input(
+            "Exit z-score",
+            min_value=0.0,
+            max_value=10.0,
+            value=0.5,
+            step=0.1,
+            format="%.2f",
+            key=f"exit_z_{strategy}",
+        ))
+        stop_z = float(st.number_input(
+            "Stop z-score",
+            min_value=0.1,
+            max_value=20.0,
+            value=3.0,
+            step=0.1,
+            format="%.2f",
+            key=f"stop_z_{strategy}",
+        ))
+        max_holding_days = int(st.number_input(
+            "Max holding days",
+            min_value=1,
+            max_value=2000,
+            value=60,
+            step=5,
+            key=f"max_holding_days_{strategy}",
+        ))
+        reentry_reset_z = float(st.number_input(
+            "Stop loss 後重新允許進場 abs(z) <",
+            min_value=0.0,
+            max_value=10.0,
+            value=1.0,
+            step=0.1,
+            format="%.2f",
+            key=f"reentry_reset_z_{strategy}",
+        ))
+
+        st.subheader("成本與資金")
+        fee_rate = float(st.number_input(
+            "買賣手續費率",
+            min_value=0.0,
+            max_value=0.05,
+            value=0.001425,
+            step=0.0001,
+            format="%.6f",
+            key=f"fee_rate_{strategy}",
+        ))
+        initial_capital = float(st.number_input(
+            "單一 pair 初始資金",
+            min_value=10_000.0,
+            max_value=1_000_000_000.0,
+            value=1_000_000.0,
+            step=100_000.0,
+            format="%.0f",
+            key=f"initial_capital_{strategy}",
+        ))
+
+        st.caption("目前版本：模式二每週重新篩選 Top 5，但已開倉部位不會因下一週重新篩選而強制平倉。")
+
+    return AppSettings(
+        strategy=strategy,
+        industry=industry,
+        data_start=pd.Timestamp(data_start),
+        trading_start=pd.Timestamp(trading_start),
+        trading_end=None if trading_end is None else pd.Timestamp(trading_end),
+        market_ticker=market_ticker or "^TWII",
+        lookback_days=lookback_days,
+        weekly_freq=weekly_freq,
+        k_final=k_final,
+        preselect_multiplier=preselect_multiplier,
+        min_obs=min_obs,
+        pvalue_threshold=pvalue_threshold,
+        beta_diff_threshold=beta_diff_threshold,
+        entry_z=entry_z,
+        exit_z=exit_z,
+        stop_z=stop_z,
+        max_holding_days=max_holding_days,
+        reentry_reset_z=reentry_reset_z,
+        fee_rate=fee_rate,
+        initial_capital=initial_capital,
+        auto_adjust=auto_adjust,
+        top_n_display=top_n_display,
+    )
 
 
 # ============================================================
@@ -1937,14 +2177,27 @@ def render_method_notes(settings: AppSettings) -> None:
 def render_strategy_page(strategy: StrategyName) -> None:
     title = "配對策略1(距離法)" if strategy == "distance" else "配對策略2(共整合法)"
     st.title(title)
-    st.caption("兩種模式：① 先篩選 pair 後手動固定回測；② 每週自動 Top-N 正式策略回測")
+    st.caption(f"版本：{APP_VERSION}｜請先在本策略內選擇模式：模式一為手動固定 Pair 回測；模式二為每週自動 Top-N 正式策略回測。")
     settings = sidebar_settings(strategy)
-    tabs = st.tabs(["模式一：固定 Pair 回測", "模式二：正式交易策略", "方法說明"])
-    with tabs[0]:
+
+    st.markdown("### 選擇本策略執行模式")
+    mode = st.radio(
+        "執行模式",
+        options=["模式一：篩選最佳 Pair 後手動選一組固定回測", "模式二：正式交易策略，每週 Top 5 自動交易最佳 n 組", "方法說明"],
+        index=0,
+        horizontal=False,
+        key=f"strategy_mode_{strategy}",
+    )
+
+    st.divider()
+
+    if mode.startswith("模式一"):
+        st.info("目前模式：先在參考日篩選最佳 pair，再由使用者選一組固定 pair 回測；回測期間不會每週重新篩選 pair。")
         render_mode1_tab(settings)
-    with tabs[1]:
+    elif mode.startswith("模式二"):
+        st.info("目前模式：正式交易策略。每週篩選 Top 5 pair，交易其中最佳 n 組；已開倉部位不因下一週重新篩選而強制平倉。")
         render_mode2_formal_strategy(settings)
-    with tabs[2]:
+    else:
         render_method_notes(settings)
 
 
