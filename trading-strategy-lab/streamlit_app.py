@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from typing import Literal
 import itertools
+import json
 import logging
 import warnings
 
@@ -301,7 +302,7 @@ st.markdown(
 )
 
 StrategyName = Literal["distance", "cointegration"]
-APP_VERSION = "2026-05-18-v4-pair-modes-all-charts"
+APP_VERSION = "2026-05-18-v5-live-assistant"
 
 
 @dataclass(frozen=True)
@@ -2242,8 +2243,11 @@ def render_method_notes(settings: AppSettings) -> None:
         1. **模式一：固定 Pair 回測**  
            先篩選候選 pair，再由使用者自行選一組 pair。回測時不每週重新選 pair，而是固定使用回測起日前的 formation 參數一路回測。
 
-        2. **模式二：正式交易策略**  
+        2. **模式二：正式交易策略回測**  
            每週自動篩選 Top 5 pair，再交易最佳 n 組。使用者不手動指定 pair。舊持倉不因下一週重選而強制平倉，會持有到觸發出場條件。
+
+        3. **模式三：實盤輔助 / 今日訊號**  
+           不連接券商 API，只用今日收盤資料產生明日手動下單表。可上傳目前持倉，系統會檢查出場條件與空閒 slot 的新進場條件。
 
         ### 共同交易邏輯
         - 今日收盤產生訊號，明日開盤成交。
@@ -2255,16 +2259,579 @@ def render_method_notes(settings: AppSettings) -> None:
     )
 
 
+# ============================================================
+# Live Trading Assistant Utilities
+# ============================================================
+
+POSITION_BASE_COLUMNS = [
+    "method", "slot_id", "pair", "ticker_x", "ticker_y", "direction",
+    "entry_date", "entry_signal_z", "entry_price_x", "entry_price_y",
+    "shares_x", "shares_y", "cash", "entry_capital", "holding_days",
+    "alpha", "hedge_ratio", "mu_x", "std_x", "mu_y", "std_y", "spread_mean", "spread_std",
+    "status", "note",
+]
+
+
+def safe_float(value, default: float = np.nan) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def normalize_positions_df(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize a user-uploaded current positions table.
+
+    The live assistant is API-free, so the user can upload positions from the
+    prior trading day.  The table can be downloaded from this app after a signal
+    run, then edited with actual fill prices / shares and uploaded the next day.
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=POSITION_BASE_COLUMNS)
+    out = df.copy()
+    for col in POSITION_BASE_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+    out["ticker_x"] = out["ticker_x"].astype(str).map(to_yf_ticker)
+    out["ticker_y"] = out["ticker_y"].astype(str).map(to_yf_ticker)
+    out["pair"] = [display_pair_name(x, y) for x, y in zip(out["ticker_x"], out["ticker_y"])]
+    if "status" in out.columns:
+        out = out[(out["status"].isna()) | (out["status"].astype(str).str.lower().isin(["", "active", "open"]))].copy()
+    return out.reset_index(drop=True)
+
+
+def read_positions_upload(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame(columns=POSITION_BASE_COLUMNS)
+    name = str(uploaded_file.name).lower()
+    if name.endswith(".csv"):
+        return normalize_positions_df(pd.read_csv(uploaded_file))
+    return normalize_positions_df(pd.read_excel(uploaded_file))
+
+
+def empty_positions_template(settings: AppSettings) -> pd.DataFrame:
+    row = {col: "" for col in POSITION_BASE_COLUMNS}
+    row["method"] = settings.strategy
+    row["slot_id"] = 0
+    row["entry_capital"] = settings.initial_capital
+    row["status"] = "active"
+    return pd.DataFrame([row])
+
+
+def build_params_from_position_row(row: pd.Series | dict, method: StrategyName) -> dict[str, object]:
+    r = row if isinstance(row, dict) else row.to_dict()
+    ticker_x = to_yf_ticker(str(r.get("ticker_x", "")))
+    ticker_y = to_yf_ticker(str(r.get("ticker_y", "")))
+    base = {
+        "method": method,
+        "ticker_x": ticker_x,
+        "ticker_y": ticker_y,
+        "hedge_ratio": safe_float(r.get("hedge_ratio", 1.0), 1.0),
+        "spread_mean": safe_float(r.get("spread_mean", 0.0), 0.0),
+        "spread_std": safe_float(r.get("spread_std", np.nan), np.nan),
+    }
+    if method == "distance":
+        base.update({
+            "mu_x": safe_float(r.get("mu_x", np.nan), np.nan),
+            "std_x": safe_float(r.get("std_x", np.nan), np.nan),
+            "mu_y": safe_float(r.get("mu_y", np.nan), np.nan),
+            "std_y": safe_float(r.get("std_y", np.nan), np.nan),
+            "hedge_ratio": 1.0,
+        })
+    else:
+        base.update({
+            "alpha": safe_float(r.get("alpha", np.nan), np.nan),
+        })
+    return base
+
+
+def params_to_position_columns(params: dict[str, object]) -> dict[str, object]:
+    keys = ["alpha", "hedge_ratio", "mu_x", "std_x", "mu_y", "std_y", "spread_mean", "spread_std"]
+    return {key: params.get(key, np.nan) for key in keys}
+
+
+def next_business_day_label(date: pd.Timestamp) -> pd.Timestamp:
+    return pd.bdate_range(pd.Timestamp(date) + pd.Timedelta(days=1), periods=1)[0]
+
+
+def current_week_rebalance_date(close_df: pd.DataFrame, signal_date: pd.Timestamp, settings: AppSettings) -> pd.Timestamp:
+    all_dates = close_df.loc[settings.trading_start:signal_date].index
+    if len(all_dates) == 0:
+        return pd.Timestamp(signal_date)
+    periods = all_dates.to_period(settings.weekly_freq)
+    current_period = pd.Timestamp(signal_date).to_period(settings.weekly_freq)
+    dates = all_dates[periods == current_period]
+    if len(dates) == 0:
+        return pd.Timestamp(all_dates[-1])
+    return pd.Timestamp(dates[0])
+
+
+def select_live_top5_candidates(
+    method: StrategyName,
+    close_df: pd.DataFrame,
+    stock_info_df: pd.DataFrame,
+    market_price_full: pd.Series,
+    settings: AppSettings,
+    signal_date: pd.Timestamp,
+    weekly_top_k: int = 5,
+) -> tuple[pd.Timestamp, pd.DataFrame, pd.DataFrame, dict[str, dict[str, object]]]:
+    """Select current-week TOP5 candidates using the latest weekly formation window."""
+    rebalance_date = current_week_rebalance_date(close_df, signal_date, settings)
+    formation_prices = get_formation_window(close_df, rebalance_date, settings.lookback_days)
+    if len(formation_prices) < settings.min_obs:
+        return rebalance_date, formation_prices, pd.DataFrame(), {}
+    _, _, top5 = select_pairs_with_beta_filter_top_k(method, formation_prices, stock_info_df, market_price_full, settings, top_k=weekly_top_k)
+    params_map: dict[str, dict[str, object]] = {}
+    if len(top5) > 0:
+        for _, row in top5.iterrows():
+            pname = display_pair_name(row["ticker_x"], row["ticker_y"])
+            params_map[pname] = fit_spread_params(method, row, formation_prices)
+    return rebalance_date, formation_prices, top5, params_map
+
+
+def make_close_order_rows(position_row: pd.Series, signal_date: pd.Timestamp, execute_date: pd.Timestamp, close_df: pd.DataFrame, reason: str, current_z: float) -> list[dict[str, object]]:
+    tx = to_yf_ticker(str(position_row.get("ticker_x")))
+    ty = to_yf_ticker(str(position_row.get("ticker_y")))
+    pair = display_pair_name(tx, ty)
+    rows: list[dict[str, object]] = []
+    for leg, ticker, shares_col in [("X", tx, "shares_x"), ("Y", ty, "shares_y")]:
+        shares = safe_float(position_row.get(shares_col, 0.0), 0.0)
+        if shares == 0:
+            continue
+        side = "SELL" if shares > 0 else "BUY_TO_COVER"
+        ref_price = close_df.loc[signal_date, ticker] if ticker in close_df.columns else np.nan
+        rows.append({
+            "signal_date": signal_date,
+            "execute_date": execute_date,
+            "order_type": "EXIT",
+            "reason": reason,
+            "pair": pair,
+            "leg": leg,
+            "ticker": ticker,
+            "code": code_from_ticker(ticker),
+            "name": resolve_stock_name(ticker),
+            "side": side,
+            "estimated_shares": abs(shares),
+            "reference_price": ref_price,
+            "estimated_notional": abs(shares) * ref_price if pd.notna(ref_price) else np.nan,
+            "direction": position_row.get("direction", np.nan),
+            "z_signal": current_z,
+            "note": "用今日收盤訊號，明日開盤手動平倉。reference_price 僅為今日收盤估算。",
+        })
+    return rows
+
+
+def make_entry_order_and_position_rows(
+    method: StrategyName,
+    params: dict[str, object],
+    direction: int,
+    signal_z: float,
+    signal_date: pd.Timestamp,
+    execute_date: pd.Timestamp,
+    close_df: pd.DataFrame,
+    slot_id: int,
+    capital: float,
+    fee_rate: float,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    tx = str(params["ticker_x"])
+    ty = str(params["ticker_y"])
+    pair = display_pair_name(tx, ty)
+    px = close_df.loc[signal_date, tx]
+    py = close_df.loc[signal_date, ty]
+    weight_x, weight_y = calculate_pair_weights(direction, float(params.get("hedge_ratio", 1.0)))
+    dollar_x = capital * weight_x
+    dollar_y = capital * weight_y
+    shares_x = dollar_x / px
+    shares_y = dollar_y / py
+    traded_notional = abs(shares_x * px) + abs(shares_y * py)
+    estimated_cost = traded_notional * fee_rate
+    estimated_cash_after_entry = capital - shares_x * px - shares_y * py - estimated_cost
+
+    def side_for_dollar(value: float) -> str:
+        return "BUY" if value > 0 else "SHORT_SELL"
+
+    rows = [
+        {
+            "signal_date": signal_date,
+            "execute_date": execute_date,
+            "order_type": "ENTER",
+            "reason": "long_spread" if direction == 1 else "short_spread",
+            "pair": pair,
+            "leg": "X",
+            "ticker": tx,
+            "code": code_from_ticker(tx),
+            "name": resolve_stock_name(tx),
+            "side": side_for_dollar(dollar_x),
+            "estimated_shares": abs(shares_x),
+            "reference_price": px,
+            "estimated_notional": abs(shares_x * px),
+            "direction": direction,
+            "z_signal": signal_z,
+            "note": "用今日收盤訊號，明日開盤手動進場。reference_price 僅為今日收盤估算。",
+        },
+        {
+            "signal_date": signal_date,
+            "execute_date": execute_date,
+            "order_type": "ENTER",
+            "reason": "long_spread" if direction == 1 else "short_spread",
+            "pair": pair,
+            "leg": "Y",
+            "ticker": ty,
+            "code": code_from_ticker(ty),
+            "name": resolve_stock_name(ty),
+            "side": side_for_dollar(dollar_y),
+            "estimated_shares": abs(shares_y),
+            "reference_price": py,
+            "estimated_notional": abs(shares_y * py),
+            "direction": direction,
+            "z_signal": signal_z,
+            "note": "用今日收盤訊號，明日開盤手動進場。reference_price 僅為今日收盤估算。",
+        },
+    ]
+    pos = {
+        "method": method,
+        "slot_id": slot_id,
+        "pair": pair,
+        "ticker_x": tx,
+        "ticker_y": ty,
+        "direction": direction,
+        "entry_date": execute_date,
+        "entry_signal_z": signal_z,
+        "entry_price_x": px,
+        "entry_price_y": py,
+        "shares_x": shares_x,
+        "shares_y": shares_y,
+        "cash": estimated_cash_after_entry,
+        "entry_capital": capital,
+        "holding_days": 0,
+        "status": "active_pending_fill",
+        "note": "成交後請以實際成交價、實際股數、實際 cash 更新後再作為明日 positions 檔案。",
+    }
+    pos.update(params_to_position_columns(params))
+    return rows, pos
+
+
+def generate_live_trading_plan(
+    method: StrategyName,
+    open_df: pd.DataFrame,
+    close_df: pd.DataFrame,
+    stock_info_df: pd.DataFrame,
+    market_price_full: pd.Series,
+    settings: AppSettings,
+    signal_date: pd.Timestamp,
+    n_pairs: int,
+    positions_df: pd.DataFrame,
+    blocked_pairs_input: list[str] | None = None,
+    weekly_top_k: int = 5,
+) -> dict[str, object]:
+    signal_date = pd.Timestamp(signal_date)
+    available_dates = close_df.loc[:signal_date].index
+    if len(available_dates) == 0:
+        raise ValueError("signal_date 之前沒有可用收盤價。")
+    signal_date = pd.Timestamp(available_dates[-1])
+    prev_dates = close_df.loc[:signal_date].index
+    if len(prev_dates) < 2:
+        raise ValueError("需要至少兩個交易日才能判斷 crossing signal。")
+    prev_date = pd.Timestamp(prev_dates[-2])
+    execute_date = next_business_day_label(signal_date)
+    positions = normalize_positions_df(positions_df)
+    if len(positions) > 0:
+        positions = positions[positions["method"].fillna(method).astype(str).eq(method)].copy()
+
+    rebalance_date, formation_prices, top5, params_map = select_live_top5_candidates(
+        method, close_df, stock_info_df, market_price_full, settings, signal_date, weekly_top_k=weekly_top_k
+    )
+    active_pairs = set(positions["pair"].astype(str).tolist()) if len(positions) > 0 else set()
+    blocked_pairs = set(blocked_pairs_input or [])
+
+    position_review_rows: list[dict[str, object]] = []
+    orders: list[dict[str, object]] = []
+    positions_to_add: list[dict[str, object]] = []
+
+    # Existing positions: check exits using their entry-time parameters.
+    for _, row in positions.iterrows():
+        params = build_params_from_position_row(row, method)
+        pair = display_pair_name(str(params["ticker_x"]), str(params["ticker_y"]))
+        try:
+            z_today = compute_z_at_date(params, close_df, signal_date)
+        except Exception:
+            z_today = np.nan
+        holding_days = safe_int(row.get("holding_days", 0), 0)
+        # If the user has not maintained holding_days, approximate with trading days since entry_date.
+        try:
+            entry_dt = pd.Timestamp(row.get("entry_date"))
+            holding_days = max(holding_days, len(close_df.loc[entry_dt:signal_date].index) - 1)
+        except Exception:
+            pass
+        exit_reason = None
+        if pd.notna(z_today):
+            if abs(float(z_today)) < settings.exit_z:
+                exit_reason = "mean_reversion"
+            elif abs(float(z_today)) > settings.stop_z:
+                exit_reason = "stop_loss"
+            elif holding_days >= settings.max_holding_days:
+                exit_reason = "max_holding_days"
+        position_review_rows.append({
+            "pair": pair,
+            "ticker_x": params.get("ticker_x"),
+            "ticker_y": params.get("ticker_y"),
+            "direction": row.get("direction", np.nan),
+            "entry_date": row.get("entry_date", ""),
+            "holding_days": holding_days,
+            "current_z": z_today,
+            "exit_signal": exit_reason is not None,
+            "exit_reason": exit_reason or "hold",
+        })
+        if exit_reason is not None:
+            orders.extend(make_close_order_rows(row, signal_date, execute_date, close_df, exit_reason, z_today))
+            if exit_reason == "stop_loss":
+                blocked_pairs.add(pair)
+
+    # Entries: current weekly TOP5, best n only, only if there are free slots.
+    active_count = len(active_pairs)
+    free_slots = max(int(n_pairs) - active_count, 0)
+    next_slot_id = 0
+    if len(positions) > 0 and "slot_id" in positions.columns:
+        try:
+            used_slots = set(positions["slot_id"].dropna().astype(int).tolist())
+            while next_slot_id in used_slots:
+                next_slot_id += 1
+        except Exception:
+            pass
+    entry_scan_rows: list[dict[str, object]] = []
+    if len(top5) > 0 and free_slots > 0:
+        for _, row in top5.head(int(n_pairs)).iterrows():
+            if free_slots <= 0:
+                break
+            pname = display_pair_name(row["ticker_x"], row["ticker_y"])
+            if pname in active_pairs:
+                entry_scan_rows.append({"pair": pname, "entry_signal": False, "reason": "already_active"})
+                continue
+            if pname not in params_map:
+                continue
+            params = params_map[pname]
+            z_today = compute_z_at_date(params, close_df, signal_date)
+            z_prev = compute_z_at_date(params, close_df, prev_date)
+            if pd.isna(z_today) or pd.isna(z_prev):
+                entry_scan_rows.append({"pair": pname, "entry_signal": False, "reason": "missing_z"})
+                continue
+            if pname in blocked_pairs:
+                if abs(z_today) < settings.reentry_reset_z:
+                    blocked_pairs.remove(pname)
+                else:
+                    entry_scan_rows.append({"pair": pname, "entry_signal": False, "reason": "blocked_after_stop_loss", "z_today": z_today, "z_prev": z_prev})
+                    continue
+            direction = None
+            reason = None
+            if (z_prev <= settings.entry_z) and (settings.entry_z < z_today < settings.stop_z):
+                direction = -1
+                reason = "short_spread_cross_up"
+            elif (z_prev >= -settings.entry_z) and (-settings.stop_z < z_today < -settings.entry_z):
+                direction = 1
+                reason = "long_spread_cross_down"
+            if direction is None:
+                entry_scan_rows.append({"pair": pname, "entry_signal": False, "reason": "no_crossing", "z_today": z_today, "z_prev": z_prev})
+                continue
+            entry_orders, pos_row = make_entry_order_and_position_rows(
+                method, params, direction, float(z_today), signal_date, execute_date, close_df, next_slot_id, float(settings.initial_capital), float(settings.fee_rate)
+            )
+            for o in entry_orders:
+                o["reason"] = reason
+            orders.extend(entry_orders)
+            positions_to_add.append(pos_row)
+            entry_scan_rows.append({"pair": pname, "entry_signal": True, "reason": reason, "z_today": z_today, "z_prev": z_prev})
+            free_slots -= 1
+            next_slot_id += 1
+
+    orders_df = pd.DataFrame(orders)
+    position_review = pd.DataFrame(position_review_rows)
+    positions_to_add_df = pd.DataFrame(positions_to_add)
+    entry_scan = pd.DataFrame(entry_scan_rows)
+    status = pd.DataFrame([{
+        "method": method,
+        "signal_date": signal_date,
+        "execute_date": execute_date,
+        "rebalance_date": rebalance_date,
+        "formation_start": formation_prices.index.min() if len(formation_prices) else pd.NaT,
+        "formation_end": formation_prices.index.max() if len(formation_prices) else pd.NaT,
+        "weekly_top_k": weekly_top_k,
+        "trade_best_n": n_pairs,
+        "active_positions": active_count,
+        "free_slots_before_new_entries": max(int(n_pairs) - active_count, 0),
+        "orders_count": len(orders_df),
+        "entry_orders_count": int((orders_df["order_type"] == "ENTER").sum()) if len(orders_df) and "order_type" in orders_df.columns else 0,
+        "exit_orders_count": int((orders_df["order_type"] == "EXIT").sum()) if len(orders_df) and "order_type" in orders_df.columns else 0,
+    }])
+    return {
+        "status": status,
+        "top5_candidates": top5,
+        "position_review": position_review,
+        "entry_scan": entry_scan,
+        "orders": orders_df,
+        "positions_to_add": positions_to_add_df,
+        "positions_template": empty_positions_template(settings),
+        "blocked_pairs_after_signal": pd.DataFrame({"pair": sorted(blocked_pairs)}),
+    }
+
+
+def render_live_assistant_mode(settings: AppSettings) -> None:
+    st.subheader("模式三：實盤輔助 / 今日訊號與明日下單表")
+    st.write(
+        "此模式不連接券商 API，而是使用今日收盤資料產生明日手動下單清單。"
+        "你可以上傳目前持倉檔，系統會檢查出場訊號；若有空閒 slot，也會從本週 Top 5 中檢查新的進場訊號。"
+    )
+    col_a, col_b, col_c = st.columns([0.34, 0.33, 0.33])
+    with col_a:
+        signal_date_input = st.date_input("訊號日期", value=pd.Timestamp.today().date(), key=f"live_signal_date_{settings.strategy}")
+    with col_b:
+        live_n = st.number_input("正式交易最佳 n 組", min_value=1, max_value=5, value=1, step=1, key=f"live_n_{settings.strategy}")
+    with col_c:
+        weekly_top_k = st.number_input("每週候選 Top K", min_value=1, max_value=10, value=5, step=1, key=f"live_topk_{settings.strategy}")
+
+    st.markdown("#### 目前持倉檔")
+    uploaded = st.file_uploader(
+        "上傳目前持倉 positions 檔案（CSV 或 Excel，可先下載下方模板）",
+        type=["csv", "xlsx"],
+        key=f"live_positions_upload_{settings.strategy}",
+    )
+    positions_df = read_positions_upload(uploaded)
+    st.caption("若沒有上傳持倉檔，系統會視為目前沒有持倉，只產生可能的新進場訊號。")
+    if len(positions_df) > 0:
+        st.dataframe(positions_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("目前沒有上傳 active positions。")
+
+    blocked_text = st.text_area(
+        "停損後暫時封鎖的 pair（選填，每行一組，例如 2882.TW_2883.TW）",
+        value="",
+        key=f"live_blocked_pairs_{settings.strategy}",
+        help="如果你有外部紀錄的 stop-loss blocked pair，可貼在這裡；系統會等 abs(z)<reentry_reset_z 才解除。",
+    )
+    blocked_pairs_input = [line.strip() for line in blocked_text.splitlines() if line.strip()]
+
+    st.download_button(
+        "下載 positions 模板",
+        data=df_to_excel_bytes({"positions_template": empty_positions_template(settings)}),
+        file_name=f"{settings.strategy}_positions_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    if st.button("產生今日訊號 / 明日下單表", type="primary", use_container_width=True, key=f"live_run_{settings.strategy}"):
+        try:
+            extra_tickers = []
+            if len(positions_df) > 0:
+                extra_tickers = positions_df["ticker_x"].tolist() + positions_df["ticker_y"].tolist()
+            open_df, close_df, market_price, universe = prepare_download_for_universe(settings, extra_tickers=extra_tickers)
+            with st.spinner("產生實盤輔助訊號..."):
+                result = generate_live_trading_plan(
+                    settings.strategy,
+                    open_df,
+                    close_df,
+                    universe,
+                    market_price,
+                    settings,
+                    pd.Timestamp(signal_date_input),
+                    int(live_n),
+                    positions_df,
+                    blocked_pairs_input=blocked_pairs_input,
+                    weekly_top_k=int(weekly_top_k),
+                )
+            st.session_state[f"live_result_{settings.strategy}"] = result
+        except Exception as exc:
+            st.error(f"產生訊號失敗：{exc}")
+            return
+
+    result = st.session_state.get(f"live_result_{settings.strategy}")
+    if not result:
+        return
+
+    st.markdown("### 今日策略狀態")
+    st.dataframe(result["status"], use_container_width=True, hide_index=True)
+    status_row = result["status"].iloc[0]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Active Positions", int(status_row.get("active_positions", 0)))
+    m2.metric("Free Slots", int(status_row.get("free_slots_before_new_entries", 0)))
+    m3.metric("Orders", int(status_row.get("orders_count", 0)))
+    m4.metric("Execute Date", str(pd.Timestamp(status_row.get("execute_date")).date()))
+
+    tab_orders, tab_positions, tab_candidates, tab_download = st.tabs(["明日下單表", "目前持倉檢查", "本週候選 Pair", "下載 / 回填"])
+    with tab_orders:
+        orders = result["orders"]
+        if len(orders) == 0:
+            st.success("今日沒有觸發明日進出場訂單。")
+        else:
+            st.dataframe(orders, use_container_width=True, hide_index=True)
+            st.warning("請注意：reference_price 是今日收盤價估算；實際下單應以明日開盤或實際成交結果為準。成交後請回填實際價格與股數。")
+    with tab_positions:
+        st.markdown("#### 目前持倉出場檢查")
+        st.dataframe(result["position_review"], use_container_width=True, hide_index=True)
+        st.markdown("#### 新進場後可加入 positions 的估算列")
+        st.dataframe(result["positions_to_add"], use_container_width=True, hide_index=True)
+        st.markdown("#### blocked pairs after signal")
+        st.dataframe(result["blocked_pairs_after_signal"], use_container_width=True, hide_index=True)
+    with tab_candidates:
+        st.markdown("#### 本週 Top 候選 Pair")
+        st.dataframe(result["top5_candidates"], use_container_width=True, hide_index=True)
+        st.markdown("#### Entry signal scan")
+        st.dataframe(result["entry_scan"], use_container_width=True, hide_index=True)
+    with tab_download:
+        sheets = {
+            "status": result["status"],
+            "orders": result["orders"],
+            "position_review": result["position_review"],
+            "positions_to_add": result["positions_to_add"],
+            "top_candidates": result["top5_candidates"],
+            "entry_scan": result["entry_scan"],
+            "blocked_pairs_after_signal": result["blocked_pairs_after_signal"],
+            "positions_template": result["positions_template"],
+        }
+        st.download_button(
+            "下載今日訊號與明日下單表 Excel",
+            data=df_to_excel_bytes(sheets),
+            file_name=f"{settings.strategy}_live_orders_{pd.Timestamp(result['status'].iloc[0]['signal_date']).date()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        if len(result["orders"]) > 0:
+            st.download_button(
+                "下載 orders.csv",
+                data=result["orders"].to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{settings.strategy}_orders.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        if len(result["positions_to_add"]) > 0:
+            st.download_button(
+                "下載 positions_to_add.csv",
+                data=result["positions_to_add"].to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{settings.strategy}_positions_to_add.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+
 def render_strategy_page(strategy: StrategyName) -> None:
     title = "配對策略1(距離法)" if strategy == "distance" else "配對策略2(共整合法)"
     st.title(title)
-    st.caption(f"版本：{APP_VERSION}｜請先在本策略內選擇模式：模式一為手動固定 Pair 回測；模式二為每週自動 Top-N 正式策略回測。")
+    st.caption(f"版本：{APP_VERSION}｜請先在本策略內選擇模式：模式一為手動固定 Pair 回測；模式二為每週 Top-N 正式策略回測；模式三為實盤輔助今日訊號。")
     settings = sidebar_settings(strategy)
 
     st.markdown("### 選擇本策略執行模式")
     mode = st.radio(
         "執行模式",
-        options=["模式一：篩選最佳 Pair 後手動選一組固定回測", "模式二：正式交易策略，每週 Top 5 自動交易最佳 n 組", "方法說明"],
+        options=["模式一：篩選最佳 Pair 後手動選一組固定回測", "模式二：正式交易策略，每週 Top 5 自動交易最佳 n 組", "模式三：實盤輔助 / 今日訊號與明日下單表", "方法說明"],
         index=0,
         horizontal=False,
         key=f"strategy_mode_{strategy}",
@@ -2276,8 +2843,11 @@ def render_strategy_page(strategy: StrategyName) -> None:
         st.info("目前模式：先在參考日篩選最佳 pair，再由使用者選一組固定 pair 回測；回測期間不會每週重新篩選 pair。")
         render_mode1_tab(settings)
     elif mode.startswith("模式二"):
-        st.info("目前模式：正式交易策略。每週篩選 Top 5 pair，交易其中最佳 n 組；已開倉部位不因下一週重新篩選而強制平倉。")
+        st.info("目前模式：正式交易策略回測。每週篩選 Top 5 pair，交易其中最佳 n 組；已開倉部位不因下一週重新篩選而強制平倉。")
         render_mode2_formal_strategy(settings)
+    elif mode.startswith("模式三"):
+        st.info("目前模式：實盤輔助。使用今日收盤資料產生明日手動下單表；不會連接券商 API，也不會自動下單。")
+        render_live_assistant_mode(settings)
     else:
         render_method_notes(settings)
 
