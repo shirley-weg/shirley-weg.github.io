@@ -301,7 +301,7 @@ st.markdown(
 )
 
 StrategyName = Literal["distance", "cointegration"]
-APP_VERSION = "2026-05-18-v2-sidebar-settings-fixed"
+APP_VERSION = "2026-05-18-v4-pair-modes-all-charts"
 
 
 @dataclass(frozen=True)
@@ -1691,6 +1691,7 @@ def run_formal_topn_strategy_backtest(
     weekly_records: list[dict[str, object]] = []
     trade_records: list[dict[str, object]] = []
     equity_records: list[dict[str, object]] = []
+    zscore_records: list[dict[str, object]] = []
 
     for i, date in enumerate(all_dates):
         date = pd.Timestamp(date)
@@ -1827,6 +1828,40 @@ def run_formal_topn_strategy_backtest(
             "free_slots": sum(not bool(s.get("active")) for s in slots),
         })
 
+        # Z-score history for formal strategy charts.
+        # Current candidate z uses this week's formation params;
+        # active position z uses the entry-time params kept inside each slot.
+        active_pair_names = {str(slot.get("pair")) for slot in slots if slot.get("active")}
+        for pname, params in current_candidate_params.items():
+            try:
+                z_current = compute_z_at_date(params, close_df, date)
+            except Exception:
+                z_current = np.nan
+            zscore_records.append({
+                "date": date,
+                "pair": pname,
+                "z_current_candidate": z_current,
+                "z_active_position": np.nan,
+                "source": "current_candidate",
+                "is_active_pair": pname in active_pair_names,
+            })
+        for slot in slots:
+            if not slot.get("active"):
+                continue
+            pname = str(slot.get("pair"))
+            try:
+                z_active = compute_z_at_date(slot["spread_params"], close_df, date)
+            except Exception:
+                z_active = np.nan
+            zscore_records.append({
+                "date": date,
+                "pair": pname,
+                "z_current_candidate": np.nan,
+                "z_active_position": z_active,
+                "source": "active_position",
+                "is_active_pair": True,
+            })
+
         if i >= len(all_dates) - 1:
             continue
 
@@ -1924,6 +1959,9 @@ def run_formal_topn_strategy_backtest(
     trades_df = pd.DataFrame(trade_records)
     selected_pairs_history = pd.concat(selected_pair_snapshots, axis=0).reset_index(drop=True) if selected_pair_snapshots else pd.DataFrame()
     weekly_summary = pd.DataFrame(weekly_records)
+    zscore_history = pd.DataFrame(zscore_records)
+    if len(zscore_history) > 0:
+        zscore_history["date"] = pd.to_datetime(zscore_history["date"])
     summary = pd.DataFrame([{**evaluate_equity_curve(equity_curve, trades_df), "initial_capital": float(settings.initial_capital) * int(n_pairs), "n_pairs": int(n_pairs), "weekly_top_k": int(weekly_top_k)}])
     return {
         "summary": summary,
@@ -1931,6 +1969,7 @@ def run_formal_topn_strategy_backtest(
         "trades": trades_df,
         "weekly_summary": weekly_summary,
         "selected_pairs_history": selected_pairs_history,
+        "zscore_history": zscore_history,
     }
 
 
@@ -2098,6 +2137,7 @@ def render_mode2_formal_strategy(settings: AppSettings) -> None:
             with st.spinner("執行正式交易策略回測..."):
                 result = run_formal_topn_strategy_backtest(settings.strategy, open_df, close_df, universe, market_price, settings, int(n_pairs), weekly_top_k=5)
             st.session_state[f"formal_result_{settings.strategy}"] = result
+            st.session_state[f"formal_price_data_{settings.strategy}"] = close_df
         except Exception as exc:
             st.error(f"正式策略回測失敗：{exc}")
             return
@@ -2108,11 +2148,48 @@ def render_mode2_formal_strategy(settings: AppSettings) -> None:
         show_summary_metrics(result["summary"])
         equity_curve = result["equity_curve"]
         trades_df = result["trades"]
-        chart_tab, table_tab = st.tabs(["績效圖表", "資料表"])
+        chart_tab, pair_chart_tab, table_tab = st.tabs(["績效圖表", "Pair 價格與訊號", "資料表"])
         with chart_tab:
             st.plotly_chart(plot_equity_curve(equity_curve), use_container_width=True)
             st.plotly_chart(plot_drawdown(equity_curve), use_container_width=True)
             st.plotly_chart(plot_trade_pnl(trades_df), use_container_width=True)
+        with pair_chart_tab:
+            close_df = st.session_state.get(f"formal_price_data_{settings.strategy}")
+            zscore_history = result.get("zscore_history", pd.DataFrame())
+            pair_labels: list[str] = []
+            if isinstance(trades_df, pd.DataFrame) and len(trades_df) > 0 and "pair" in trades_df.columns:
+                pair_labels.extend(trades_df["pair"].dropna().astype(str).unique().tolist())
+            selected_pairs_df = result.get("selected_pairs_history", pd.DataFrame())
+            if isinstance(selected_pairs_df, pd.DataFrame) and len(selected_pairs_df) > 0:
+                for _, row in selected_pairs_df.iterrows():
+                    if "ticker_x" in row and "ticker_y" in row:
+                        pair_labels.append(display_pair_name(row["ticker_x"], row["ticker_y"]))
+            pair_labels = sorted(set(pair_labels))
+            if close_df is None or len(pair_labels) == 0:
+                st.info("目前沒有可繪製的 pair 圖表。請先執行正式策略，且至少要有候選 pair 或交易紀錄。")
+            else:
+                selected_pair = st.selectbox("選擇要檢視的 pair", pair_labels, key=f"formal_pair_chart_select_{settings.strategy}")
+                try:
+                    ticker_x, ticker_y = selected_pair.split("_")
+                    trading_close = close_df.loc[settings.trading_start:settings.trading_end]
+                    st.plotly_chart(plot_price_chart(trading_close, ticker_x, ticker_y), use_container_width=True)
+                    st.plotly_chart(plot_normalized_price_chart(trading_close, ticker_x, ticker_y), use_container_width=True)
+                    if isinstance(zscore_history, pd.DataFrame) and len(zscore_history) > 0:
+                        pair_z = zscore_history[zscore_history["pair"].astype(str) == selected_pair].copy()
+                        if len(pair_z) > 0:
+                            pair_z = (
+                                pair_z.groupby("date", as_index=True)[["z_current_candidate", "z_active_position"]]
+                                .max()
+                                .sort_index()
+                            )
+                            pair_trades = trades_df[trades_df["pair"].astype(str) == selected_pair].copy() if isinstance(trades_df, pd.DataFrame) and len(trades_df) > 0 else pd.DataFrame()
+                            st.plotly_chart(plot_zscore(pair_z, settings, pair_trades), use_container_width=True)
+                        else:
+                            st.info("此 pair 在正式策略期間沒有可用的 z-score 紀錄。")
+                    else:
+                        st.info("此回測結果沒有 z-score history。")
+                except Exception as exc:
+                    st.warning(f"pair 圖表產生失敗：{exc}")
         with table_tab:
             st.markdown("#### 交易紀錄")
             st.dataframe(trades_df, use_container_width=True, hide_index=True)
@@ -2120,6 +2197,9 @@ def render_mode2_formal_strategy(settings: AppSettings) -> None:
             st.dataframe(result["selected_pairs_history"], use_container_width=True, hide_index=True)
             st.markdown("#### 每週摘要")
             st.dataframe(result["weekly_summary"], use_container_width=True, hide_index=True)
+            if isinstance(result.get("zscore_history", pd.DataFrame()), pd.DataFrame) and len(result.get("zscore_history", pd.DataFrame())) > 0:
+                st.markdown("#### Z-score history")
+                st.dataframe(result["zscore_history"], use_container_width=True, hide_index=True)
         st.download_button(
             "下載正式策略結果 Excel/ZIP",
             data=df_to_excel_bytes({
@@ -2128,6 +2208,7 @@ def render_mode2_formal_strategy(settings: AppSettings) -> None:
                 "trades": trades_df,
                 "selected_pairs": result["selected_pairs_history"],
                 "weekly_summary": result["weekly_summary"],
+                "zscore_history": result.get("zscore_history", pd.DataFrame()),
             }),
             file_name=f"{settings.strategy}_formal_topn_backtest.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
