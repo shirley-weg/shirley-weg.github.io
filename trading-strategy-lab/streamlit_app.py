@@ -651,6 +651,28 @@ def sidebar_strategy2_settings() -> dict[str, object]:
     adf_pvalue = st.sidebar.selectbox("ADF p-value threshold", [0.01, 0.05, 0.10], index=1)
 
     st.sidebar.divider()
+    st.sidebar.header("Pair Screening 設定")
+    industry_groups = build_industry_groups()
+    industry_options = sorted(industry_groups.keys())
+    default_industry = "半導體業" if "半導體業" in industry_options else industry_options[0]
+    screen_industry = st.sidebar.selectbox(
+        "篩選細產業",
+        industry_options,
+        index=industry_options.index(default_industry),
+        key="s2_screen_industry",
+    )
+    screen_period = st.sidebar.selectbox("篩選資料期間", ["1y", "2y", "3y", "5y", "10y"], index=2, key="s2_screen_period")
+    corr_threshold = st.sidebar.slider(
+        "Correlation threshold",
+        min_value=0.50,
+        max_value=0.98,
+        value=0.80,
+        step=0.01,
+        key="s2_corr_threshold",
+    )
+    top_n = st.sidebar.slider("顯示最佳 pair 數量", 1, 20, 10, 1, key="s2_top_n")
+
+    st.sidebar.divider()
     st.sidebar.header("策略參數")
     lookback = st.sidebar.slider("Rolling OLS lookback", 40, 260, 120, 10, key="s2_lookback")
     entry_z = st.sidebar.slider("Entry z-score", 0.5, 4.0, 2.0, 0.1, key="s2_entry_z")
@@ -673,6 +695,10 @@ def sidebar_strategy2_settings() -> dict[str, object]:
         "benchmark": benchmark,
         "formation_ratio": float(formation_ratio),
         "adf_pvalue": float(adf_pvalue),
+        "screen_industry": screen_industry,
+        "screen_period": screen_period,
+        "corr_threshold": float(corr_threshold),
+        "top_n": int(top_n),
         "config": Config(
             lookback=lookback,
             entry_z=entry_z,
@@ -684,7 +710,6 @@ def sidebar_strategy2_settings() -> dict[str, object]:
         ),
     }
 
-
 def render_cointegration_research(settings: dict[str, object]) -> None:
     a_code = str(settings["a_code"])
     b_code = str(settings["b_code"])
@@ -694,24 +719,33 @@ def render_cointegration_research(settings: dict[str, object]) -> None:
     end = pd.Timestamp(settings["end"])
     formation_ratio = float(settings["formation_ratio"])
     adf_pvalue = float(settings["adf_pvalue"])
+    corr_threshold = float(settings["corr_threshold"])
+    top_n = int(settings["top_n"])
     config: Config = settings["config"]  # type: ignore[assignment]
 
     st.subheader("策略2：Cointegration 單一 Pair 實證")
 
-    left, right = st.columns([0.58, 0.42])
+    left, right = st.columns([0.55, 0.45])
     with left:
+        st.markdown("#### 回測 Pair")
         if a_code and b_code:
             st.markdown(f"### {format_stock_label(a_code, a_name)} / {format_stock_label(b_code, b_name)}")
             st.write("策略2會先用 formation period 檢查 pair 的共整合特性，再用 test period 進行與策略1相同格式的回測顯示。")
         else:
-            st.info("請先在左側輸入 A code / B code。")
-    with right:
-        st.metric("Formation ratio", f"{formation_ratio:.0%}")
-        st.metric("ADF threshold", f"{adf_pvalue:.2f}")
+            st.info("請先在左側輸入 A code / B code，或從右側最佳 pair 結果套用。")
 
-    run = st.button("Run 策略2單一 Pair 回測", type="primary", use_container_width=True)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Formation ratio", f"{formation_ratio:.0%}")
+        m2.metric("ADF threshold", f"{adf_pvalue:.2f}")
+        m3.metric("Corr threshold", f"{corr_threshold:.2f}")
+
+        run = st.button("Run 策略2單一 Pair 回測", type="primary", use_container_width=True)
+
+    with right:
+        render_strategy2_best_pairs_panel(settings)
+
     if not run:
-        st.info("輸入兩檔股票代號並設定參數後，按 Run 開始回測。")
+        st.info("輸入兩檔股票代號，或從右側最佳 pair 結果套用後，按 Run 開始回測。")
         return
 
     if not a_code or not b_code:
@@ -750,6 +784,99 @@ def render_cointegration_research(settings: dict[str, object]) -> None:
     show_charts(result, a_code, b_code, str(settings["benchmark"]), config)
     show_tables(result)
 
+
+def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
+    st.markdown("#### 最佳 Pair 篩選結果")
+
+    industry = str(settings["screen_industry"])
+    period = str(settings["screen_period"])
+    corr_threshold = float(settings["corr_threshold"])
+    adf_pvalue = float(settings["adf_pvalue"])
+    top_n = int(settings["top_n"])
+
+    industry_groups = build_industry_groups()
+    stocks = tuple(industry_groups.get(industry, []))
+
+    st.caption(
+        f"細產業：{industry}｜股票數：{len(stocks)}｜資料期間：{period}｜"
+        f"Correlation threshold：{corr_threshold:.2f}｜Top N：{top_n}"
+    )
+
+    run_screen = st.button("篩選策略2最佳 Pair", use_container_width=True)
+
+    if run_screen:
+        with st.spinner("下載價格並篩選最佳 pair..."):
+            try:
+                best_pairs = screen_best_pairs_by_industry(
+                    industry,
+                    stocks,
+                    corr_threshold=corr_threshold,
+                    top_n=top_n,
+                    period=period,
+                    adf_pvalue=adf_pvalue,
+                )
+            except Exception as exc:
+                st.error(f"篩選失敗：{exc}")
+                return
+
+        st.session_state["s2_screened_industry"] = industry
+        st.session_state["s2_screened_period"] = period
+        st.session_state["s2_screened_corr_threshold"] = corr_threshold
+        st.session_state["s2_screened_adf_pvalue"] = adf_pvalue
+        st.session_state["s2_screened_top_n"] = top_n
+        st.session_state["s2_screened_pairs"] = best_pairs.to_dict("records")
+
+    records = st.session_state.get("s2_screened_pairs", [])
+    same_setting = (
+        st.session_state.get("s2_screened_industry") == industry
+        and st.session_state.get("s2_screened_period") == period
+        and float(st.session_state.get("s2_screened_corr_threshold", -1)) == corr_threshold
+        and float(st.session_state.get("s2_screened_adf_pvalue", -1)) == adf_pvalue
+        and int(st.session_state.get("s2_screened_top_n", -1)) == top_n
+    )
+
+    if not records or not same_setting:
+        st.info("按「篩選策略2最佳 Pair」後，這裡會列出符合相關性門檻與 ADF 條件排序後的最佳幾對。")
+        return
+
+    best_pairs_df = pd.DataFrame(records)
+    if best_pairs_df.empty:
+        st.warning("這個設定下沒有找到符合基本條件的 pair。可降低 correlation threshold、放寬 ADF threshold，或延長篩選資料期間。")
+        return
+
+    display_cols = [
+        "rank",
+        "stock_A_code", "stock_A_name",
+        "stock_B_code", "stock_B_name",
+        "correlation",
+        "beta_hedge_ratio",
+        "adf_pvalue",
+        "half_life",
+        "trend_strength",
+        "crossings_per_year",
+        "score",
+        "suitable",
+    ]
+    show_df = best_pairs_df[[c for c in display_cols if c in best_pairs_df.columns]].copy()
+    for c in ["correlation", "beta_hedge_ratio", "adf_pvalue", "half_life", "trend_strength", "crossings_per_year"]:
+        if c in show_df.columns:
+            show_df[c] = pd.to_numeric(show_df[c], errors="coerce").round(4)
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    pair_labels = [
+        f"{int(row['rank'])}. {row['stock_A_code']} {row['stock_A_name']} / "
+        f"{row['stock_B_code']} {row['stock_B_name']} | "
+        f"corr={float(row['correlation']):.3f} | ADF p={float(row['adf_pvalue']):.4f} | score={int(row['score'])}"
+        for _, row in best_pairs_df.iterrows()
+    ]
+    selected_label = st.selectbox("套用最佳 pair 到策略2回測", pair_labels, key="s2_selected_best_pair")
+    selected_idx = pair_labels.index(selected_label)
+    selected = best_pairs_df.iloc[selected_idx]
+
+    if st.button("套用選取 pair 到策略2", type="primary", use_container_width=True):
+        st.session_state["s2_a_code_input"] = str(selected["stock_A_code"])
+        st.session_state["s2_b_code_input"] = str(selected["stock_B_code"])
+        st.rerun()
 
 def determine_strategy2_test_start(
     close_df: pd.DataFrame,
@@ -948,18 +1075,25 @@ def extract_ohlc_from_single_download(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], ...]) -> pd.DataFrame:
+def screen_best_pairs_by_industry(
+    industry: str,
+    stocks: tuple[tuple[str, str], ...],
+    corr_threshold: float = CORR_THRESHOLD,
+    top_n: int = TOP_N,
+    period: str = PERIOD,
+    adf_pvalue: float = ADF_P_THRESHOLD,
+) -> pd.DataFrame:
     if len(stocks) <= 1:
         return pd.DataFrame()
 
-    price_df = download_screening_prices(stocks, PERIOD, INTERVAL)
+    price_df = download_screening_prices(stocks, period, INTERVAL)
     group_price = get_group_price(price_df, stocks)
 
     if group_price.shape[1] <= 1:
         return pd.DataFrame()
 
     log_price = np.log(group_price)
-    corr_pairs = extract_high_corr_pairs(industry, log_price, CORR_THRESHOLD)
+    corr_pairs = extract_high_corr_pairs(industry, log_price, corr_threshold)
 
     if corr_pairs.empty:
         return pd.DataFrame()
@@ -986,7 +1120,7 @@ def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], 
         spread_mean = float(spread_series.mean())
         spread_std = float(spread_series.std())
 
-        adf_stat, adf_pvalue = adf_test(spread_series)
+        adf_stat, adf_p_val = adf_test(spread_series)
         half_life = estimate_half_life(spread_series)
         trend_slope, trend_pvalue, trend_strength = trend_strength_test(spread_series)
         crossings, crossings_per_year = count_crossings(spread_series)
@@ -1001,8 +1135,8 @@ def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], 
             "spread_min": float(spread_series.min()),
             "spread_max": float(spread_series.max()),
             "adf_stat": float(adf_stat),
-            "adf_pvalue": float(adf_pvalue),
-            "adf_pass_5pct": bool(adf_pvalue < ADF_P_THRESHOLD),
+            "adf_pvalue": float(adf_p_val),
+            "adf_pass_5pct": bool(pd.notna(adf_p_val) and adf_p_val < adf_pvalue),
             "half_life": float(half_life) if pd.notna(half_life) else np.nan,
             "half_life_reasonable": bool(pd.notna(half_life) and MIN_HALF_LIFE <= half_life <= MAX_HALF_LIFE),
             "trend_slope": float(trend_slope),
@@ -1037,9 +1171,9 @@ def screen_best_pairs_by_industry(industry: str, stocks: tuple[tuple[str, str], 
 
     best_pairs_df = screening_df[screening_df["suitable"]].copy()
     if best_pairs_df.empty:
-        best_pairs_df = screening_df.head(TOP_N).copy()
+        best_pairs_df = screening_df.head(top_n).copy()
     else:
-        best_pairs_df = best_pairs_df.head(TOP_N).copy()
+        best_pairs_df = best_pairs_df.head(top_n).copy()
 
     best_pairs_df = best_pairs_df.reset_index(drop=True)
     best_pairs_df.insert(0, "rank", np.arange(1, len(best_pairs_df) + 1))
