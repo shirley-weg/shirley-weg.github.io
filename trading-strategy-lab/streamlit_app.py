@@ -1145,13 +1145,558 @@ def df_to_excel_bytes(sheets: dict[str, pd.DataFrame | pd.Series]) -> bytes:
     return output.getvalue()
 
 
+
 # ============================================================
-# Streamlit Rendering
+# Streamlit Rendering - Revised Two-Mode Version
 # ============================================================
+
+def df_to_excel_bytes(sheets: dict[str, pd.DataFrame | pd.Series]) -> bytes:
+    """Excel export with CSV ZIP fallback when openpyxl is unavailable."""
+    output = BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            for name, obj in sheets.items():
+                safe_name = str(name)[:31]
+                if isinstance(obj, pd.Series):
+                    obj.to_frame(obj.name or "value").to_excel(writer, sheet_name=safe_name)
+                elif isinstance(obj, pd.DataFrame):
+                    obj.to_excel(writer, sheet_name=safe_name, index=True)
+        output.seek(0)
+        return output.getvalue()
+    except ModuleNotFoundError:
+        import zipfile
+        output = BytesIO()
+        with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, obj in sheets.items():
+                if isinstance(obj, pd.Series):
+                    df = obj.to_frame(obj.name or "value")
+                elif isinstance(obj, pd.DataFrame):
+                    df = obj
+                else:
+                    continue
+                zf.writestr(f"{name}.csv", df.to_csv(index=True).encode("utf-8-sig"))
+        output.seek(0)
+        return output.getvalue()
+
+
+def get_formation_window(close_df: pd.DataFrame, reference_date: pd.Timestamp, lookback_days: int) -> pd.DataFrame:
+    reference_date = pd.Timestamp(reference_date)
+    prior_dates = close_df.index[close_df.index < reference_date]
+    if len(prior_dates) < lookback_days:
+        return pd.DataFrame()
+    end_pos = close_df.index.get_loc(prior_dates[-1])
+    start_pos = end_pos - lookback_days + 1
+    if start_pos < 0:
+        return pd.DataFrame()
+    return close_df.iloc[start_pos:end_pos + 1].copy()
+
+
+def select_pairs_with_beta_filter_top_k(
+    method: StrategyName,
+    formation_prices: pd.DataFrame,
+    stock_info_df: pd.DataFrame,
+    market_price_full: pd.Series,
+    settings: AppSettings,
+    top_k: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    preselect_n = max(int(top_k) * int(settings.preselect_multiplier), int(top_k))
+    if method == "distance":
+        all_raw, preselected = select_pairs_distance_preselect(formation_prices, stock_info_df, preselect_n, settings.min_obs)
+        sort_by = {"by": ["distance"], "ascending": [True]}
+    else:
+        all_raw, preselected = select_pairs_cointegration_preselect(
+            formation_prices,
+            stock_info_df,
+            settings.pvalue_threshold,
+            preselect_n,
+            settings.min_obs,
+        )
+        sort_by = {"by": ["coint_t", "p_value"], "ascending": [True, True]}
+    beta_df = build_beta_table_for_candidate_pairs(preselected, formation_prices, stock_info_df, market_price_full, settings.min_obs)
+    final_candidates = apply_beta_and_industry_filter(preselected, beta_df, settings.beta_diff_threshold, top_k, sort_by=sort_by)
+    return all_raw, preselected, final_candidates
+
+
+def compute_z_series_from_params(params: dict[str, object], close_df: pd.DataFrame) -> pd.Series:
+    tx = str(params["ticker_x"])
+    ty = str(params["ticker_y"])
+    dates = close_df[[tx, ty]].dropna().index
+    values = [compute_z_at_date(params, close_df, pd.Timestamp(d)) for d in dates]
+    return pd.Series(values, index=dates, name="z_current_candidate")
+
+
+def run_fixed_pair_backtest(
+    method: StrategyName,
+    ticker_x: str,
+    ticker_y: str,
+    open_df: pd.DataFrame,
+    close_df: pd.DataFrame,
+    settings: AppSettings,
+) -> dict[str, object]:
+    ticker_x = to_yf_ticker(ticker_x)
+    ticker_y = to_yf_ticker(ticker_y)
+
+    all_dates = close_df.loc[settings.trading_start:settings.trading_end].index
+    if len(all_dates) < 2:
+        raise ValueError("回測期間資料不足。")
+
+    formation_prices = get_formation_window(close_df, settings.trading_start, settings.lookback_days)
+    if len(formation_prices) < settings.min_obs:
+        raise ValueError("正式回測起日前 formation 資料不足，請提前資料下載起日或縮短 lookback days。")
+
+    pair_row = {"ticker_x": ticker_x, "ticker_y": ticker_y}
+    params = fit_spread_params(method, pair_row, formation_prices)
+
+    cash = float(settings.initial_capital)
+    active = False
+    pending_order: dict[str, object] | None = None
+    blocked_after_stop_loss = False
+    shares_x = 0.0
+    shares_y = 0.0
+    entry_capital = np.nan
+    entry_date: pd.Timestamp | None = None
+    entry_signal_z = np.nan
+    entry_price_x = np.nan
+    entry_price_y = np.nan
+    entry_direction = 0
+    holding_days = 0
+
+    trade_records: list[dict[str, object]] = []
+    equity_records: list[dict[str, object]] = []
+    z_records: list[dict[str, object]] = []
+
+    for i, date in enumerate(all_dates):
+        date = pd.Timestamp(date)
+        if ticker_x not in open_df.columns or ticker_y not in open_df.columns:
+            raise ValueError("輸入股票不在下載資料欄位中。")
+        if date not in open_df.index:
+            continue
+        open_x = open_df.loc[date, ticker_x]
+        open_y = open_df.loc[date, ticker_y]
+        close_x = close_df.loc[date, ticker_x]
+        close_y = close_df.loc[date, ticker_y]
+        z_today = compute_z_at_date(params, close_df, date)
+
+        # Execute yesterday's order at today's open.
+        if pending_order is not None:
+            action = str(pending_order["action"])
+            if pd.isna(open_x) or pd.isna(open_y):
+                pending_order = None
+            elif action == "enter":
+                direction = int(pending_order["direction"])
+                weight_x, weight_y = calculate_pair_weights(direction, float(params["hedge_ratio"]))
+                dollar_x = cash * weight_x
+                dollar_y = cash * weight_y
+                shares_x = dollar_x / open_x
+                shares_y = dollar_y / open_y
+                traded_notional = abs(shares_x * open_x) + abs(shares_y * open_y)
+                cost = traded_notional * settings.fee_rate
+                entry_capital = cash
+                cash -= shares_x * open_x
+                cash -= shares_y * open_y
+                cash -= cost
+                active = True
+                holding_days = 0
+                entry_date = date
+                entry_signal_z = float(pending_order["signal_z"])
+                entry_price_x = float(open_x)
+                entry_price_y = float(open_y)
+                entry_direction = direction
+                pending_order = None
+            elif action == "exit":
+                traded_notional = abs(shares_x * open_x) + abs(shares_y * open_y)
+                cost = traded_notional * settings.fee_rate
+                cash += shares_x * open_x
+                cash += shares_y * open_y
+                cash -= cost
+                pnl = cash - float(entry_capital)
+                trade_records.append({
+                    "method": method,
+                    "pair": display_pair_name(ticker_x, ticker_y),
+                    "ticker_x": ticker_x,
+                    "ticker_y": ticker_y,
+                    "entry_date": entry_date,
+                    "exit_date": date,
+                    "direction": entry_direction,
+                    "entry_z": entry_signal_z,
+                    "exit_signal_z": float(pending_order["exit_signal_z"]),
+                    "entry_price_x": entry_price_x,
+                    "entry_price_y": entry_price_y,
+                    "exit_price_x": float(open_x),
+                    "exit_price_y": float(open_y),
+                    "holding_days": holding_days,
+                    "exit_reason": pending_order["exit_reason"],
+                    "pnl": pnl,
+                    "return": pnl / float(entry_capital),
+                })
+                if pending_order["exit_reason"] == "stop_loss":
+                    blocked_after_stop_loss = True
+                shares_x = shares_y = 0.0
+                active = False
+                holding_days = 0
+                pending_order = None
+
+        equity = cash + shares_x * close_x + shares_y * close_y if active else cash
+        equity_records.append({"date": date, "equity": equity, "active": active})
+        z_records.append({
+            "date": date,
+            "z_current_candidate": z_today,
+            "z_active_position": z_today if active else np.nan,
+            "eligible": True,
+        })
+
+        if i >= len(all_dates) - 1 or pd.isna(z_today):
+            continue
+        prev_date = pd.Timestamp(all_dates[i - 1]) if i > 0 else None
+        if prev_date is None:
+            continue
+        z_prev = compute_z_at_date(params, close_df, prev_date)
+        if pd.isna(z_prev):
+            continue
+
+        if not active:
+            if blocked_after_stop_loss:
+                if abs(z_today) < settings.reentry_reset_z:
+                    blocked_after_stop_loss = False
+                continue
+            direction = None
+            if (z_prev <= settings.entry_z) and (settings.entry_z < z_today < settings.stop_z):
+                direction = -1
+            elif (z_prev >= -settings.entry_z) and (-settings.stop_z < z_today < -settings.entry_z):
+                direction = 1
+            if direction is not None:
+                pending_order = {"action": "enter", "direction": direction, "signal_z": z_today}
+        else:
+            holding_days += 1
+            exit_reason = None
+            if abs(z_today) < settings.exit_z:
+                exit_reason = "mean_reversion"
+            elif abs(z_today) > settings.stop_z:
+                exit_reason = "stop_loss"
+            elif holding_days >= settings.max_holding_days:
+                exit_reason = "max_holding_days"
+            if exit_reason is not None:
+                pending_order = {"action": "exit", "exit_signal_z": z_today, "exit_reason": exit_reason}
+
+    # Liquidate at backtest end only.
+    final_date = pd.Timestamp(all_dates[-1])
+    if active:
+        close_x = close_df.loc[final_date, ticker_x]
+        close_y = close_df.loc[final_date, ticker_y]
+        traded_notional = abs(shares_x * close_x) + abs(shares_y * close_y)
+        cost = traded_notional * settings.fee_rate
+        cash += shares_x * close_x
+        cash += shares_y * close_y
+        cash -= cost
+        z_final = compute_z_at_date(params, close_df, final_date)
+        pnl = cash - float(entry_capital)
+        trade_records.append({
+            "method": method,
+            "pair": display_pair_name(ticker_x, ticker_y),
+            "ticker_x": ticker_x,
+            "ticker_y": ticker_y,
+            "entry_date": entry_date,
+            "exit_date": final_date,
+            "direction": entry_direction,
+            "entry_z": entry_signal_z,
+            "exit_signal_z": z_final,
+            "entry_price_x": entry_price_x,
+            "entry_price_y": entry_price_y,
+            "exit_price_x": float(close_x),
+            "exit_price_y": float(close_y),
+            "holding_days": holding_days,
+            "exit_reason": "backtest_end",
+            "pnl": pnl,
+            "return": pnl / float(entry_capital),
+        })
+        equity_records.append({"date": final_date, "equity": cash, "active": False})
+
+    equity_curve = pd.DataFrame(equity_records).drop_duplicates("date", keep="last").set_index("date")["equity"]
+    trades_df = pd.DataFrame(trade_records)
+    z_df = pd.DataFrame(z_records).drop_duplicates("date", keep="last").set_index("date")
+    summary = pd.DataFrame([{**evaluate_equity_curve(equity_curve, trades_df), "initial_capital": settings.initial_capital}])
+    return {
+        "summary": summary,
+        "equity_curve": equity_curve,
+        "trades": trades_df,
+        "zscore": z_df,
+        "formation_start": formation_prices.index.min(),
+        "formation_end": formation_prices.index.max(),
+    }
+
+
+def run_formal_topn_strategy_backtest(
+    method: StrategyName,
+    open_df: pd.DataFrame,
+    close_df: pd.DataFrame,
+    stock_info_df: pd.DataFrame,
+    market_price_full: pd.Series,
+    settings: AppSettings,
+    n_pairs: int,
+    weekly_top_k: int = 5,
+) -> dict[str, object]:
+    all_dates = close_df.loc[settings.trading_start:settings.trading_end].index
+    if len(all_dates) < 2:
+        raise ValueError("回測期間資料不足。")
+    week_start_set = set(get_week_start_dates(close_df, settings.trading_start, settings.trading_end, settings.weekly_freq))
+
+    slots: list[dict[str, object]] = [
+        {"slot_id": i, "active": False, "cash": float(settings.initial_capital), "pending_order": None}
+        for i in range(int(n_pairs))
+    ]
+    blocked_pairs: set[str] = set()
+    current_candidates = pd.DataFrame()
+    current_candidate_params: dict[str, dict[str, object]] = {}
+    selected_pair_snapshots: list[pd.DataFrame] = []
+    weekly_records: list[dict[str, object]] = []
+    trade_records: list[dict[str, object]] = []
+    equity_records: list[dict[str, object]] = []
+
+    for i, date in enumerate(all_dates):
+        date = pd.Timestamp(date)
+
+        # Weekly selection: screen TOP5 and use best n pairs only for free slots.
+        if date in week_start_set:
+            current_candidates = pd.DataFrame()
+            current_candidate_params = {}
+            formation_prices = get_formation_window(close_df, date, settings.lookback_days)
+            if len(formation_prices) >= settings.min_obs:
+                all_raw, preselected, top5_candidates = select_pairs_with_beta_filter_top_k(
+                    method, formation_prices, stock_info_df, market_price_full, settings, top_k=weekly_top_k
+                )
+                current_candidates = top5_candidates.head(int(n_pairs)).copy()
+                if len(current_candidates) > 0:
+                    snap = current_candidates.copy()
+                    snap["rebalance_date"] = date
+                    snap["formation_start"] = formation_prices.index.min()
+                    snap["formation_end"] = formation_prices.index.max()
+                    selected_pair_snapshots.append(snap)
+                    for _, row in current_candidates.iterrows():
+                        pname = display_pair_name(row["ticker_x"], row["ticker_y"])
+                        current_candidate_params[pname] = fit_spread_params(method, row, formation_prices)
+                weekly_records.append({
+                    "method": method,
+                    "rebalance_date": date,
+                    "formation_start": formation_prices.index.min(),
+                    "formation_end": formation_prices.index.max(),
+                    "top5_count": len(top5_candidates),
+                    "selected_n_count": len(current_candidates),
+                    "active_before_trade": sum(bool(s.get("active")) for s in slots),
+                    "free_slots": sum(not bool(s.get("active")) for s in slots),
+                })
+
+        # Execute pending orders at today's open.
+        for slot in slots:
+            pending_order = slot.get("pending_order")
+            if pending_order is None:
+                continue
+            action = str(pending_order["action"])
+            if action == "enter":
+                params = pending_order["spread_params"]
+                ticker_x = str(params["ticker_x"])
+                ticker_y = str(params["ticker_y"])
+                open_x = open_df.loc[date, ticker_x]
+                open_y = open_df.loc[date, ticker_y]
+                if pd.isna(open_x) or pd.isna(open_y):
+                    slot["pending_order"] = None
+                    continue
+                capital = float(slot["cash"])
+                direction = int(pending_order["direction"])
+                weight_x, weight_y = calculate_pair_weights(direction, float(params["hedge_ratio"]))
+                shares_x = (capital * weight_x) / open_x
+                shares_y = (capital * weight_y) / open_y
+                traded_notional = abs(shares_x * open_x) + abs(shares_y * open_y)
+                cost = traded_notional * settings.fee_rate
+                cash = capital - shares_x * open_x - shares_y * open_y - cost
+                slot.update({
+                    "active": True,
+                    "cash": cash,
+                    "shares_x": shares_x,
+                    "shares_y": shares_y,
+                    "ticker_x": ticker_x,
+                    "ticker_y": ticker_y,
+                    "pair": display_pair_name(ticker_x, ticker_y),
+                    "spread_params": params,
+                    "direction": direction,
+                    "entry_date": date,
+                    "entry_signal_z": float(pending_order["signal_z"]),
+                    "entry_capital": capital,
+                    "entry_price_x": float(open_x),
+                    "entry_price_y": float(open_y),
+                    "holding_days": 0,
+                    "pending_order": None,
+                })
+            elif action == "exit":
+                ticker_x = str(slot["ticker_x"])
+                ticker_y = str(slot["ticker_y"])
+                open_x = open_df.loc[date, ticker_x]
+                open_y = open_df.loc[date, ticker_y]
+                if pd.isna(open_x) or pd.isna(open_y):
+                    slot["pending_order"] = None
+                    continue
+                shares_x = float(slot["shares_x"])
+                shares_y = float(slot["shares_y"])
+                traded_notional = abs(shares_x * open_x) + abs(shares_y * open_y)
+                cost = traded_notional * settings.fee_rate
+                cash = float(slot["cash"]) + shares_x * open_x + shares_y * open_y - cost
+                pnl = cash - float(slot["entry_capital"])
+                trade_records.append({
+                    "method": method,
+                    "slot_id": slot["slot_id"],
+                    "pair": slot["pair"],
+                    "ticker_x": ticker_x,
+                    "ticker_y": ticker_y,
+                    "entry_date": slot["entry_date"],
+                    "exit_date": date,
+                    "direction": slot["direction"],
+                    "entry_z": slot["entry_signal_z"],
+                    "exit_signal_z": float(pending_order["exit_signal_z"]),
+                    "entry_price_x": slot["entry_price_x"],
+                    "entry_price_y": slot["entry_price_y"],
+                    "exit_price_x": float(open_x),
+                    "exit_price_y": float(open_y),
+                    "holding_days": slot["holding_days"],
+                    "exit_reason": pending_order["exit_reason"],
+                    "pnl": pnl,
+                    "return": pnl / float(slot["entry_capital"]),
+                })
+                if pending_order["exit_reason"] == "stop_loss":
+                    blocked_pairs.add(str(slot["pair"]))
+                old_id = slot["slot_id"]
+                slot.clear()
+                slot.update({"slot_id": old_id, "active": False, "cash": cash, "pending_order": None})
+
+        # Mark to market.
+        portfolio_equity = 0.0
+        for slot in slots:
+            if slot.get("active"):
+                tx = str(slot["ticker_x"])
+                ty = str(slot["ticker_y"])
+                cx = close_df.loc[date, tx]
+                cy = close_df.loc[date, ty]
+                if pd.isna(cx) or pd.isna(cy):
+                    portfolio_equity += float(slot["cash"])
+                else:
+                    portfolio_equity += float(slot["cash"]) + float(slot["shares_x"]) * cx + float(slot["shares_y"]) * cy
+            else:
+                portfolio_equity += float(slot["cash"])
+        equity_records.append({
+            "date": date,
+            "equity": portfolio_equity,
+            "active_slots": sum(bool(s.get("active")) for s in slots),
+            "free_slots": sum(not bool(s.get("active")) for s in slots),
+        })
+
+        if i >= len(all_dates) - 1:
+            continue
+
+        # Exit signals for active positions.
+        for slot in slots:
+            if not slot.get("active") or slot.get("pending_order") is not None:
+                continue
+            z_today = compute_z_at_date(slot["spread_params"], close_df, date)
+            if pd.isna(z_today):
+                continue
+            slot["holding_days"] = int(slot["holding_days"]) + 1
+            exit_reason = None
+            if abs(z_today) < settings.exit_z:
+                exit_reason = "mean_reversion"
+            elif abs(z_today) > settings.stop_z:
+                exit_reason = "stop_loss"
+            elif int(slot["holding_days"]) >= settings.max_holding_days:
+                exit_reason = "max_holding_days"
+            if exit_reason is not None:
+                slot["pending_order"] = {"action": "exit", "exit_signal_z": z_today, "exit_reason": exit_reason}
+
+        # Entry only for free slots and current weekly best n pairs.
+        free_slots = [slot for slot in slots if (not slot.get("active")) and slot.get("pending_order") is None]
+        if len(free_slots) == 0 or current_candidates is None or len(current_candidates) == 0:
+            continue
+        active_pairs = {str(slot.get("pair")) for slot in slots if slot.get("active")}
+        used_pairs = set()
+        prev_date = pd.Timestamp(all_dates[i - 1]) if i > 0 else None
+        if prev_date is None:
+            continue
+        for _, row in current_candidates.iterrows():
+            if len(free_slots) == 0:
+                break
+            pname = display_pair_name(row["ticker_x"], row["ticker_y"])
+            if pname in active_pairs or pname in used_pairs or pname not in current_candidate_params:
+                continue
+            params = current_candidate_params[pname]
+            z_today = compute_z_at_date(params, close_df, date)
+            z_prev = compute_z_at_date(params, close_df, prev_date)
+            if pd.isna(z_today) or pd.isna(z_prev):
+                continue
+            if pname in blocked_pairs:
+                if abs(z_today) < settings.reentry_reset_z:
+                    blocked_pairs.remove(pname)
+                continue
+            direction = None
+            if (z_prev <= settings.entry_z) and (settings.entry_z < z_today < settings.stop_z):
+                direction = -1
+            elif (z_prev >= -settings.entry_z) and (-settings.stop_z < z_today < -settings.entry_z):
+                direction = 1
+            if direction is None:
+                continue
+            slot = free_slots.pop(0)
+            slot["pending_order"] = {"action": "enter", "spread_params": params, "direction": direction, "signal_z": z_today}
+            used_pairs.add(pname)
+
+    # Final liquidation.
+    final_date = pd.Timestamp(all_dates[-1])
+    for slot in slots:
+        if not slot.get("active"):
+            continue
+        tx = str(slot["ticker_x"])
+        ty = str(slot["ticker_y"])
+        cx = close_df.loc[final_date, tx]
+        cy = close_df.loc[final_date, ty]
+        shares_x = float(slot["shares_x"])
+        shares_y = float(slot["shares_y"])
+        traded_notional = abs(shares_x * cx) + abs(shares_y * cy)
+        cost = traded_notional * settings.fee_rate
+        cash = float(slot["cash"]) + shares_x * cx + shares_y * cy - cost
+        pnl = cash - float(slot["entry_capital"])
+        z_final = compute_z_at_date(slot["spread_params"], close_df, final_date)
+        trade_records.append({
+            "method": method,
+            "slot_id": slot["slot_id"],
+            "pair": slot["pair"],
+            "ticker_x": tx,
+            "ticker_y": ty,
+            "entry_date": slot["entry_date"],
+            "exit_date": final_date,
+            "direction": slot["direction"],
+            "entry_z": slot["entry_signal_z"],
+            "exit_signal_z": z_final,
+            "entry_price_x": slot["entry_price_x"],
+            "entry_price_y": slot["entry_price_y"],
+            "exit_price_x": float(cx),
+            "exit_price_y": float(cy),
+            "holding_days": slot["holding_days"],
+            "exit_reason": "backtest_end",
+            "pnl": pnl,
+            "return": pnl / float(slot["entry_capital"]),
+        })
+
+    equity_curve = pd.DataFrame(equity_records).drop_duplicates("date", keep="last").set_index("date")["equity"]
+    trades_df = pd.DataFrame(trade_records)
+    selected_pairs_history = pd.concat(selected_pair_snapshots, axis=0).reset_index(drop=True) if selected_pair_snapshots else pd.DataFrame()
+    weekly_summary = pd.DataFrame(weekly_records)
+    summary = pd.DataFrame([{**evaluate_equity_curve(equity_curve, trades_df), "initial_capital": float(settings.initial_capital) * int(n_pairs), "n_pairs": int(n_pairs), "weekly_top_k": int(weekly_top_k)}])
+    return {
+        "summary": summary,
+        "equity_curve": equity_curve,
+        "trades": trades_df,
+        "weekly_summary": weekly_summary,
+        "selected_pairs_history": selected_pairs_history,
+    }
+
 
 def render_strategy_selector() -> None:
     st.title("Trading Strategy Lab")
-    st.caption("請選擇要使用的配對交易策略。")
+    st.caption("請先選擇要使用的交易策略。")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1159,139 +1704,49 @@ def render_strategy_selector() -> None:
             """
             <div class="strategy-card">
               <h3>配對策略1(距離法)</h3>
-              <p>
-                依細產業股票池，使用標準化 log price 計算 SSD 距離，
-                篩選距離最小的 pair，再用 rolling formation 與 z-score 進行回測。
-              </p>
+              <p>使用標準化 log price 的 SSD 距離選 pair。策略內含手動固定 pair 回測與正式週度 Top-N 交易模式。</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        if st.button("進入 配對策略1(距離法)", type="primary", use_container_width=True):
+        if st.button("進入配對策略1(距離法)", type="primary", use_container_width=True):
             st.session_state["selected_strategy"] = "distance"
             st.rerun()
-
     with col2:
         st.markdown(
             """
             <div class="strategy-card">
               <h3>配對策略2(共整合法)</h3>
-              <p>
-                依細產業股票池，使用 Engle-Granger 共整合檢定，
-                篩選 p-value 通過且 coint_t 較負的 pair，再執行 rolling 回測。
-              </p>
+              <p>使用 Engle-Granger 共整合檢定選 pair，並以 OLS residual 作為 spread 交易訊號。</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        if st.button("進入 配對策略2(共整合法)", use_container_width=True):
+        if st.button("進入配對策略2(共整合法)", type="primary", use_container_width=True):
             st.session_state["selected_strategy"] = "cointegration"
             st.rerun()
 
-    st.info("流程：先在「選股 / 選 Pair」產生候選清單，再套用或手動輸入股票代號進行單一 pair rolling 回測。")
 
+def render_mode1_tab(settings: AppSettings) -> None:
+    st.subheader("模式一：先篩選最佳 Pair，再手動選一組固定回測")
+    st.write("此模式先用參考日前的 formation window 產生候選 pair。回測時不每週重新篩選 pair，而是固定使用回測起日前的 formation window 估計參數，直接回測到結束日 / 最新資料。")
 
-def sidebar_settings(strategy: StrategyName) -> AppSettings:
-    if st.sidebar.button("返回策略選擇"):
-        st.session_state["selected_strategy"] = None
-        st.rerun()
+    run_screen = st.button("執行選股 / 選 Pair", type="primary", use_container_width=True, key=f"mode1_screen_{settings.strategy}")
+    ref_col, info_col = st.columns([0.35, 0.65])
+    with ref_col:
+        ref_date = st.date_input("選 Pair 參考日期", value=settings.trading_start.date(), key=f"mode1_ref_{settings.strategy}")
+    with info_col:
+        st.info(f"股票池：{settings.industry}；顯示 Top {settings.top_n_display}；正式回測起日：{settings.trading_start.date()}")
 
-    st.sidebar.caption(f"目前策略：{'配對策略1(距離法)' if strategy == 'distance' else '配對策略2(共整合法)'}")
-    st.sidebar.divider()
-
-    industries = get_industry_options()
-    default_ind = "金融保險業" if "金融保險業" in industries else industries[0]
-    industry = st.sidebar.selectbox("細產業股票池", industries, index=industries.index(default_ind), help="可選全部，但全部股票池執行共整合篩選會較慢。")
-
-    st.sidebar.header("資料與回測期間")
-    data_start = st.sidebar.date_input("資料下載起日", value=pd.Timestamp("2022-01-01").date())
-    trading_start = st.sidebar.date_input("正式回測起日", value=pd.Timestamp("2024-01-01").date())
-    use_today = st.sidebar.checkbox("回測到最新資料", value=True)
-    if use_today:
-        trading_end = None
-        st.sidebar.caption("回測結束日：yfinance 最新可取得資料")
-    else:
-        trading_end = pd.Timestamp(st.sidebar.date_input("正式回測結束日", value=pd.Timestamp.today().date()))
-    market_ticker = st.sidebar.text_input("Beta benchmark", value="^TWII")
-    auto_adjust = st.sidebar.toggle("使用 yfinance auto_adjust", value=True)
-
-    st.sidebar.divider()
-    st.sidebar.header("選股 / Pair 篩選")
-    lookback_days = st.sidebar.number_input("Rolling formation lookback days", min_value=60, max_value=1000, value=252, step=10)
-    min_obs = st.sidebar.number_input("Formation 最少共同資料筆數", min_value=30, max_value=900, value=200, step=10)
-    k_final = st.sidebar.slider("每週候選 pair 數量 final_k", 1, 30, 10, 1)
-    preselect_multiplier = st.sidebar.slider("初選倍數 multiplier", 1, 30, 10, 1)
-    beta_diff_threshold = st.sidebar.number_input("Beta 差距門檻", min_value=0.0, value=0.2, step=0.05, format="%.4f")
-    pvalue_threshold = 0.05
-    if strategy == "cointegration":
-        pvalue_threshold = st.sidebar.selectbox("共整合 p-value 門檻", [0.01, 0.05, 0.10], index=1)
-    top_n_display = st.sidebar.slider("候選 pair 表格顯示筆數", 1, 50, 10, 1)
-
-    st.sidebar.divider()
-    st.sidebar.header("交易規則")
-    entry_z = st.sidebar.slider("Entry z-score", 0.5, 4.0, 2.0, 0.1)
-    exit_z = st.sidebar.slider("Exit z-score", 0.0, 2.0, 0.5, 0.1)
-    stop_z = st.sidebar.slider("Stop z-score", 1.0, 6.0, 3.0, 0.1)
-    max_holding_days = st.sidebar.number_input("Max holding days", min_value=1, max_value=1000, value=60, step=5)
-    reentry_reset_z = st.sidebar.slider("Stop loss 後重新允許進場 abs(z) <", 0.0, 2.0, 1.0, 0.1)
-
-    st.sidebar.divider()
-    st.sidebar.header("成本與資金")
-    fee_rate = st.sidebar.number_input("買賣手續費率", min_value=0.0, value=0.001425, step=0.0001, format="%.6f")
-    initial_capital = st.sidebar.number_input("單一 pair 初始資金", min_value=10_000, value=1_000_000, step=100_000)
-
-    return AppSettings(
-        strategy=strategy,
-        industry=industry,
-        data_start=pd.Timestamp(data_start),
-        trading_start=pd.Timestamp(trading_start),
-        trading_end=trading_end,
-        market_ticker=market_ticker,
-        lookback_days=int(lookback_days),
-        weekly_freq="W-FRI",
-        k_final=int(k_final),
-        preselect_multiplier=int(preselect_multiplier),
-        min_obs=int(min_obs),
-        pvalue_threshold=float(pvalue_threshold),
-        beta_diff_threshold=float(beta_diff_threshold),
-        entry_z=float(entry_z),
-        exit_z=float(exit_z),
-        stop_z=float(stop_z),
-        max_holding_days=int(max_holding_days),
-        reentry_reset_z=float(reentry_reset_z),
-        fee_rate=float(fee_rate),
-        initial_capital=float(initial_capital),
-        auto_adjust=bool(auto_adjust),
-        top_n_display=int(top_n_display),
-    )
-
-
-def render_pair_selection_tab(settings: AppSettings) -> None:
-    st.subheader("① 選股 / 選 Pair")
-    universe = get_universe_by_industry(settings.industry)
-    st.write(f"目前股票池：**{settings.industry}**，共 **{len(universe)}** 檔。")
-    st.dataframe(universe[["code", "name", "industry", "ticker_yf"]], use_container_width=True, hide_index=True)
-
-    ref_date = st.date_input("選 Pair 參考日期：使用此日期前的 rolling formation 選 pair", value=settings.trading_start.date())
-    run_screen = st.button("執行選股 / 選 Pair", type="primary", use_container_width=True)
-
-    key = f"screen_{settings.strategy}"
+    key = f"mode1_screen_result_{settings.strategy}"
     if run_screen:
         try:
             open_df, close_df, market_price, universe = prepare_download_for_universe(settings)
             ref_ts = pd.Timestamp(ref_date)
-            all_dates = close_df.index
-            if ref_ts not in all_dates:
-                earlier = all_dates[all_dates <= ref_ts]
-                if len(earlier) == 0:
-                    st.error("參考日期之前沒有可用價格資料。")
-                    return
-                ref_ts = pd.Timestamp(earlier[-1])
-            pos = all_dates.get_loc(ref_ts)
-            if pos < settings.lookback_days:
-                st.error("參考日期前資料不足，請提前資料下載起日或縮短 lookback days。")
+            formation_prices = get_formation_window(close_df, ref_ts, settings.lookback_days)
+            if formation_prices.empty:
+                st.error("參考日前資料不足，請提前資料下載起日或縮短 lookback days。")
                 return
-            formation_prices = close_df.iloc[pos - settings.lookback_days:pos].copy()
             with st.spinner("計算候選 pair..."):
                 all_raw, preselected, final_candidates = select_pairs_with_beta_filter(settings.strategy, formation_prices, universe, market_price, settings)
             st.session_state[key] = {
@@ -1307,157 +1762,174 @@ def render_pair_selection_tab(settings: AppSettings) -> None:
             return
 
     result = st.session_state.get(key)
-    if not result:
-        st.info("按下「執行選股 / 選 Pair」後，這裡會顯示候選 pair 清單。")
-        return
+    if result:
+        final_candidates = result["final_candidates"]
+        st.caption(f"Pair selection formation：{pd.Timestamp(result['formation_start']).date()} ～ {pd.Timestamp(result['formation_end']).date()}")
+        if final_candidates is None or len(final_candidates) == 0:
+            st.warning("目前條件下沒有通過篩選的候選 pair。")
+        else:
+            metric_cols = ["distance"] if settings.strategy == "distance" else ["coint_t", "p_value", "direction"]
+            display_cols = ["code_x", "name_x", "code_y", "name_y", "industry_x", "industry_y", "n_obs", "beta_x", "beta_y", "beta_diff"] + metric_cols
+            display_cols = [c for c in display_cols if c in final_candidates.columns]
+            st.dataframe(final_candidates.head(settings.top_n_display)[display_cols], use_container_width=True, hide_index=True)
+            labels = []
+            for idx, row in final_candidates.iterrows():
+                score = f"distance={row['distance']:.3f}" if settings.strategy == "distance" else f"p={row['p_value']:.4f}, t={row['coint_t']:.3f}"
+                labels.append(f"{idx+1}. {row['code_x']} {row['name_x']} / {row['code_y']} {row['name_y']} | {score} | beta_diff={row['beta_diff']:.3f}")
+            selected_label = st.selectbox("套用候選 pair 到回測", labels, key=f"mode1_pair_select_{settings.strategy}")
+            selected_idx = labels.index(selected_label)
+            selected = final_candidates.iloc[selected_idx]
+            if st.button("套用選取 pair 到回測輸入框", use_container_width=True, key=f"mode1_apply_{settings.strategy}"):
+                st.session_state[f"{settings.strategy}_fixed_code_x"] = str(selected["code_x"])
+                st.session_state[f"{settings.strategy}_fixed_code_y"] = str(selected["code_y"])
+                st.success(f"已套用：{selected['code_x']} / {selected['code_y']}")
+            st.download_button(
+                "下載候選 pair Excel/ZIP",
+                data=df_to_excel_bytes({"final_candidates": final_candidates, "preselected": result["preselected"], "all_raw": result["all_raw"]}),
+                file_name=f"{settings.strategy}_mode1_candidates.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
-    final_candidates = result["final_candidates"]
-    st.caption(f"Formation period：{pd.Timestamp(result['formation_start']).date()} ～ {pd.Timestamp(result['formation_end']).date()}；參考日期：{pd.Timestamp(result['ref_date']).date()}")
+    st.divider()
+    st.markdown("### 固定 Pair 回測")
+    col_x, col_y = st.columns(2)
+    with col_x:
+        code_x = st.text_input("股票 X 代號", key=f"{settings.strategy}_fixed_code_x", placeholder="例如 2892").strip().upper()
+    with col_y:
+        code_y = st.text_input("股票 Y 代號", key=f"{settings.strategy}_fixed_code_y", placeholder="例如 5880").strip().upper()
 
-    if final_candidates is None or len(final_candidates) == 0:
-        st.warning("目前條件下沒有通過 beta 差距與同產業篩選的候選 pair。")
-        return
-
-    show = final_candidates.copy().head(settings.top_n_display)
-    metric_cols = ["distance"] if settings.strategy == "distance" else ["coint_t", "p_value", "direction"]
-    display_cols = ["code_x", "name_x", "code_y", "name_y", "industry_x", "industry_y", "n_obs", "beta_x", "beta_y", "beta_diff"] + metric_cols
-    display_cols = [c for c in display_cols if c in show.columns]
-    for col in ["distance", "coint_t", "p_value", "beta_x", "beta_y", "beta_diff"]:
-        if col in show.columns:
-            show[col] = pd.to_numeric(show[col], errors="coerce").round(6)
-    st.dataframe(show[display_cols], use_container_width=True, hide_index=True)
-
-    labels = []
-    for idx, row in final_candidates.iterrows():
-        score = f"distance={row['distance']:.3f}" if settings.strategy == "distance" else f"p={row['p_value']:.4f}, t={row['coint_t']:.3f}"
-        labels.append(f"{idx+1}. {row['code_x']} {row['name_x']} / {row['code_y']} {row['name_y']} | {score} | beta_diff={row['beta_diff']:.3f}")
-
-    selected_label = st.selectbox("套用候選 pair 到回測", labels)
-    selected_idx = labels.index(selected_label)
-    selected = final_candidates.iloc[selected_idx]
-    if st.button("套用選取 pair 到回測輸入框", use_container_width=True):
-        st.session_state[f"{settings.strategy}_code_x"] = str(selected["code_x"])
-        st.session_state[f"{settings.strategy}_code_y"] = str(selected["code_y"])
-        st.success(f"已套用：{selected['code_x']} / {selected['code_y']}。請切到「單一 Pair 回測」執行。")
-
-    excel_bytes = df_to_excel_bytes({"final_candidates": final_candidates, "preselected": result["preselected"], "all_raw": result["all_raw"]})
-    st.download_button("下載候選 pair Excel", data=excel_bytes, file_name=f"{settings.strategy}_pair_candidates.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-def render_backtest_tab(settings: AppSettings) -> None:
-    st.subheader("② 單一 Pair Rolling 回測")
-    st.write("此回測會每週重新選 pair；只有當輸入的 pair 在該週候選清單中時，才允許用空閒資金開新倉。舊部位不因週度 re-selection 強制平倉，會繼續用進場時的 spread 參數管理。")
-
-    col_a, col_b, col_c = st.columns([0.25, 0.25, 0.50])
-    with col_a:
-        code_x = st.text_input("股票 X 代號", key=f"{settings.strategy}_code_x", placeholder="例如 2892").strip().upper()
-    with col_b:
-        code_y = st.text_input("股票 Y 代號", key=f"{settings.strategy}_code_y", placeholder="例如 5880").strip().upper()
-    with col_c:
-        if code_x or code_y:
-            st.caption(f"辨識結果：{format_stock_label(code_x)} / {format_stock_label(code_y)}")
-            st.caption(f"產業：{resolve_stock_industry(code_x) or 'NA'} / {resolve_stock_industry(code_y) or 'NA'}")
-
-    run = st.button("Run rolling backtest", type="primary", use_container_width=True)
-    if not run:
-        st.info("請輸入股票代號，或先到「選股 / 選 Pair」套用候選 pair。")
-        return
-    if not code_x or not code_y:
-        st.error("請輸入兩檔股票代號。")
-        return
-    if code_x == code_y:
-        st.error("兩檔股票代號不能相同。")
-        return
-
-    ticker_x = to_yf_ticker(code_x)
-    ticker_y = to_yf_ticker(code_y)
-
-    try:
-        open_df, close_df, market_price, universe = prepare_download_for_universe(settings, extra_tickers=[ticker_x, ticker_y])
-        if ticker_x not in close_df.columns or ticker_y not in close_df.columns:
-            st.error("下載資料中找不到輸入股票。請確認 yfinance 是否支援該代號。")
+    if st.button("Run fixed-pair backtest", type="primary", use_container_width=True, key=f"mode1_backtest_{settings.strategy}"):
+        if not code_x or not code_y:
+            st.error("請輸入兩檔股票代號。")
             return
-        with st.spinner("執行 rolling formation no-force-close 回測..."):
-            result = run_single_pair_rolling_backtest(settings.strategy, ticker_x, ticker_y, open_df, close_df, universe, market_price, settings)
-    except Exception as exc:
-        st.error(f"回測失敗：{exc}")
-        return
+        try:
+            ticker_x = to_yf_ticker(code_x)
+            ticker_y = to_yf_ticker(code_y)
+            open_df, close_df, market_price, universe = prepare_download_for_universe(settings, extra_tickers=[ticker_x, ticker_y])
+            if ticker_x not in close_df.columns or ticker_y not in close_df.columns:
+                st.error("下載資料中找不到輸入股票。請確認 yfinance 是否支援該代號。")
+                return
+            with st.spinner("執行固定 pair 回測..."):
+                result = run_fixed_pair_backtest(settings.strategy, ticker_x, ticker_y, open_df, close_df, settings)
+            st.session_state[f"mode1_backtest_result_{settings.strategy}"] = result
+            st.session_state[f"mode1_backtest_pair_{settings.strategy}"] = (ticker_x, ticker_y, close_df)
+        except Exception as exc:
+            st.error(f"回測失敗：{exc}")
+            return
 
-    st.markdown(f"### 回測結果：{format_stock_label(code_x)} / {format_stock_label(code_y)}")
-    show_summary_metrics(result["summary"])
-
-    equity_curve = result["equity_curve"]
-    trades_df = result["trades"]
-    z_df = result["zscore"]
-    trading_close = close_df.loc[settings.trading_start:settings.trading_end]
-
-    chart_tab1, chart_tab2, chart_tab3, table_tab = st.tabs(["績效圖表", "價格與訊號", "交易損益", "資料表"])
-    with chart_tab1:
-        if len(equity_curve) > 0:
+    bt = st.session_state.get(f"mode1_backtest_result_{settings.strategy}")
+    pair_state = st.session_state.get(f"mode1_backtest_pair_{settings.strategy}")
+    if bt and pair_state:
+        ticker_x, ticker_y, close_df = pair_state
+        st.markdown(f"### 回測結果：{format_stock_label(ticker_x)} / {format_stock_label(ticker_y)}")
+        show_summary_metrics(bt["summary"])
+        equity_curve = bt["equity_curve"]
+        trades_df = bt["trades"]
+        z_df = bt["zscore"]
+        charts = st.tabs(["績效", "價格與訊號", "交易紀錄"])
+        with charts[0]:
             st.plotly_chart(plot_equity_curve(equity_curve), use_container_width=True)
             st.plotly_chart(plot_drawdown(equity_curve), use_container_width=True)
-        else:
-            st.warning("沒有 equity curve 可顯示。")
-    with chart_tab2:
-        st.plotly_chart(plot_price_chart(trading_close, ticker_x, ticker_y), use_container_width=True)
-        st.plotly_chart(plot_normalized_price_chart(trading_close, ticker_x, ticker_y), use_container_width=True)
-        st.plotly_chart(plot_zscore(z_df, settings, trades_df), use_container_width=True)
-    with chart_tab3:
-        st.plotly_chart(plot_trade_pnl(trades_df), use_container_width=True)
-    with table_tab:
-        st.markdown("#### 交易紀錄")
-        st.dataframe(trades_df, use_container_width=True, hide_index=True)
-        st.markdown("#### 每週選股狀態")
-        st.dataframe(result["weekly_summary"], use_container_width=True, hide_index=True)
-        st.markdown("#### 歷史候選 pair")
-        st.dataframe(result["selected_pairs_history"], use_container_width=True, hide_index=True)
-        st.markdown("#### Z-score / eligible 狀態")
-        st.dataframe(z_df, use_container_width=True)
+        with charts[1]:
+            trading_close = close_df.loc[settings.trading_start:settings.trading_end]
+            st.plotly_chart(plot_price_chart(trading_close, ticker_x, ticker_y), use_container_width=True)
+            st.plotly_chart(plot_normalized_price_chart(trading_close, ticker_x, ticker_y), use_container_width=True)
+            st.plotly_chart(plot_zscore(z_df, settings, trades_df), use_container_width=True)
+        with charts[2]:
+            st.plotly_chart(plot_trade_pnl(trades_df), use_container_width=True)
+            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "下載固定 Pair 回測結果 Excel/ZIP",
+            data=df_to_excel_bytes({"summary": bt["summary"], "equity_curve": equity_curve, "trades": trades_df, "zscore": z_df}),
+            file_name=f"{settings.strategy}_{code_x}_{code_y}_fixed_backtest.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-    excel_bytes = df_to_excel_bytes({
-        "summary": result["summary"],
-        "equity_curve": equity_curve,
-        "trades": trades_df,
-        "weekly_summary": result["weekly_summary"],
-        "selected_pairs": result["selected_pairs_history"],
-        "zscore": z_df,
-    })
-    st.download_button("下載完整回測結果 Excel", data=excel_bytes, file_name=f"{settings.strategy}_{code_x}_{code_y}_rolling_backtest.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+def render_mode2_formal_strategy(settings: AppSettings) -> None:
+    st.subheader("模式二：正式交易策略模式")
+    st.write("每週重新篩選 Top 5 組 pair，再取最好的 n 組進行交易；使用者不手動指定 pair。已開倉部位不會因下一週重新篩選而強制平倉，會一路持有到觸發出場條件。")
+    n_pairs = st.number_input("每週從 Top 5 中交易最佳 n 組 pair", min_value=1, max_value=5, value=1, step=1, key=f"formal_n_{settings.strategy}")
+    st.caption("如果 Top 5 不滿 5 組，就以實際通過篩選的組數為準。若已有持倉，新的 pair 只會用空閒 slot 進場。")
+
+    if st.button("Run formal Top-N strategy", type="primary", use_container_width=True, key=f"formal_run_{settings.strategy}"):
+        try:
+            open_df, close_df, market_price, universe = prepare_download_for_universe(settings)
+            with st.spinner("執行正式交易策略回測..."):
+                result = run_formal_topn_strategy_backtest(settings.strategy, open_df, close_df, universe, market_price, settings, int(n_pairs), weekly_top_k=5)
+            st.session_state[f"formal_result_{settings.strategy}"] = result
+        except Exception as exc:
+            st.error(f"正式策略回測失敗：{exc}")
+            return
+
+    result = st.session_state.get(f"formal_result_{settings.strategy}")
+    if result:
+        st.markdown("### 正式策略回測結果")
+        show_summary_metrics(result["summary"])
+        equity_curve = result["equity_curve"]
+        trades_df = result["trades"]
+        chart_tab, table_tab = st.tabs(["績效圖表", "資料表"])
+        with chart_tab:
+            st.plotly_chart(plot_equity_curve(equity_curve), use_container_width=True)
+            st.plotly_chart(plot_drawdown(equity_curve), use_container_width=True)
+            st.plotly_chart(plot_trade_pnl(trades_df), use_container_width=True)
+        with table_tab:
+            st.markdown("#### 交易紀錄")
+            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+            st.markdown("#### 每週選出的交易候選 pair")
+            st.dataframe(result["selected_pairs_history"], use_container_width=True, hide_index=True)
+            st.markdown("#### 每週摘要")
+            st.dataframe(result["weekly_summary"], use_container_width=True, hide_index=True)
+        st.download_button(
+            "下載正式策略結果 Excel/ZIP",
+            data=df_to_excel_bytes({
+                "summary": result["summary"],
+                "equity_curve": equity_curve,
+                "trades": trades_df,
+                "selected_pairs": result["selected_pairs_history"],
+                "weekly_summary": result["weekly_summary"],
+            }),
+            file_name=f"{settings.strategy}_formal_topn_backtest.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 
 def render_method_notes(settings: AppSettings) -> None:
-    st.subheader("③ 方法說明")
+    st.subheader("方法說明")
     if settings.strategy == "distance":
         st.markdown(
             """
             ### 配對策略1(距離法)
-            1. 每週用過去 `lookback_days` 個交易日作為 formation period。
-            2. 對每檔股票取 log price 後標準化。
-            3. 對所有兩兩 pair 計算 `SSD = sum((Z_X - Z_Y)^2)`。
-            4. 先取 SSD 最小的初選 pair，再做 `beta_diff < threshold` 與同產業篩選。
-            5. 單一 pair 回測時，只有當該 pair 在當週候選清單中，才允許開新倉。
+            - 每次 formation period 先對價格取 log price。
+            - 對每檔股票做標準化。
+            - 對每組 pair 計算 `SSD = sum((Z_X - Z_Y)^2)`。
+            - SSD 越小代表 formation period 中兩檔走勢越接近。
             """
         )
     else:
         st.markdown(
             """
             ### 配對策略2(共整合法)
-            1. 每週用過去 `lookback_days` 個交易日作為 formation period。
-            2. 對所有兩兩 pair 的 log price 做 Engle-Granger 共整合檢定。
-            3. 保留 `p_value <= threshold`，再依 `coint_t` 最負排序。
-            4. 對初選 pair 做 `beta_diff < threshold` 與同產業篩選。
-            5. 單一 pair 回測時，spread 使用進場當下 formation period 估出的 OLS `alpha` 與 `hedge_ratio`。
+            - 每次 formation period 對所有 pair 做 Engle-Granger 共整合檢定。
+            - 保留 `p_value <= threshold`，再依 `coint_t` 越負越優先排序。
+            - Spread 使用 `log_X = alpha + beta * log_Y + residual` 的 residual。
             """
         )
     st.markdown(
         """
+        ### 兩種模式
+        1. **模式一：固定 Pair 回測**  
+           先篩選候選 pair，再由使用者自行選一組 pair。回測時不每週重新選 pair，而是固定使用回測起日前的 formation 參數一路回測。
+
+        2. **模式二：正式交易策略**  
+           每週自動篩選 Top 5 pair，再交易最佳 n 組。使用者不手動指定 pair。舊持倉不因下一週重選而強制平倉，會持有到觸發出場條件。
+
         ### 共同交易邏輯
         - 今日收盤產生訊號，明日開盤成交。
-        - 不在 stop zone 進場：只允許 `entry_z < abs(z) < stop_z`。
-        - 只在 crossing signal 進場，避免 z-score 長期在極端區間時反覆追單。
+        - 只在 crossing signal 進場。
+        - 不在 stop zone 進場。
         - stop loss 後必須等 `abs(z) < reentry_reset_z` 才允許重新進場。
-        - 不在週末強制平倉；舊部位繼續用進場時的 spread 參數管理。
-        - 僅在 `exit_z`、`stop_z`、`max_holding_days` 或回測結束時出場。
+        - 出場條件：`abs(z)<exit_z`、`abs(z)>stop_z`、`max_holding_days`、或回測結束。
         """
     )
 
@@ -1465,14 +1937,13 @@ def render_method_notes(settings: AppSettings) -> None:
 def render_strategy_page(strategy: StrategyName) -> None:
     title = "配對策略1(距離法)" if strategy == "distance" else "配對策略2(共整合法)"
     st.title(title)
-    st.caption("細產業選股 / 候選 pair 清單 / 手動輸入 pair rolling 回測")
+    st.caption("兩種模式：① 先篩選 pair 後手動固定回測；② 每週自動 Top-N 正式策略回測")
     settings = sidebar_settings(strategy)
-
-    tabs = st.tabs(["① 選股 / 選 Pair", "② 單一 Pair 回測", "③ 方法說明"])
+    tabs = st.tabs(["模式一：固定 Pair 回測", "模式二：正式交易策略", "方法說明"])
     with tabs[0]:
-        render_pair_selection_tab(settings)
+        render_mode1_tab(settings)
     with tabs[1]:
-        render_backtest_tab(settings)
+        render_mode2_formal_strategy(settings)
     with tabs[2]:
         render_method_notes(settings)
 
