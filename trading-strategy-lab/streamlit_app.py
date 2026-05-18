@@ -621,9 +621,9 @@ def sidebar_strategy2_settings() -> dict[str, object]:
     st.sidebar.header("回測標的")
     col_a, col_b = st.sidebar.columns(2)
     with col_a:
-        a_code = st.text_input("A code", key="s2_a_code_input", value="2330").strip().upper()
+        a_code = st.text_input("A code", key="s2_a_code_input_v2", placeholder="例如：2330").strip().upper()
     with col_b:
-        b_code = st.text_input("B code", key="s2_b_code_input", value="2303").strip().upper()
+        b_code = st.text_input("B code", key="s2_b_code_input_v2", placeholder="例如：2303").strip().upper()
 
     a_name = resolve_stock_name(a_code) if a_code else ""
     b_name = resolve_stock_name(b_code) if b_code else ""
@@ -874,8 +874,8 @@ def render_strategy2_best_pairs_panel(settings: dict[str, object]) -> None:
     selected = best_pairs_df.iloc[selected_idx]
 
     if st.button("套用選取 pair 到策略2", type="primary", use_container_width=True):
-        st.session_state["s2_a_code_input"] = str(selected["stock_A_code"])
-        st.session_state["s2_b_code_input"] = str(selected["stock_B_code"])
+        st.session_state["s2_a_code_input_v2"] = str(selected["stock_A_code"])
+        st.session_state["s2_b_code_input_v2"] = str(selected["stock_B_code"])
         st.rerun()
 
 def determine_strategy2_test_start(
