@@ -2261,7 +2261,8 @@ def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, re
     perf["total_fee_paid"] = np.nan
     perf["total_trade_value"] = np.nan
     perf["avg_turnover_per_rebalance"] = np.nan
-    perf["execution_price"] = np.nan
+    # keep this column as object dtype; assigning a string into a float column can fail on Streamlit/Pandas
+    perf["execution_price"] = ""
     perf["benchmark"] = settings.benchmark_ticker
 
     strategy_name = f"FF5 Alpha Top {settings.top_n}"
