@@ -2328,16 +2328,225 @@ def render_strategy3_notes() -> None:
     st.subheader("③ 方法說明 / GitHub 資料準備")
 
     st.markdown(
-        """
+        r"""
         ### 策略3：台股五因子 Alpha 月調倉策略
 
-        **策略邏輯**
-        1. 先在 Colab 建構台股五因子：`MKT_RF`, `SMB`, `HML`, `RMW`, `CMA`。
-        2. 對市值前 150 股票做 rolling five-factor regression。
-        3. 每個 `formation_date` 取得每檔股票的五因子 alpha。
-        4. 網站端依 alpha 由高到低排序，選出 Alpha Top N。
-        5. t 日收到訊號，t+1 收盤價調倉。
-        6. 買賣皆扣手續費，並與 0050 或自訂 benchmark 比較。
+        本策略使用資料期間為 **2023/01/01 至 2026/05/18**。策略核心是先建構台股五因子，再利用五因子模型估計每檔股票的 rolling alpha，最後每月選出 alpha 最高的股票進行投資。
+
+        #### 1. 策略流程簡短總結
+
+        1. 每個月以月底作為形成日 `formation_date`，先選出台股市值前 150 大股票作為股票池。
+        2. 在每個形成日，根據市值、B/M、獲利能力與資產成長率建立五因子：`MKT_RF`, `SMB`, `HML`, `RMW`, `CMA`。
+        3. 對股票池內每檔股票使用過去 252 個交易日資料進行 Fama-French 五因子 rolling regression，且至少需要 180 筆有效日資料才估計 alpha。
+        4. 每個月取得各股票的 rolling alpha 後，依 alpha 由高到低排序。
+        5. 網站端選出 Alpha Top N 股票，並在下一個交易日以收盤價進行月調倉。
+        6. 回測時會扣除買賣手續費與賣出交易稅，並與 0050 或自訂 benchmark 進行績效比較。
+
+        #### 2. 五個因子的建構公式
+
+        本策略中，每個投資組合的日報酬皆使用形成日市值加權計算：
+
+        $$
+        R_{P,t} = \sum_{i \in P} w_{i,f} R_{i,t}
+        $$
+
+        其中：
+
+        $$
+        w_{i,f} = \frac{ME_{i,f}}{\sum_{j \in P} ME_{j,f}}
+        $$
+
+        \(R_{P,t}\) 為投資組合 \(P\) 在第 \(t\) 日的報酬，\(R_{i,t}\) 為股票 \(i\) 在第 \(t\) 日的報酬，\(ME_{i,f}\) 為股票 \(i\) 在形成日 \(f\) 的市值。
+
+        ##### (1) 市場因子 MKT_RF
+
+        市場因子使用市值前 150 大股票的市值加權報酬作為市場投資組合報酬：
+
+        $$
+        MKT_t = R_{Top150,t}^{VW}
+        $$
+
+        市場超額報酬因子為：
+
+        $$
+        MKT\_RF_t = MKT_t - RF_t
+        $$
+
+        其中 \(RF_t\) 為第 \(t\) 日的無風險利率。此因子衡量整體大型股市場相對於無風險利率的超額報酬。
+
+        ##### (2) 規模因子 SMB
+
+        SMB 是 Small Minus Big，用來衡量小型股相對大型股的超額報酬。在每個形成日，先依市值中位數將股票分為 Small 與 Big 兩組：
+
+        - \(S\)：市值小於或等於中位數的股票。
+        - \(B\)：市值大於中位數的股票。
+
+        接著分別搭配 B/M、獲利能力與資產成長率三種特徵分組，計算三個 SMB，再取平均。
+
+        **第一種：由 B/M 分組得到的 SMB**
+
+        先依 B/M 的第 30 與第 70 百分位數，將股票分為 Low、Medium、High 三組，再與 Size 分組交叉形成六個投資組合：
+
+        | 符號 | 意義 |
+        |---|---|
+        | \(SL_t\) | Small 且 Low B/M 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(SM_t\) | Small 且 Medium B/M 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(SH_t\) | Small 且 High B/M 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BL_t\) | Big 且 Low B/M 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BM_t\) | Big 且 Medium B/M 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BH_t\) | Big 且 High B/M 股票組合在第 \(t\) 日的市值加權報酬 |
+
+        $$
+        SMB^{BM}_t =
+        \frac{SL_t + SM_t + SH_t}{3}
+        -
+        \frac{BL_t + BM_t + BH_t}{3}
+        $$
+
+        **第二種：由獲利能力分組得到的 SMB**
+
+        依獲利能力的第 30 與第 70 百分位數，將股票分為 Weak、Neutral、Robust 三組，再與 Size 分組交叉形成六個投資組合：
+
+        | 符號 | 意義 |
+        |---|---|
+        | \(SW_t\) | Small 且 Weak profitability 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(SN_t\) | Small 且 Neutral profitability 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(SR_t\) | Small 且 Robust profitability 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BW_t\) | Big 且 Weak profitability 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BN_t\) | Big 且 Neutral profitability 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BR_t\) | Big 且 Robust profitability 股票組合在第 \(t\) 日的市值加權報酬 |
+
+        $$
+        SMB^{OP}_t =
+        \frac{SW_t + SN_t + SR_t}{3}
+        -
+        \frac{BW_t + BN_t + BR_t}{3}
+        $$
+
+        **第三種：由投資風格分組得到的 SMB**
+
+        依資產成長率的第 30 與第 70 百分位數，將股票分為 Conservative、Neutral、Aggressive 三組，再與 Size 分組交叉形成六個投資組合：
+
+        | 符號 | 意義 |
+        |---|---|
+        | \(SC_t\) | Small 且 Conservative investment 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(SN^{INV}_t\) | Small 且 Neutral investment 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(SA_t\) | Small 且 Aggressive investment 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BC_t\) | Big 且 Conservative investment 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BN^{INV}_t\) | Big 且 Neutral investment 股票組合在第 \(t\) 日的市值加權報酬 |
+        | \(BA_t\) | Big 且 Aggressive investment 股票組合在第 \(t\) 日的市值加權報酬 |
+
+        $$
+        SMB^{INV}_t =
+        \frac{SC_t + SN^{INV}_t + SA_t}{3}
+        -
+        \frac{BC_t + BN^{INV}_t + BA_t}{3}
+        $$
+
+        最終 SMB 為三種 SMB 的平均：
+
+        $$
+        SMB_t =
+        \frac{SMB^{BM}_t + SMB^{OP}_t + SMB^{INV}_t}{3}
+        $$
+
+        ##### (3) 價值因子 HML
+
+        HML 是 High Minus Low，用來衡量高 B/M 股票相對低 B/M 股票的超額報酬。B/M 定義為：
+
+        $$
+        BM_i = \frac{Book\ Equity_i}{Market\ Equity_i}
+        $$
+
+        依 B/M 將股票分為 Low、Medium、High 三組後，HML 定義為：
+
+        $$
+        HML_t =
+        \frac{SH_t + BH_t}{2}
+        -
+        \frac{SL_t + BL_t}{2}
+        $$
+
+        其中 \(SH_t\) 與 \(BH_t\) 代表高 B/M 組合報酬，\(SL_t\) 與 \(BL_t\) 代表低 B/M 組合報酬。若 \(HML_t\) 為正，代表高 B/M 的價值股表現優於低 B/M 的成長股。
+
+        ##### (4) 獲利能力因子 RMW
+
+        RMW 是 Robust Minus Weak，用來衡量高獲利能力股票相對低獲利能力股票的超額報酬。獲利能力定義為：
+
+        $$
+        Profitability_i =
+        \frac{Operating\ Income_i}{Total\ Equity_i}
+        $$
+
+        依獲利能力將股票分為 Weak、Neutral、Robust 三組後，RMW 定義為：
+
+        $$
+        RMW_t =
+        \frac{SR_t + BR_t}{2}
+        -
+        \frac{SW_t + BW_t}{2}
+        $$
+
+        其中 \(SR_t\) 與 \(BR_t\) 代表高獲利能力組合報酬，\(SW_t\) 與 \(BW_t\) 代表低獲利能力組合報酬。若 \(RMW_t\) 為正，代表高獲利能力公司表現優於低獲利能力公司。
+
+        ##### (5) 投資因子 CMA
+
+        CMA 是 Conservative Minus Aggressive，用來衡量低資產成長率公司相對高資產成長率公司的超額報酬。資產成長率定義為：
+
+        $$
+        Asset\ Growth_i =
+        \frac{Total\ Assets_{i,t} - Total\ Assets_{i,t-4}}
+        {Total\ Assets_{i,t-4}}
+        $$
+
+        其中 \(t-4\) 代表去年同季。依資產成長率將股票分為 Conservative、Neutral、Aggressive 三組後，CMA 定義為：
+
+        $$
+        CMA_t =
+        \frac{SC_t + BC_t}{2}
+        -
+        \frac{SA_t + BA_t}{2}
+        $$
+
+        其中 \(SC_t\) 與 \(BC_t\) 代表低資產成長率、投資較保守的組合報酬，\(SA_t\) 與 \(BA_t\) 代表高資產成長率、投資較積極的組合報酬。若 \(CMA_t\) 為正，代表投資保守公司表現優於投資積極公司。
+
+        #### 3. 五因子回歸公式與 rolling alpha
+
+        本策略使用 Fama-French 五因子模型估計個股 alpha。對每一檔股票 \(i\)，在每個形成日 \(f\)，使用形成日以前最近 252 個交易日資料進行迴歸：
+
+        $$
+        R_{i,t} - RF_t =
+        \alpha_{i,f}
+        + \beta_{i,MKT}(MKT_t - RF_t)
+        + \beta_{i,SMB}SMB_t
+        + \beta_{i,HML}HML_t
+        + \beta_{i,RMW}RMW_t
+        + \beta_{i,CMA}CMA_t
+        + \varepsilon_{i,t}
+        $$
+
+        其中：
+
+        | 符號 | 意義 |
+        |---|---|
+        | \(R_{i,t} - RF_t\) | 股票 \(i\) 在第 \(t\) 日的超額報酬 |
+        | \(MKT_t - RF_t\) | 市場超額報酬因子，即 `MKT_RF` |
+        | \(SMB_t\) | 規模因子，衡量小型股相對大型股的報酬差 |
+        | \(HML_t\) | 價值因子，衡量高 B/M 股票相對低 B/M 股票的報酬差 |
+        | \(RMW_t\) | 獲利能力因子，衡量高獲利能力股票相對低獲利能力股票的報酬差 |
+        | \(CMA_t\) | 投資因子，衡量保守投資公司相對積極投資公司的報酬差 |
+        | \(\alpha_{i,f}\) | 股票 \(i\) 在形成日 \(f\) 估計出的 rolling alpha |
+        | \(\varepsilon_{i,t}\) | 迴歸殘差，代表模型無法解釋的部分 |
+
+        Rolling 的意思是：每到一個新的形成日 \(f\)，都重新往前取最近 252 個交易日估計一次五因子迴歸。隨著形成日逐月往前推進，估計使用的時間視窗也會逐月向前滾動，因此稱為 rolling regression。
+
+        由於迴歸使用的是日報酬資料，估計出的 \(\alpha_{i,f}\) 是每日 alpha。為了讓 alpha 較容易解讀，可以將每日 alpha 乘以 252 轉成年化 alpha：
+
+        $$
+        \alpha^{annualized}_{i,f} = 252 \times \alpha_{i,f}
+        $$
+
+        年化 alpha 主要是為了方便解釋其經濟意義；若只是用 alpha 進行股票排序，是否年化不會改變排名，因為所有股票都乘上相同常數 252。
 
         **網站必要 CSV**
         - `alpha_scores_ff5_top150.csv`
