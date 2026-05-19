@@ -300,7 +300,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-StrategyName = Literal["distance", "cointegration"]
+StrategyName = Literal["distance", "cointegration", "ff5_alpha"]
 
 
 @dataclass(frozen=True)
@@ -1151,9 +1151,10 @@ def df_to_excel_bytes(sheets: dict[str, pd.DataFrame | pd.Series]) -> bytes:
 
 def render_strategy_selector() -> None:
     st.title("Trading Strategy Lab")
-    st.caption("請選擇要使用的配對交易策略。")
+    st.caption("請選擇要使用的交易策略。")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
+
     with col1:
         st.markdown(
             """
@@ -1188,8 +1189,28 @@ def render_strategy_selector() -> None:
             st.session_state["selected_strategy"] = "cointegration"
             st.rerun()
 
-    st.info("流程：先在「選股 / 選 Pair」產生候選清單，再套用或手動輸入股票代號進行單一 pair rolling 回測。")
+    with col3:
+        st.markdown(
+            """
+            <div class="strategy-card">
+              <h3>策略3(台股五因子 Alpha 月調倉策略)</h3>
+              <p>
+                使用已建構好的台股五因子 rolling regression alpha，
+                每月從市值前 150 股票池中選出 Alpha Top N，
+                以 t+1 收盤價調倉並與 0050 benchmark 比較。
+              </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("進入 策略3(五因子 Alpha)", use_container_width=True):
+            st.session_state["selected_strategy"] = "ff5_alpha"
+            st.rerun()
 
+    st.info(
+        "策略1/2：先在「選股 / 選 Pair」產生候選清單，再進行單一 pair rolling 回測。"
+        "策略3：使用 Colab 產出的 alpha_scores 與 AD PRICE CSV，直接產生 Top N 持股與回測。"
+    )
 
 def sidebar_settings(strategy: StrategyName) -> AppSettings:
     if st.sidebar.button("返回策略選擇"):
@@ -1477,6 +1498,877 @@ def render_strategy_page(strategy: StrategyName) -> None:
         render_method_notes(settings)
 
 
+
+# ============================================================
+# Strategy 3: Taiwan FF5 Alpha Top N Monthly Strategy
+# ============================================================
+
+@dataclass(frozen=True)
+class FF5AlphaSettings:
+    alpha_path: str
+    price_path: str
+    top_n: int
+    initial_capital: float
+    commission_rate: float
+    sell_tax_rate: float
+    benchmark_ticker: str
+    benchmark_auto_adjust: bool
+
+
+def strategy3_sidebar_settings() -> FF5AlphaSettings:
+    if st.sidebar.button("返回策略選擇"):
+        st.session_state["selected_strategy"] = None
+        st.rerun()
+
+    st.sidebar.caption("目前策略：策略3(台股五因子 Alpha 月調倉策略)")
+    st.sidebar.divider()
+
+    st.sidebar.header("資料檔案")
+    st.sidebar.caption("建議把 CSV 放在 GitHub repo 的 data/strategy3/ 資料夾。")
+    alpha_path = st.sidebar.text_input(
+        "Alpha scores CSV 路徑",
+        value="data/strategy3/alpha_scores_ff5_top150.csv",
+        help="需要包含 formation_date、stock_id、stock_name、alpha。"
+    )
+    price_path = st.sidebar.text_input(
+        "AD PRICE CSV 或資料夾路徑",
+        value="data/strategy3/cmoney_daily_adjusted_price.csv",
+        help="可填單一 CSV，或填資料夾路徑。欄位可用英文 date/stock_id/stock_name/adj_close，或 CMoney 中文欄位：日期、股票代號、股票名稱、收盤價。"
+    )
+
+    st.sidebar.divider()
+    st.sidebar.header("策略參數")
+    top_n = st.sidebar.slider("Alpha Top N 持股檔數", min_value=1, max_value=50, value=10, step=1)
+    initial_capital = st.sidebar.number_input("初始資金", min_value=10_000, value=1_000_000, step=100_000)
+    commission_rate = st.sidebar.number_input("買賣手續費率", min_value=0.0, value=0.001425, step=0.0001, format="%.6f")
+    sell_tax_rate = st.sidebar.number_input("賣出交易稅率", min_value=0.0, value=0.0, step=0.0005, format="%.6f")
+    st.sidebar.caption("目前執行價固定為：t+1 收盤價。")
+
+    st.sidebar.divider()
+    st.sidebar.header("Benchmark")
+    benchmark_ticker = st.sidebar.text_input("Benchmark ticker", value="0050.TW")
+    benchmark_auto_adjust = st.sidebar.toggle("Benchmark 使用 yfinance auto_adjust", value=True)
+
+    return FF5AlphaSettings(
+        alpha_path=alpha_path,
+        price_path=price_path,
+        top_n=int(top_n),
+        initial_capital=float(initial_capital),
+        commission_rate=float(commission_rate),
+        sell_tax_rate=float(sell_tax_rate),
+        benchmark_ticker=str(benchmark_ticker).strip(),
+        benchmark_auto_adjust=bool(benchmark_auto_adjust),
+    )
+
+
+def parse_strategy3_date_series(s: pd.Series) -> pd.Series:
+    out = pd.to_datetime(s, errors="coerce")
+    num = pd.to_numeric(s, errors="coerce")
+    mask = num.between(20000, 60000) & out.isna()
+    if mask.any():
+        out.loc[mask] = pd.to_datetime(num.loc[mask], unit="D", origin="1899-12-30")
+    return out.dt.normalize()
+
+
+def strategy3_to_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("--", "", regex=False)
+        .str.replace("- -", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    )
+
+
+@st.cache_data(show_spinner=False)
+def strategy3_read_csv_file(path_str: str) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到檔案或資料夾：{path_str}")
+
+    def _read_one(p: Path) -> pd.DataFrame:
+        last_error = None
+        for enc in ["utf-8-sig", "utf-8", "big5", "cp950"]:
+            try:
+                return pd.read_csv(p, encoding=enc)
+            except Exception as exc:
+                last_error = exc
+        raise last_error
+
+    if path.is_dir():
+        files = sorted(path.glob("*.csv"))
+        if len(files) == 0:
+            raise FileNotFoundError(f"資料夾中沒有 CSV 檔案：{path_str}")
+        dfs = []
+        for f in files:
+            df = _read_one(f)
+            df["source_file"] = f.name
+            dfs.append(df)
+        return pd.concat(dfs, ignore_index=True)
+
+    return _read_one(path)
+
+
+def strategy3_normalize_alpha(alpha_raw: pd.DataFrame) -> pd.DataFrame:
+    df = alpha_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    rename_map = {
+        "形成日": "formation_date",
+        "調倉日": "formation_date",
+        "股票代號": "stock_id",
+        "股票名稱": "stock_name",
+        "年化alpha": "alpha_annualized",
+        "年化Alpha": "alpha_annualized",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    required = ["formation_date", "stock_id", "alpha"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"alpha scores 缺少必要欄位：{missing}")
+
+    df["formation_date"] = parse_strategy3_date_series(df["formation_date"])
+    if "holding_start" in df.columns:
+        df["holding_start"] = parse_strategy3_date_series(df["holding_start"])
+    if "holding_end" in df.columns:
+        df["holding_end"] = parse_strategy3_date_series(df["holding_end"])
+
+    df["stock_id"] = clean_stock_id(df["stock_id"])
+    for c in [
+        "alpha", "alpha_annualized", "pvalue_alpha", "alpha_rank",
+        "rank_in_top150", "beta_mkt", "beta_smb", "beta_hml", "beta_rmw", "beta_cma",
+        "r2", "adj_r2", "n_obs"
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["formation_date", "stock_id", "alpha"])
+    df = df.drop_duplicates(["formation_date", "stock_id"], keep="last")
+    return df.sort_values(["formation_date", "alpha"], ascending=[True, False]).reset_index(drop=True)
+
+
+def strategy3_normalize_price(price_raw: pd.DataFrame) -> pd.DataFrame:
+    df = price_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    rename_map = {
+        "日期": "date",
+        "股票代號": "stock_id",
+        "股票名稱": "stock_name",
+        "收盤價": "adj_close",
+        "還原收盤價": "adj_close",
+        "成交量": "volume",
+        "成交金額(千)": "trading_value_thousand",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    required = ["date", "stock_id", "adj_close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"AD PRICE 缺少必要欄位：{missing}")
+
+    if "stock_name" not in df.columns:
+        df["stock_name"] = ""
+
+    df["date"] = parse_strategy3_date_series(df["date"])
+    df["stock_id"] = clean_stock_id(df["stock_id"])
+    df["adj_close"] = strategy3_to_num(df["adj_close"])
+
+    df = df.dropna(subset=["date", "stock_id", "adj_close"])
+    df = df.drop_duplicates(["date", "stock_id"], keep="last")
+    return df.sort_values(["date", "stock_id"]).reset_index(drop=True)
+
+
+def strategy3_next_trading_date(trading_dates: pd.DatetimeIndex, current_date: pd.Timestamp) -> pd.Timestamp | pd.NaT:
+    future = trading_dates[trading_dates > current_date]
+    if len(future) == 0:
+        return pd.NaT
+    return pd.Timestamp(future[0])
+
+
+def strategy3_create_positions(alpha: pd.DataFrame, price_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    trading_dates = pd.DatetimeIndex(sorted(price_df["date"].dropna().unique()))
+    rows: list[pd.DataFrame] = []
+
+    for fdate, g in alpha.groupby("formation_date"):
+        g = g.sort_values("alpha", ascending=False).head(top_n).copy()
+        if len(g) == 0:
+            continue
+
+        if "holding_start" not in g.columns or g["holding_start"].isna().all():
+            holding_start = strategy3_next_trading_date(trading_dates, pd.Timestamp(fdate))
+            g["holding_start"] = holding_start
+
+        g = g.dropna(subset=["holding_start"])
+        if len(g) == 0:
+            continue
+
+        n_selected = len(g)
+        g["position_rank"] = np.arange(1, n_selected + 1)
+        g["target_weight"] = 1.0 / n_selected
+        g["top_n_setting"] = int(top_n)
+        g["n_alpha_available"] = int(len(alpha[alpha["formation_date"] == fdate]))
+        rows.append(g)
+
+    if len(rows) == 0:
+        return pd.DataFrame()
+
+    positions = pd.concat(rows, ignore_index=True)
+
+    # holding_end：下一個 holding_start
+    unique_starts = sorted(pd.to_datetime(positions["holding_start"].dropna().unique()))
+    start_to_end = {
+        unique_starts[i]: unique_starts[i + 1] if i + 1 < len(unique_starts) else pd.NaT
+        for i in range(len(unique_starts))
+    }
+    positions["holding_end"] = positions["holding_start"].map(start_to_end)
+
+    positions["target_weight"] = (
+        positions["target_weight"] /
+        positions.groupby("holding_start")["target_weight"].transform("sum")
+    )
+
+    return positions.sort_values(["formation_date", "position_rank"]).reset_index(drop=True)
+
+
+def strategy3_run_backtest(
+    positions: pd.DataFrame,
+    price_df: pd.DataFrame,
+    initial_capital: float,
+    commission_rate: float,
+    sell_tax_rate: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    price_lookup = price_df.set_index(["date", "stock_id"])["adj_close"].sort_index()
+    name_lookup = price_df.drop_duplicates("stock_id").set_index("stock_id")["stock_name"].to_dict()
+    trading_dates = pd.DatetimeIndex(sorted(price_df["date"].dropna().unique()))
+
+    rebalance_dates = pd.DatetimeIndex(sorted(positions["holding_start"].dropna().unique()))
+    rebalance_set = set(rebalance_dates)
+
+    if len(rebalance_dates) == 0:
+        raise ValueError("沒有可用 holding_start，無法回測。")
+
+    backtest_dates = trading_dates[trading_dates >= rebalance_dates[0]]
+    if len(backtest_dates) == 0:
+        raise ValueError("AD PRICE 中沒有回測期間價格。")
+
+    cash = float(initial_capital)
+    holdings: dict[str, float] = {}
+    last_price: dict[str, float] = {}
+
+    nav_rows: list[dict[str, object]] = []
+    trade_rows: list[dict[str, object]] = []
+    rebalance_rows: list[dict[str, object]] = []
+
+    prev_nav = float(initial_capital)
+
+    for current_date in backtest_dates:
+        current_date = pd.Timestamp(current_date)
+
+        today_prices = price_df[price_df["date"] == current_date]
+        for _, r in today_prices.iterrows():
+            last_price[r["stock_id"]] = r["adj_close"]
+
+        pre_trade_stock_value = 0.0
+        missing_price_count = 0
+        current_values: dict[str, float] = {}
+
+        for sid, shares in holdings.items():
+            px = price_lookup.get((current_date, sid), np.nan)
+            if pd.isna(px):
+                px = last_price.get(sid, np.nan)
+
+            if pd.isna(px) or px <= 0:
+                missing_price_count += 1
+                value = 0.0
+            else:
+                value = float(shares * px)
+
+            current_values[sid] = value
+            pre_trade_stock_value += value
+
+        pre_trade_nav = cash + pre_trade_stock_value
+
+        total_fee_today = 0.0
+        turnover_today = 0.0
+        buy_value_today = 0.0
+        sell_value_today = 0.0
+
+        if current_date in rebalance_set:
+            target_df = positions[positions["holding_start"] == current_date].copy()
+
+            valid_list = []
+            for _, r in target_df.iterrows():
+                sid = r["stock_id"]
+                px = price_lookup.get((current_date, sid), np.nan)
+                valid_list.append(pd.notna(px) and px > 0)
+
+            target_df = target_df.loc[valid_list].copy()
+
+            if len(target_df) > 0:
+                target_df["target_weight"] = target_df["target_weight"] / target_df["target_weight"].sum()
+
+                target_weights = dict(zip(target_df["stock_id"], target_df["target_weight"]))
+                all_sids = sorted(set(list(holdings.keys()) + list(target_weights.keys())))
+
+                target_values = {
+                    sid: pre_trade_nav * target_weights.get(sid, 0.0)
+                    for sid in all_sids
+                }
+
+                close_prices = {}
+                for sid in all_sids:
+                    px = price_lookup.get((current_date, sid), np.nan)
+                    if pd.isna(px):
+                        px = last_price.get(sid, np.nan)
+                    close_prices[sid] = px
+
+                diff_values = {}
+                for sid in all_sids:
+                    current_value = current_values.get(sid, 0.0)
+                    target_value = target_values.get(sid, 0.0)
+                    diff_values[sid] = target_value - current_value
+
+                # Sell first
+                for sid, diff_value in diff_values.items():
+                    if diff_value >= 0:
+                        continue
+
+                    shares_old = holdings.get(sid, 0.0)
+                    px = close_prices.get(sid, np.nan)
+
+                    if shares_old <= 0 or pd.isna(px) or px <= 0:
+                        continue
+
+                    sell_value = min(-diff_value, shares_old * px)
+                    sell_shares = sell_value / px
+
+                    commission = sell_value * commission_rate
+                    tax = sell_value * sell_tax_rate
+                    fee = commission + tax
+
+                    cash += sell_value - fee
+                    holdings[sid] = shares_old - sell_shares
+
+                    if abs(holdings[sid]) < 1e-10:
+                        holdings.pop(sid, None)
+
+                    sell_value_today += sell_value
+                    turnover_today += sell_value
+                    total_fee_today += fee
+
+                    trade_rows.append({
+                        "date": current_date,
+                        "stock_id": sid,
+                        "stock_name": name_lookup.get(sid, None),
+                        "action": "SELL",
+                        "price_type": "t+1 close",
+                        "price": px,
+                        "shares": sell_shares,
+                        "trade_value": sell_value,
+                        "commission": commission,
+                        "tax": tax,
+                        "total_fee": fee,
+                        "cash_after_trade": cash,
+                        "pre_trade_nav": pre_trade_nav,
+                    })
+
+                # Buy after selling
+                buy_candidates = []
+                for sid, diff_value in diff_values.items():
+                    if diff_value <= 0:
+                        continue
+
+                    px = close_prices.get(sid, np.nan)
+                    if pd.isna(px) or px <= 0:
+                        continue
+
+                    buy_candidates.append((sid, diff_value, px))
+
+                desired_buy_value = sum(x[1] for x in buy_candidates)
+                if desired_buy_value > 0:
+                    max_affordable_buy_value = cash / (1 + commission_rate)
+                    buy_scale = min(1.0, max_affordable_buy_value / desired_buy_value)
+                else:
+                    buy_scale = 0.0
+
+                for sid, desired_value, px in buy_candidates:
+                    buy_value = desired_value * buy_scale
+                    if buy_value <= 0:
+                        continue
+
+                    buy_shares = buy_value / px
+                    if buy_shares <= 0:
+                        continue
+
+                    commission = buy_value * commission_rate
+                    fee = commission
+                    total_cost = buy_value + fee
+
+                    if total_cost > cash + 1e-8:
+                        continue
+
+                    cash -= total_cost
+                    holdings[sid] = holdings.get(sid, 0.0) + buy_shares
+
+                    buy_value_today += buy_value
+                    turnover_today += buy_value
+                    total_fee_today += fee
+
+                    trade_rows.append({
+                        "date": current_date,
+                        "stock_id": sid,
+                        "stock_name": name_lookup.get(sid, None),
+                        "action": "BUY",
+                        "price_type": "t+1 close",
+                        "price": px,
+                        "shares": buy_shares,
+                        "trade_value": buy_value,
+                        "commission": commission,
+                        "tax": 0.0,
+                        "total_fee": fee,
+                        "cash_after_trade": cash,
+                        "pre_trade_nav": pre_trade_nav,
+                    })
+
+                rebalance_rows.append({
+                    "date": current_date,
+                    "pre_trade_nav": pre_trade_nav,
+                    "n_target_stocks": len(target_df),
+                    "n_holdings_after": len(holdings),
+                    "buy_value": buy_value_today,
+                    "sell_value": sell_value_today,
+                    "turnover_value": turnover_today,
+                    "turnover_rate": turnover_today / pre_trade_nav if pre_trade_nav > 0 else np.nan,
+                    "total_fee": total_fee_today,
+                    "cash_after_rebalance": cash,
+                })
+
+        post_trade_stock_value = 0.0
+        for sid, shares in holdings.items():
+            px = price_lookup.get((current_date, sid), np.nan)
+            if pd.isna(px):
+                px = last_price.get(sid, np.nan)
+            if pd.notna(px) and px > 0:
+                post_trade_stock_value += shares * px
+
+        post_trade_nav = cash + post_trade_stock_value
+        daily_return = post_trade_nav / prev_nav - 1 if prev_nav > 0 else np.nan
+
+        nav_rows.append({
+            "date": current_date,
+            "cash": cash,
+            "stock_value": post_trade_stock_value,
+            "portfolio_nav": post_trade_nav,
+            "daily_return": daily_return,
+            "cum_return": post_trade_nav / initial_capital - 1,
+            "n_holdings": len(holdings),
+            "is_rebalance_day": current_date in rebalance_set,
+            "fee_paid_today": total_fee_today,
+            "turnover_today": turnover_today,
+            "missing_price_count": missing_price_count,
+        })
+
+        prev_nav = post_trade_nav
+
+    nav_df = pd.DataFrame(nav_rows)
+    trades_df = pd.DataFrame(trade_rows)
+    rebalance_df = pd.DataFrame(rebalance_rows)
+
+    nav_df["running_max"] = nav_df["portfolio_nav"].cummax()
+    nav_df["drawdown"] = nav_df["portfolio_nav"] / nav_df["running_max"] - 1
+
+    return nav_df, trades_df, rebalance_df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def strategy3_download_benchmark(
+    ticker: str,
+    start: str,
+    end: str,
+    auto_adjust: bool,
+    initial_capital: float,
+) -> pd.DataFrame:
+    yf_end = (pd.Timestamp(end) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+    raw = yf.download(
+        ticker,
+        start=start,
+        end=yf_end,
+        auto_adjust=auto_adjust,
+        progress=False,
+    )
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+
+    bench = raw.reset_index().rename(columns={"Date": "date", "Close": "benchmark_close"})
+    bench["date"] = pd.to_datetime(bench["date"]).dt.normalize()
+    bench = bench[["date", "benchmark_close"]].dropna().sort_values("date")
+    bench["benchmark_daily_return"] = bench["benchmark_close"].pct_change()
+    bench.loc[bench.index[0], "benchmark_daily_return"] = 0.0
+    bench["benchmark_nav"] = initial_capital * (1 + bench["benchmark_daily_return"]).cumprod()
+    bench["benchmark_cum_return"] = bench["benchmark_nav"] / initial_capital - 1
+    bench["benchmark_running_max"] = bench["benchmark_nav"].cummax()
+    bench["benchmark_drawdown"] = bench["benchmark_nav"] / bench["benchmark_running_max"] - 1
+    return bench
+
+
+def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
+    start = nav_df["date"].min().strftime("%Y-%m-%d")
+    end = nav_df["date"].max().strftime("%Y-%m-%d")
+
+    bench = strategy3_download_benchmark(
+        settings.benchmark_ticker,
+        start,
+        end,
+        settings.benchmark_auto_adjust,
+        settings.initial_capital,
+    )
+
+    if bench.empty:
+        nav_df = nav_df.copy()
+        for c in ["benchmark_close", "benchmark_daily_return", "benchmark_nav", "benchmark_cum_return", "benchmark_drawdown"]:
+            nav_df[c] = np.nan
+        return nav_df
+
+    aligned = pd.merge_asof(
+        nav_df[["date"]].sort_values("date"),
+        bench.sort_values("date"),
+        on="date",
+        direction="backward",
+    )
+
+    out = pd.merge(
+        nav_df,
+        aligned[["date", "benchmark_close", "benchmark_daily_return", "benchmark_nav", "benchmark_cum_return", "benchmark_drawdown"]],
+        on="date",
+        how="left",
+    )
+
+    out["active_daily_return"] = out["daily_return"] - out["benchmark_daily_return"]
+    out["active_cum_return"] = out["cum_return"] - out["benchmark_cum_return"]
+    out["relative_nav"] = out["portfolio_nav"] / out["benchmark_nav"]
+    return out
+
+
+def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, rebalance_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
+    def _one(nav_col: str, ret_col: str, label: str) -> dict[str, object]:
+        daily_ret = nav_df[ret_col].dropna()
+        final_nav = nav_df[nav_col].iloc[-1]
+        total_return = final_nav / settings.initial_capital - 1
+        n_days = len(nav_df)
+        years = n_days / 252
+        ann_return = (final_nav / settings.initial_capital) ** (1 / years) - 1 if years > 0 else np.nan
+        ann_vol = daily_ret.std() * np.sqrt(252)
+        sharpe = daily_ret.mean() / daily_ret.std() * np.sqrt(252) if daily_ret.std() != 0 else np.nan
+        running_max = nav_df[nav_col].cummax()
+        max_drawdown = (nav_df[nav_col] / running_max - 1).min()
+        win_rate = (daily_ret > 0).mean()
+        return {
+            "name": label,
+            "initial_capital": settings.initial_capital,
+            "final_nav": final_nav,
+            "total_return": total_return,
+            "annualized_return": ann_return,
+            "annualized_volatility": ann_vol,
+            "sharpe_ratio": sharpe,
+            "max_drawdown": max_drawdown,
+            "win_rate": win_rate,
+            "n_trading_days": n_days,
+        }
+
+    rows = [_one("portfolio_nav", "daily_return", f"FF5 Alpha Top {settings.top_n}")]
+    if "benchmark_nav" in nav_df.columns and nav_df["benchmark_nav"].notna().any():
+        rows.append(_one("benchmark_nav", "benchmark_daily_return", settings.benchmark_ticker))
+
+    perf = pd.DataFrame(rows)
+
+    total_fee_paid = trades_df["total_fee"].sum() if len(trades_df) > 0 else 0.0
+    total_trade_value = trades_df["trade_value"].sum() if len(trades_df) > 0 else 0.0
+    avg_turnover = rebalance_df["turnover_rate"].mean() if len(rebalance_df) > 0 else np.nan
+
+    perf["commission_rate"] = np.nan
+    perf["sell_tax_rate"] = np.nan
+    perf["n_rebalances"] = np.nan
+    perf["total_fee_paid"] = np.nan
+    perf["total_trade_value"] = np.nan
+    perf["avg_turnover_per_rebalance"] = np.nan
+    perf["execution_price"] = np.nan
+    perf["benchmark"] = settings.benchmark_ticker
+
+    strategy_name = f"FF5 Alpha Top {settings.top_n}"
+    perf.loc[perf["name"] == strategy_name, "commission_rate"] = settings.commission_rate
+    perf.loc[perf["name"] == strategy_name, "sell_tax_rate"] = settings.sell_tax_rate
+    perf.loc[perf["name"] == strategy_name, "n_rebalances"] = len(rebalance_df)
+    perf.loc[perf["name"] == strategy_name, "total_fee_paid"] = total_fee_paid
+    perf.loc[perf["name"] == strategy_name, "total_trade_value"] = total_trade_value
+    perf.loc[perf["name"] == strategy_name, "avg_turnover_per_rebalance"] = avg_turnover
+    perf.loc[perf["name"] == strategy_name, "execution_price"] = "t+1 close"
+
+    if len(perf) >= 2:
+        strat_total = perf.loc[perf["name"] == strategy_name, "total_return"].iloc[0]
+        bench_total = perf.loc[perf["name"] == settings.benchmark_ticker, "total_return"].iloc[0]
+        strat_ann = perf.loc[perf["name"] == strategy_name, "annualized_return"].iloc[0]
+        bench_ann = perf.loc[perf["name"] == settings.benchmark_ticker, "annualized_return"].iloc[0]
+
+        active_ret = nav_df["active_daily_return"].dropna() if "active_daily_return" in nav_df.columns else pd.Series(dtype=float)
+        tracking_error = active_ret.std() * np.sqrt(252) if len(active_ret) else np.nan
+        information_ratio = active_ret.mean() / active_ret.std() * np.sqrt(252) if len(active_ret) and active_ret.std() != 0 else np.nan
+
+        perf["strategy_minus_benchmark_total_return"] = np.nan
+        perf["strategy_minus_benchmark_annualized_return"] = np.nan
+        perf["tracking_error"] = np.nan
+        perf["information_ratio"] = np.nan
+
+        perf.loc[perf["name"] == strategy_name, "strategy_minus_benchmark_total_return"] = strat_total - bench_total
+        perf.loc[perf["name"] == strategy_name, "strategy_minus_benchmark_annualized_return"] = strat_ann - bench_ann
+        perf.loc[perf["name"] == strategy_name, "tracking_error"] = tracking_error
+        perf.loc[perf["name"] == strategy_name, "information_ratio"] = information_ratio
+
+    return perf
+
+
+def strategy3_plot_nav(nav_df: pd.DataFrame, top_n: int, benchmark_ticker: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["portfolio_nav"], mode="lines", name=f"FF5 Alpha Top {top_n}"))
+    if "benchmark_nav" in nav_df.columns and nav_df["benchmark_nav"].notna().any():
+        fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["benchmark_nav"], mode="lines", name=f"{benchmark_ticker} Benchmark"))
+    fig.update_layout(title="Portfolio NAV vs Benchmark", template="plotly_white", height=460, hovermode="x unified")
+    return fig
+
+
+def strategy3_plot_cum_return(nav_df: pd.DataFrame, top_n: int, benchmark_ticker: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["cum_return"], mode="lines", name=f"FF5 Alpha Top {top_n}"))
+    if "benchmark_cum_return" in nav_df.columns and nav_df["benchmark_cum_return"].notna().any():
+        fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["benchmark_cum_return"], mode="lines", name=f"{benchmark_ticker} Benchmark"))
+    fig.update_layout(title="Cumulative Return", template="plotly_white", height=420, yaxis_tickformat=".1%", hovermode="x unified")
+    return fig
+
+
+def strategy3_plot_drawdown(nav_df: pd.DataFrame, top_n: int, benchmark_ticker: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["drawdown"], fill="tozeroy", mode="lines", name=f"FF5 Alpha Top {top_n}"))
+    if "benchmark_drawdown" in nav_df.columns and nav_df["benchmark_drawdown"].notna().any():
+        fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["benchmark_drawdown"], mode="lines", name=f"{benchmark_ticker} Benchmark"))
+    fig.update_layout(title="Drawdown", template="plotly_white", height=350, yaxis_tickformat=".1%", hovermode="x unified")
+    return fig
+
+
+def render_strategy3_notes() -> None:
+    st.subheader("③ 方法說明 / GitHub 資料準備")
+
+    st.markdown(
+        """
+        ### 策略3：台股五因子 Alpha 月調倉策略
+
+        **策略邏輯**
+        1. 先在 Colab 建構台股五因子：`MKT_RF`, `SMB`, `HML`, `RMW`, `CMA`。
+        2. 對市值前 150 股票做 rolling five-factor regression。
+        3. 每個 `formation_date` 取得每檔股票的五因子 alpha。
+        4. 網站端依 alpha 由高到低排序，選出 Alpha Top N。
+        5. t 日收到訊號，t+1 收盤價調倉。
+        6. 買賣皆扣手續費，並與 0050 或自訂 benchmark 比較。
+
+        **網站必要 CSV**
+        - `alpha_scores_ff5_top150.csv`
+        - `cmoney_daily_adjusted_price.csv`
+
+        **alpha_scores_ff5_top150.csv 必要欄位**
+        - `formation_date`
+        - `stock_id`
+        - `stock_name`
+        - `alpha`
+
+        **cmoney_daily_adjusted_price.csv 必要欄位**
+        - 英文欄位：`date`, `stock_id`, `stock_name`, `adj_close`
+        - 或 CMoney 中文欄位：`日期`, `股票代號`, `股票名稱`, `收盤價`
+        """
+    )
+
+    st.markdown(
+        """
+        ### GitHub 上傳步驟
+
+        1. 在專案根目錄建立資料夾：
+           ```text
+           data/strategy3/
+           ```
+
+        2. 把 Colab 產出的 alpha 檔放進去：
+           ```text
+           data/strategy3/alpha_scores_ff5_top150.csv
+           ```
+
+        3. 把 AD PRICE 還原收盤價資料整理成一個 CSV 後放進去：
+           ```text
+           data/strategy3/cmoney_daily_adjusted_price.csv
+           ```
+
+        4. 你的 GitHub repo 建議結構：
+           ```text
+           your-repo/
+           ├── app.py
+           ├── requirements.txt
+           └── data/
+               └── strategy3/
+                   ├── alpha_scores_ff5_top150.csv
+                   └── cmoney_daily_adjusted_price.csv
+           ```
+
+        5. `requirements.txt` 至少需要：
+           ```text
+           streamlit
+           pandas
+           numpy
+           plotly
+           statsmodels
+           yfinance
+           openpyxl
+           ```
+
+        6. 如果 CSV 超過 GitHub 單檔 100MB 限制，建議：
+           - 使用 Git LFS；
+           - 或把 AD PRICE 分年放在 `data/strategy3/ad_price/` 資料夾，網站路徑填資料夾；
+           - 或改用 Streamlit Cloud secrets / 外部雲端資料源。
+        """
+    )
+
+
+def render_strategy3_page() -> None:
+    st.title("策略3(台股五因子 Alpha 月調倉策略)")
+    st.caption("使用已建構之五因子 rolling alpha，每月選 Alpha Top N，並以 t+1 收盤價調倉。")
+
+    settings = strategy3_sidebar_settings()
+
+    tabs = st.tabs(["① 回測結果", "② 持股 / 交易資料", "③ 方法說明 / GitHub 資料"])
+
+    with tabs[0]:
+        st.subheader("① 回測結果")
+        st.write(
+            f"目前設定：Alpha Top **{settings.top_n}**，初始資金 **{settings.initial_capital:,.0f}**，"
+            f"手續費率 **{settings.commission_rate:.4%}**，Benchmark：**{settings.benchmark_ticker}**。"
+        )
+
+        run = st.button("執行策略3回測", type="primary", use_container_width=True)
+
+        if run:
+            try:
+                with st.spinner("讀取 alpha scores..."):
+                    alpha_raw = strategy3_read_csv_file(settings.alpha_path)
+                    alpha = strategy3_normalize_alpha(alpha_raw)
+
+                with st.spinner("讀取 AD PRICE..."):
+                    price_raw = strategy3_read_csv_file(settings.price_path)
+                    price_df = strategy3_normalize_price(price_raw)
+
+                with st.spinner("產生 Top N 每月持股..."):
+                    positions = strategy3_create_positions(alpha, price_df, settings.top_n)
+                    if positions.empty:
+                        st.error("沒有成功產生持股清單，請檢查 alpha scores 與 price data。")
+                        return
+
+                with st.spinner("執行 t+1 收盤價回測..."):
+                    nav_df, trades_df, rebalance_df = strategy3_run_backtest(
+                        positions=positions,
+                        price_df=price_df,
+                        initial_capital=settings.initial_capital,
+                        commission_rate=settings.commission_rate,
+                        sell_tax_rate=settings.sell_tax_rate,
+                    )
+
+                with st.spinner(f"下載 benchmark：{settings.benchmark_ticker}..."):
+                    nav_df = strategy3_attach_benchmark(nav_df, settings)
+
+                perf = strategy3_calc_performance(nav_df, trades_df, rebalance_df, settings)
+
+                st.session_state["strategy3_result"] = {
+                    "alpha": alpha,
+                    "price_df": price_df,
+                    "positions": positions,
+                    "nav_df": nav_df,
+                    "trades_df": trades_df,
+                    "rebalance_df": rebalance_df,
+                    "perf": perf,
+                    "settings": settings,
+                }
+
+            except Exception as exc:
+                st.error(f"策略3回測失敗：{exc}")
+                return
+
+        result = st.session_state.get("strategy3_result")
+        if not result:
+            st.info("請先確認左側參數與 CSV 路徑，然後按「執行策略3回測」。")
+            return
+
+        nav_df = result["nav_df"]
+        trades_df = result["trades_df"]
+        rebalance_df = result["rebalance_df"]
+        perf = result["perf"]
+        positions = result["positions"]
+        settings_used = result["settings"]
+
+        strategy_row = perf.iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Return", f"{strategy_row['total_return']:.2%}")
+        c2.metric("Sharpe", f"{strategy_row['sharpe_ratio']:.2f}" if pd.notna(strategy_row["sharpe_ratio"]) else "NA")
+        c3.metric("Max Drawdown", f"{strategy_row['max_drawdown']:.2%}")
+        c4.metric("Final NAV", f"{strategy_row['final_nav']:,.0f}")
+
+        st.plotly_chart(strategy3_plot_nav(nav_df, settings_used.top_n, settings_used.benchmark_ticker), use_container_width=True)
+        st.plotly_chart(strategy3_plot_cum_return(nav_df, settings_used.top_n, settings_used.benchmark_ticker), use_container_width=True)
+        st.plotly_chart(strategy3_plot_drawdown(nav_df, settings_used.top_n, settings_used.benchmark_ticker), use_container_width=True)
+
+        st.markdown("#### 績效比較表")
+        st.dataframe(perf, use_container_width=True, hide_index=True)
+
+        excel_bytes = df_to_excel_bytes({
+            "performance": perf,
+            "nav": nav_df,
+            "positions": positions,
+            "trades": trades_df,
+            "rebalance": rebalance_df,
+        })
+        st.download_button(
+            "下載策略3完整回測結果 Excel",
+            data=excel_bytes,
+            file_name=f"strategy3_ff5_alpha_top{settings_used.top_n}_backtest.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    with tabs[1]:
+        st.subheader("② 持股 / 交易資料")
+        result = st.session_state.get("strategy3_result")
+        if not result:
+            st.info("請先到「回測結果」執行策略3回測。")
+            return
+
+        positions = result["positions"]
+        trades_df = result["trades_df"]
+        rebalance_df = result["rebalance_df"]
+        nav_df = result["nav_df"]
+
+        st.markdown("#### 每月 Alpha Top N 成分股")
+        st.dataframe(positions, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 交易紀錄")
+        st.dataframe(trades_df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 調倉摘要")
+        st.dataframe(rebalance_df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### NAV 明細")
+        st.dataframe(nav_df, use_container_width=True, hide_index=True)
+
+    with tabs[2]:
+        render_strategy3_notes()
+
 def main() -> None:
     if "selected_strategy" not in st.session_state:
         st.session_state["selected_strategy"] = None
@@ -1489,6 +2381,8 @@ def main() -> None:
         render_strategy_page("distance")
     elif st.session_state["selected_strategy"] == "cointegration":
         render_strategy_page("cointegration")
+    elif st.session_state["selected_strategy"] == "ff5_alpha":
+        render_strategy3_page()
     else:
         st.session_state["selected_strategy"] = None
         st.rerun()
