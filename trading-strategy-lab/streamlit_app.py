@@ -1573,6 +1573,17 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     )
 
 
+
+def strategy3_force_datetime_ns(s: pd.Series) -> pd.Series:
+    """Normalize dates and force pandas datetime64[ns] for merge_asof compatibility."""
+    out = pd.to_datetime(s, errors="coerce")
+    try:
+        if getattr(out.dt, "tz", None) is not None:
+            out = out.dt.tz_localize(None)
+    except Exception:
+        pass
+    return out.dt.normalize().astype("datetime64[ns]")
+
 def parse_strategy3_date_series(s: pd.Series) -> pd.Series:
     """
     支援三種日期格式：
@@ -1610,7 +1621,7 @@ def parse_strategy3_date_series(s: pd.Series) -> pd.Series:
             errors="coerce",
         )
 
-    return out.dt.normalize()
+    return strategy3_force_datetime_ns(out)
 
 
 def strategy3_to_num(s: pd.Series) -> pd.Series:
@@ -2119,7 +2130,7 @@ def strategy3_download_benchmark(
         raw.columns = raw.columns.get_level_values(0)
 
     bench = raw.reset_index().rename(columns={"Date": "date", "Close": "benchmark_close"})
-    bench["date"] = pd.to_datetime(bench["date"]).dt.normalize()
+    bench["date"] = strategy3_force_datetime_ns(bench["date"])
     bench = bench[["date", "benchmark_close"]].dropna().sort_values("date")
     bench["benchmark_daily_return"] = bench["benchmark_close"].pct_change()
     bench.loc[bench.index[0], "benchmark_daily_return"] = 0.0
@@ -2133,8 +2144,14 @@ def strategy3_download_benchmark(
 def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
     """
     下載 benchmark，對齊策略日期，並將 benchmark NAV rebased 到策略第一天。
+
+    修正重點：
+    - yfinance 的 date 有時是 datetime64[s]，策略 NAV 是 datetime64[ns]。
+      pd.merge_asof 需要左右 key 完全同型別，所以這裡強制轉成 datetime64[ns]。
     """
     out = nav_df.copy()
+    out["date"] = strategy3_force_datetime_ns(out["date"])
+    out = out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
     # 多抓幾天，避免策略第一天不是 benchmark 交易日導致缺值
     start = (out["date"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
@@ -2157,9 +2174,19 @@ def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings)
             out[c] = np.nan
         return out
 
+    bench = bench.copy()
+    bench["date"] = strategy3_force_datetime_ns(bench["date"])
+    bench = bench.dropna(subset=["date", "benchmark_close"]).sort_values("date").reset_index(drop=True)
+
+    left = out[["date"]].copy().sort_values("date").reset_index(drop=True)
+    left["date"] = strategy3_force_datetime_ns(left["date"])
+
+    right = bench[["date", "benchmark_close"]].copy().sort_values("date").reset_index(drop=True)
+    right["date"] = strategy3_force_datetime_ns(right["date"])
+
     aligned = pd.merge_asof(
-        out[["date"]].sort_values("date"),
-        bench[["date", "benchmark_close"]].sort_values("date"),
+        left,
+        right,
         on="date",
         direction="backward",
     )
@@ -2175,6 +2202,8 @@ def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings)
     aligned["benchmark_running_max"] = aligned["benchmark_nav"].cummax()
     aligned["benchmark_drawdown"] = aligned["benchmark_nav"] / aligned["benchmark_running_max"] - 1
 
+    aligned["date"] = strategy3_force_datetime_ns(aligned["date"])
+
     out = pd.merge(
         out,
         aligned[[
@@ -2189,7 +2218,6 @@ def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings)
     out["active_cum_return"] = out["cum_return"] - out["benchmark_cum_return"]
     out["relative_nav"] = out["portfolio_nav"] / out["benchmark_nav"]
     return out
-
 
 def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, rebalance_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
     def _one(nav_col: str, ret_col: str, label: str) -> dict[str, object]:
