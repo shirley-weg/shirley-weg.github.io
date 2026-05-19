@@ -337,6 +337,18 @@ class AppSettings:
 # Basic Universe Helpers
 # ============================================================
 
+def clean_stock_id(s: pd.Series) -> pd.Series:
+    """
+    將股票代號統一成 4 碼字串。
+    例如：2330、2330.0、"2330 台積電" 都會轉成 "2330"。
+    """
+    return (
+        s.astype(str)
+         .str.extract(r"(\d+)")[0]
+         .str.zfill(4)
+    )
+
+
 def stock_pool_df() -> pd.DataFrame:
     df = pd.DataFrame(single_stock_futures).copy()
     df["code"] = df["code"].astype(str)
@@ -1209,7 +1221,7 @@ def render_strategy_selector() -> None:
 
     st.info(
         "策略1/2：先在「選股 / 選 Pair」產生候選清單，再進行單一 pair rolling 回測。"
-        "策略3：使用 Colab 產出的 alpha_scores 與 AD PRICE CSV，直接產生 Top N 持股與回測。"
+        "策略3：使用 Colab 產出的 alpha_scores 與 AD PRICE CSV/XLSX，直接產生 Top N 持股與回測。"
     )
 
 def sidebar_settings(strategy: StrategyName) -> AppSettings:
@@ -1524,7 +1536,7 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     st.sidebar.divider()
 
     st.sidebar.header("資料檔案")
-    st.sidebar.caption("建議把 CSV 放在 GitHub repo 的 data/strategy3/ 資料夾。")
+    st.sidebar.caption("建議把資料放在 GitHub repo 的 data/strategy3/ 資料夾。支援 CSV、XLSX，AD PRICE 可填單一檔案或資料夾。")
     alpha_path = st.sidebar.text_input(
         "Alpha scores CSV 路徑",
         value="data/strategy3/alpha_scores_ff5_top150.csv",
@@ -1532,8 +1544,8 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     )
     price_path = st.sidebar.text_input(
         "AD PRICE CSV 或資料夾路徑",
-        value="data/strategy3/cmoney_daily_adjusted_price.csv",
-        help="可填單一 CSV，或填資料夾路徑。欄位可用英文 date/stock_id/stock_name/adj_close，或 CMoney 中文欄位：日期、股票代號、股票名稱、收盤價。"
+        value="data/strategy3/ad_price",
+        help="可填單一 CSV/XLSX，或填資料夾路徑。欄位可用英文 date/stock_id/stock_name/adj_close，或 CMoney 中文欄位：日期、股票代號、股票名稱、收盤價。"
     )
 
     st.sidebar.divider()
@@ -1562,11 +1574,42 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
 
 
 def parse_strategy3_date_series(s: pd.Series) -> pd.Series:
-    out = pd.to_datetime(s, errors="coerce")
-    num = pd.to_numeric(s, errors="coerce")
-    mask = num.between(20000, 60000) & out.isna()
-    if mask.any():
-        out.loc[mask] = pd.to_datetime(num.loc[mask], unit="D", origin="1899-12-30")
+    """
+    支援三種日期格式：
+    1. 一般日期字串 / pandas datetime
+    2. Excel serial number，例如 45123
+    3. YYYYMMDD 數字或字串，例如 20240131
+    """
+    raw = s.copy()
+    raw_str = raw.astype(str).str.strip()
+
+    is_yyyymmdd = raw_str.str.fullmatch(r"\d{8}")
+    out = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+
+    if is_yyyymmdd.any():
+        out.loc[is_yyyymmdd] = pd.to_datetime(
+            raw_str.loc[is_yyyymmdd],
+            format="%Y%m%d",
+            errors="coerce",
+        )
+
+    remain = ~is_yyyymmdd
+    out.loc[remain] = pd.to_datetime(raw.loc[remain], errors="coerce")
+
+    num = pd.to_numeric(raw, errors="coerce")
+    is_excel_serial = (
+        num.between(20000, 60000)
+        & raw_str.str.fullmatch(r"\d+(\.0)?")
+    )
+
+    if is_excel_serial.any():
+        out.loc[is_excel_serial] = pd.to_datetime(
+            num.loc[is_excel_serial],
+            unit="D",
+            origin="1899-12-30",
+            errors="coerce",
+        )
+
     return out.dt.normalize()
 
 
@@ -1581,13 +1624,67 @@ def strategy3_to_num(s: pd.Series) -> pd.Series:
     )
 
 
+def resolve_strategy3_path(path_str: str) -> Path:
+    """
+    讓策略3資料路徑同時支援：
+    - data/strategy3/...
+    - trading-strategy-lab/data/strategy3/...
+
+    會優先嘗試以 streamlit_app.py 所在資料夾為基準，
+    也會嘗試目前 working directory 與 repo root 常見結構。
+    """
+    raw = str(path_str).strip().strip('"').strip("'")
+    if not raw:
+        raise FileNotFoundError("資料路徑是空的。")
+
+    p = Path(raw)
+    if p.is_absolute():
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"找不到檔案或資料夾：{p}")
+
+    app_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd().resolve()
+
+    candidates = [
+        app_dir / p,
+        cwd / p,
+        cwd / "trading-strategy-lab" / p,
+        app_dir.parent / p,
+    ]
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate not in seen:
+            unique_candidates.append(candidate)
+            seen.add(candidate)
+
+    for candidate in unique_candidates:
+        if candidate.exists():
+            return candidate
+
+    checked = "\n".join(str(c) for c in unique_candidates)
+    raise FileNotFoundError(
+        f"找不到檔案或資料夾：{path_str}\n"
+        f"已嘗試以下位置：\n{checked}"
+    )
+
+
 @st.cache_data(show_spinner=False)
 def strategy3_read_csv_file(path_str: str) -> pd.DataFrame:
-    path = Path(path_str)
-    if not path.exists():
-        raise FileNotFoundError(f"找不到檔案或資料夾：{path_str}")
+    """
+    讀取策略3資料，支援：
+    - 單一 CSV
+    - 單一 XLSX / XLS
+    - 資料夾：自動合併其中所有 CSV / XLSX / XLS
 
-    def _read_one(p: Path) -> pd.DataFrame:
+    注意：資料夾內會自動忽略 .gitkeep、暫存檔與非資料檔。
+    """
+    path = resolve_strategy3_path(path_str)
+
+    def _read_csv(p: Path) -> pd.DataFrame:
         last_error = None
         for enc in ["utf-8-sig", "utf-8", "big5", "cp950"]:
             try:
@@ -1596,15 +1693,30 @@ def strategy3_read_csv_file(path_str: str) -> pd.DataFrame:
                 last_error = exc
         raise last_error
 
+    def _read_one(p: Path) -> pd.DataFrame:
+        suffix = p.suffix.lower()
+        if suffix == ".csv":
+            return _read_csv(p)
+        if suffix in [".xlsx", ".xls"]:
+            return pd.read_excel(p)
+        raise ValueError(f"不支援的檔案格式：{p.name}")
+
     if path.is_dir():
-        files = sorted(path.glob("*.csv"))
+        files: list[Path] = []
+        for pattern in ["*.csv", "*.xlsx", "*.xls"]:
+            files.extend(sorted(path.glob(pattern)))
+
+        files = [f for f in files if not f.name.startswith("~$")]
+
         if len(files) == 0:
-            raise FileNotFoundError(f"資料夾中沒有 CSV 檔案：{path_str}")
+            raise FileNotFoundError(f"資料夾中沒有 CSV/XLSX/XLS 檔案：{path}")
+
         dfs = []
         for f in files:
             df = _read_one(f)
             df["source_file"] = f.name
             dfs.append(df)
+
         return pd.concat(dfs, ignore_index=True)
 
     return _read_one(path)
@@ -2019,8 +2131,14 @@ def strategy3_download_benchmark(
 
 
 def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
-    start = nav_df["date"].min().strftime("%Y-%m-%d")
-    end = nav_df["date"].max().strftime("%Y-%m-%d")
+    """
+    下載 benchmark，對齊策略日期，並將 benchmark NAV rebased 到策略第一天。
+    """
+    out = nav_df.copy()
+
+    # 多抓幾天，避免策略第一天不是 benchmark 交易日導致缺值
+    start = (out["date"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    end = out["date"].max().strftime("%Y-%m-%d")
 
     bench = strategy3_download_benchmark(
         settings.benchmark_ticker,
@@ -2031,21 +2149,38 @@ def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings)
     )
 
     if bench.empty:
-        nav_df = nav_df.copy()
-        for c in ["benchmark_close", "benchmark_daily_return", "benchmark_nav", "benchmark_cum_return", "benchmark_drawdown"]:
-            nav_df[c] = np.nan
-        return nav_df
+        for c in [
+            "benchmark_close", "benchmark_daily_return", "benchmark_nav",
+            "benchmark_cum_return", "benchmark_drawdown",
+            "active_daily_return", "active_cum_return", "relative_nav"
+        ]:
+            out[c] = np.nan
+        return out
 
     aligned = pd.merge_asof(
-        nav_df[["date"]].sort_values("date"),
-        bench.sort_values("date"),
+        out[["date"]].sort_values("date"),
+        bench[["date", "benchmark_close"]].sort_values("date"),
         on="date",
         direction="backward",
     )
 
+    aligned["benchmark_daily_return"] = aligned["benchmark_close"].pct_change()
+    aligned.loc[aligned.index[0], "benchmark_daily_return"] = 0.0
+
+    aligned["benchmark_nav"] = settings.initial_capital * (
+        1 + aligned["benchmark_daily_return"].fillna(0)
+    ).cumprod()
+
+    aligned["benchmark_cum_return"] = aligned["benchmark_nav"] / settings.initial_capital - 1
+    aligned["benchmark_running_max"] = aligned["benchmark_nav"].cummax()
+    aligned["benchmark_drawdown"] = aligned["benchmark_nav"] / aligned["benchmark_running_max"] - 1
+
     out = pd.merge(
-        nav_df,
-        aligned[["date", "benchmark_close", "benchmark_daily_return", "benchmark_nav", "benchmark_cum_return", "benchmark_drawdown"]],
+        out,
+        aligned[[
+            "date", "benchmark_close", "benchmark_daily_return",
+            "benchmark_nav", "benchmark_cum_return", "benchmark_drawdown"
+        ]],
         on="date",
         how="left",
     )
@@ -2177,7 +2312,7 @@ def render_strategy3_notes() -> None:
 
         **網站必要 CSV**
         - `alpha_scores_ff5_top150.csv`
-        - `cmoney_daily_adjusted_price.csv`
+        - `cmoney_daily_adjusted_price.csv`，或將多個 `.xlsx` / `.csv` 放在 `ad_price/` 資料夾
 
         **alpha_scores_ff5_top150.csv 必要欄位**
         - `formation_date`
@@ -2185,7 +2320,7 @@ def render_strategy3_notes() -> None:
         - `stock_name`
         - `alpha`
 
-        **cmoney_daily_adjusted_price.csv 必要欄位**
+        **AD PRICE 必要欄位**
         - 英文欄位：`date`, `stock_id`, `stock_name`, `adj_close`
         - 或 CMoney 中文欄位：`日期`, `股票代號`, `股票名稱`, `收盤價`
         """
@@ -2234,7 +2369,7 @@ def render_strategy3_notes() -> None:
 
         6. 如果 CSV 超過 GitHub 單檔 100MB 限制，建議：
            - 使用 Git LFS；
-           - 或把 AD PRICE 分年放在 `data/strategy3/ad_price/` 資料夾，網站路徑填資料夾；
+           - 或把 AD PRICE 分年放在 `data/strategy3/ad_price/` 資料夾，網站路徑填資料夾；支援 `.csv`、`.xlsx`、`.xls`；
            - 或改用 Streamlit Cloud secrets / 外部雲端資料源。
         """
     )
