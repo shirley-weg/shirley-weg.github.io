@@ -2569,8 +2569,6 @@ $$
         """
     )
 
-    st.markdown(
-        """
 
 
 def render_strategy3_page() -> None:
