@@ -15,6 +15,7 @@ import streamlit as st
 import statsmodels.api as sm
 import yfinance as yf
 from statsmodels.tsa.stattools import coint
+from strategy3_ff5_pipeline import FF5RawBuildConfig, run_ff5_raw_pipeline
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
@@ -1517,8 +1518,13 @@ def render_strategy_page(strategy: StrategyName) -> None:
 
 @dataclass(frozen=True)
 class FF5AlphaSettings:
-    alpha_path: str
-    price_path: str
+    raw_data_path: str
+    market_cap_top_n: int
+    lookback_days: int
+    min_obs: int
+    require_positive_alpha: bool
+    use_pvalue_filter: bool
+    pvalue_threshold: float
     top_n: int
     initial_capital: float
     commission_rate: float
@@ -1536,21 +1542,21 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     st.sidebar.divider()
 
     st.sidebar.header("資料檔案")
-    st.sidebar.caption("建議把資料放在 GitHub repo 的 data/strategy3/ 資料夾。支援 CSV、XLSX，AD PRICE 可填單一檔案或資料夾。")
-    alpha_path = st.sidebar.text_input(
-        "Alpha scores CSV 路徑",
-        value="data/strategy3/alpha_scores_ff5_top150.csv",
-        help="需要包含 formation_date、stock_id、stock_name、alpha。"
-    )
-    price_path = st.sidebar.text_input(
-        "AD PRICE CSV 或資料夾路徑",
-        value="data/strategy3/ad_price",
-        help="可填單一 CSV/XLSX，或填資料夾路徑。欄位可用英文 date/stock_id/stock_name/adj_close，或 CMoney 中文欄位：日期、股票代號、股票名稱、收盤價。"
+    raw_data_path = st.sidebar.text_input(
+        "原始資料資料夾",
+        value="data/strategy3",
+        help="資料夾內需包含 DATA、AD PRICE、ASSET、RMW Excel。可分子資料夾放置。"
     )
 
     st.sidebar.divider()
     st.sidebar.header("策略參數")
+    market_cap_top_n = st.sidebar.number_input("每月市值股票池", min_value=50, max_value=300, value=150, step=10)
+    lookback_days = st.sidebar.slider("Rolling regression lookback", min_value=120, max_value=504, value=252, step=21)
+    min_obs = st.sidebar.slider("Regression minimum observations", min_value=60, max_value=252, value=180, step=10)
     top_n = st.sidebar.slider("Alpha Top N 持股檔數", min_value=1, max_value=50, value=10, step=1)
+    require_positive_alpha = st.sidebar.toggle("只保留 alpha > 0", value=False)
+    use_pvalue_filter = st.sidebar.toggle("使用 alpha p-value 篩選", value=False)
+    pvalue_threshold = st.sidebar.slider("Alpha p-value 門檻", min_value=0.01, max_value=0.30, value=0.10, step=0.01)
     initial_capital = st.sidebar.number_input("初始資金", min_value=10_000, value=1_000_000, step=100_000)
     commission_rate = st.sidebar.number_input("買賣手續費率", min_value=0.0, value=0.001425, step=0.0001, format="%.6f")
     sell_tax_rate = st.sidebar.number_input("賣出交易稅率", min_value=0.0, value=0.0, step=0.0005, format="%.6f")
@@ -1562,8 +1568,13 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     benchmark_auto_adjust = st.sidebar.toggle("Benchmark 使用 yfinance auto_adjust", value=True)
 
     return FF5AlphaSettings(
-        alpha_path=alpha_path,
-        price_path=price_path,
+        raw_data_path=raw_data_path,
+        market_cap_top_n=int(market_cap_top_n),
+        lookback_days=int(lookback_days),
+        min_obs=int(min_obs),
+        require_positive_alpha=bool(require_positive_alpha),
+        use_pvalue_filter=bool(use_pvalue_filter),
+        pvalue_threshold=float(pvalue_threshold),
         top_n=int(top_n),
         initial_capital=float(initial_capital),
         commission_rate=float(commission_rate),
@@ -1731,6 +1742,31 @@ def strategy3_read_csv_file(path_str: str) -> pd.DataFrame:
         return pd.concat(dfs, ignore_index=True)
 
     return _read_one(path)
+
+
+@st.cache_data(show_spinner=False)
+def strategy3_build_raw_pipeline_cached(
+    raw_data_path: str,
+    market_cap_top_n: int,
+    lookback_days: int,
+    min_obs: int,
+) -> dict[str, pd.DataFrame]:
+    raw_dir = resolve_strategy3_path(raw_data_path)
+    config = FF5RawBuildConfig(
+        market_cap_top_n=int(market_cap_top_n),
+        lookback_days=int(lookback_days),
+        min_obs=int(min_obs),
+    )
+    return run_ff5_raw_pipeline(raw_dir, config)
+
+
+def strategy3_filter_alpha_scores(alpha: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
+    filtered = alpha.copy()
+    if settings.require_positive_alpha:
+        filtered = filtered[filtered["alpha"] > 0].copy()
+    if settings.use_pvalue_filter and "pvalue_alpha" in filtered.columns:
+        filtered = filtered[filtered["pvalue_alpha"] < settings.pvalue_threshold].copy()
+    return filtered.sort_values(["formation_date", "alpha"], ascending=[True, False]).reset_index(drop=True)
 
 
 def strategy3_normalize_alpha(alpha_raw: pd.DataFrame) -> pd.DataFrame:
@@ -2550,22 +2586,16 @@ $$
 
 #### GitHub 資料
 
-**網站必要 CSV**
+**網站必要原始資料**
 
-- `alpha_scores_ff5_top150.csv`
-- `cmoney_daily_adjusted_price.csv`
+- `DATA`：日行情、市值、PB 等欄位
+- `AD PRICE`：還原收盤價，用於個股日報酬與回測成交價
+- `ASSET`：資產負債表，用於 B/M 與 CMA
+- `RMW`：損益表，用於 profitability 與 RMW
 
-**alpha_scores_ff5_top150.csv 必要欄位**
-
-- `formation_date`
-- `stock_id`
-- `stock_name`
-- `alpha`
-
-**AD PRICE 必要欄位**
-
-- 英文欄位：`date`, `stock_id`, `stock_name`, `adj_close`
-- 或 CMoney 中文欄位：`日期`, `股票代號`, `股票名稱`, `收盤價`
+網站會在執行回測時自動產生 `top150_formation_characteristics`、
+`ff5_factor_returns_top150`、`alpha_scores_ff5_top150`，
+再依 Alpha Top N 形成持股與回測結果。
         """
     )
 
@@ -2573,7 +2603,7 @@ $$
 
 def render_strategy3_page() -> None:
     st.title("策略3(台股五因子 Alpha 月調倉策略)")
-    st.caption("使用已建構之五因子 rolling alpha，每月選 Alpha Top N，並以 t+1 收盤價調倉。")
+    st.caption("從原始 CMoney Excel 建立 Top 150 股票池、五因子、rolling alpha，再執行 Alpha Top N 月調倉。")
 
     settings = strategy3_sidebar_settings()
 
@@ -2582,24 +2612,36 @@ def render_strategy3_page() -> None:
     with tabs[0]:
         st.subheader("① 回測結果")
         st.write(
-            f"目前設定：Alpha Top **{settings.top_n}**，初始資金 **{settings.initial_capital:,.0f}**，"
-            f"手續費率 **{settings.commission_rate:.4%}**，Benchmark：**{settings.benchmark_ticker}**。"
+            f"目前設定：市值前 **{settings.market_cap_top_n}**，Alpha Top **{settings.top_n}**，"
+            f"lookback **{settings.lookback_days}**，min obs **{settings.min_obs}**，"
+            f"初始資金 **{settings.initial_capital:,.0f}**，Benchmark：**{settings.benchmark_ticker}**。"
         )
 
         run = st.button("執行策略3回測", type="primary", use_container_width=True)
 
         if run:
             try:
-                with st.spinner("讀取 alpha scores..."):
-                    alpha_raw = strategy3_read_csv_file(settings.alpha_path)
-                    alpha = strategy3_normalize_alpha(alpha_raw)
+                with st.spinner("讀取原始資料、建立五因子並估計 rolling alpha..."):
+                    raw_result = strategy3_build_raw_pipeline_cached(
+                        settings.raw_data_path,
+                        settings.market_cap_top_n,
+                        settings.lookback_days,
+                        settings.min_obs,
+                    )
+                    alpha = raw_result["alpha_scores"]
+                    price_df = raw_result["price_df"]
 
-                with st.spinner("讀取 AD PRICE..."):
-                    price_raw = strategy3_read_csv_file(settings.price_path)
-                    price_df = strategy3_normalize_price(price_raw)
+                if alpha.empty:
+                    st.error("沒有成功產生 alpha scores，請調低 min obs 或檢查原始資料期間。")
+                    return
+
+                alpha_for_positions = strategy3_filter_alpha_scores(alpha, settings)
+                if alpha_for_positions.empty:
+                    st.error("alpha 篩選後沒有可用股票，請放寬 alpha 或 p-value 條件。")
+                    return
 
                 with st.spinner("產生 Top N 每月持股..."):
-                    positions = strategy3_create_positions(alpha, price_df, settings.top_n)
+                    positions = strategy3_create_positions(alpha_for_positions, price_df, settings.top_n)
                     if positions.empty:
                         st.error("沒有成功產生持股清單，請檢查 alpha scores 與 price data。")
                     else:
@@ -2619,7 +2661,13 @@ def render_strategy3_page() -> None:
 
                         st.session_state["strategy3_result"] = {
                             "alpha": alpha,
+                            "alpha_for_positions": alpha_for_positions,
                             "price_df": price_df,
+                            "ff5": raw_result["ff5"],
+                            "formations": raw_result["formations"],
+                            "factor_panel": raw_result["factor_panel"],
+                            "regression_panel": raw_result["regression_panel"],
+                            "file_manifest": raw_result["file_manifest"],
                             "positions": positions,
                             "nav_df": nav_df,
                             "trades_df": trades_df,
@@ -2633,7 +2681,7 @@ def render_strategy3_page() -> None:
 
         result = st.session_state.get("strategy3_result")
         if not result:
-            st.info("請先確認左側參數與 CSV 路徑，然後按「執行策略3回測」。")
+            st.info("請先確認左側參數與原始資料資料夾，然後按「執行策略3回測」。")
         else:
             nav_df = result["nav_df"]
             trades_df = result["trades_df"]
@@ -2662,6 +2710,10 @@ def render_strategy3_page() -> None:
                 "positions": positions,
                 "trades": trades_df,
                 "rebalance": rebalance_df,
+                "alpha_scores": result["alpha"],
+                "ff5_factors": result["ff5"],
+                "top150_formations": result["formations"],
+                "raw_files": result["file_manifest"],
             })
             st.download_button(
                 "下載策略3完整回測結果 Excel",
@@ -2692,6 +2744,16 @@ def render_strategy3_page() -> None:
 
             st.markdown("#### NAV 明細")
             st.dataframe(nav_df, use_container_width=True, hide_index=True)
+
+            with st.expander("原始資料與前置作業輸出"):
+                st.markdown("#### Raw data files")
+                st.dataframe(result["file_manifest"], use_container_width=True, hide_index=True)
+                st.markdown("#### Alpha scores")
+                st.dataframe(result["alpha"], use_container_width=True, hide_index=True)
+                st.markdown("#### FF5 factor returns")
+                st.dataframe(result["ff5"], use_container_width=True, hide_index=True)
+                st.markdown("#### Top 150 formation characteristics")
+                st.dataframe(result["formations"], use_container_width=True, hide_index=True)
 
     with tabs[2]:
         render_strategy3_notes()
