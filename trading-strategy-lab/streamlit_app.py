@@ -1824,7 +1824,7 @@ def render_method_notes(settings: AppSettings) -> None:
         )
     st.markdown(
         """
-        ### 共同交易邏輯
+        ### 交易邏輯
         - 今日收盤產生訊號，明日開盤成交。
         - 不在 stop zone 進場：只允許 `entry_z < abs(z) < stop_z`。
         - 只在 crossing signal 進場，避免 z-score 長期在極端區間時反覆追單。
