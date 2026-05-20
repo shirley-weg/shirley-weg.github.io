@@ -1474,13 +1474,352 @@ def render_method_notes(settings: AppSettings) -> None:
         )
     else:
         st.markdown(
-            """
+            r"""
             ### 配對策略2(共整合法)
+
+            本策略使用 **Engle-Granger 共整合檢定** 尋找長期均衡關係較穩定的股票配對。策略核心概念是：若兩檔股票的 log price 雖然各自可能為非定態序列，但存在某一線性組合為定態序列，則代表兩者具有長期均衡關係；當 spread 偏離均衡過大時，策略預期未來會產生均值回歸。
+
+            #### 1. 策略流程簡短總結
+
             1. 每週用過去 `lookback_days` 個交易日作為 formation period。
-            2. 對所有兩兩 pair 的 log price 做 Engle-Granger 共整合檢定。
-            3. 保留 `p_value <= threshold`，再依 `coint_t` 最負排序。
-            4. 對初選 pair 做 `beta_diff < threshold` 與同產業篩選。
-            5. 單一 pair 回測時，spread 使用進場當下 formation period 估出的 OLS `alpha` 與 `hedge_ratio`。
+            2. 對股票池內所有兩兩 pair 的 log price 做雙向 Engle-Granger 共整合檢定。
+            3. 保留 `p_value <= pvalue_threshold` 的 pair，並依 `coint_t` 由小到大排序；`coint_t` 越負，代表殘差越明顯拒絕單根假設，共整合關係越強。
+            4. 對初選 pair 加上同產業條件與 beta 差距條件，只保留 `same_industry = True` 且 `beta_diff < beta_diff_threshold` 的 pair。
+            5. 單一 pair 回測時，只有當該 pair 在當週候選清單中，才允許開新倉。
+            6. 進場訊號使用進場當下 formation period 重新估計出的 OLS `alpha` 與 `hedge_ratio` 建立 spread，並將 spread 標準化成 z-score。
+            7. 今日收盤產生訊號，下一個交易日開盤成交；出場條件則由均值回歸、停損或最大持有天數決定。
+
+            #### 2. Formation period 與 log price
+
+            在每個週調倉日 $f$，取過去 $L$ 個交易日作為 formation period：
+
+            $$
+            \mathcal{F}_f = \{t=f-L, f-L+1, \dots, f-1\}
+            $$
+
+            對任意股票 $i$，先將價格轉成 log price：
+
+            $$
+            x_{i,t} = \log(P_{i,t})
+            $$
+
+            其中 $P_{i,t}$ 為股票 $i$ 在第 $t$ 日的收盤價，$x_{i,t}$ 為其對數價格。使用 log price 的原因是價格比例變化可被轉換成加法形式，較適合用於線性迴歸與 spread 建構。
+
+            #### 3. Engle-Granger 共整合檢定公式
+
+            對任意一組候選 pair $(X,Y)$，本策略在 formation period 內先估計下列 OLS 迴歸：
+
+            $$
+            x_{X,t} = \alpha_{XY} + \beta_{XY} x_{Y,t} + \varepsilon_{XY,t}
+            $$
+
+            其中：
+
+            | 符號 | 意義 |
+            |---|---|
+            | $x_{X,t}$ | 股票 $X$ 在第 $t$ 日的 log price |
+            | $x_{Y,t}$ | 股票 $Y$ 在第 $t$ 日的 log price |
+            | $\alpha_{XY}$ | OLS 截距項 |
+            | $\beta_{XY}$ | hedge ratio，也就是用 $Y$ 解釋 $X$ 的斜率係數 |
+            | $\varepsilon_{XY,t}$ | 共整合殘差，也就是 spread 的未標準化型態 |
+
+            OLS 估計量可寫為：
+
+            $$
+            \hat{\beta}_{XY}
+            =
+            \frac{
+            \sum_{t \in \mathcal{F}_f}
+            (x_{Y,t}-\bar{x}_Y)(x_{X,t}-\bar{x}_X)
+            }{
+            \sum_{t \in \mathcal{F}_f}
+            (x_{Y,t}-\bar{x}_Y)^2
+            }
+            $$
+
+            $$
+            \hat{\alpha}_{XY}
+            =
+            \bar{x}_X - \hat{\beta}_{XY}\bar{x}_Y
+            $$
+
+            估計完成後，取得殘差序列：
+
+            $$
+            \hat{\varepsilon}_{XY,t}
+            =
+            x_{X,t}
+            -
+            \hat{\alpha}_{XY}
+            -
+            \hat{\beta}_{XY}x_{Y,t}
+            $$
+
+            Engle-Granger 方法的重點是檢查殘差 $\hat{\varepsilon}_{XY,t}$ 是否為定態。若殘差為定態，代表 $X$ 與 $Y$ 雖然各自價格可能非定態，但兩者存在穩定的長期均衡關係。殘差的 ADF 檢定可表示為：
+
+            $$
+            \Delta \hat{\varepsilon}_t
+            =
+            \phi \hat{\varepsilon}_{t-1}
+            +
+            \sum_{l=1}^{q}
+            \gamma_l \Delta \hat{\varepsilon}_{t-l}
+            +
+            u_t
+            $$
+
+            假設檢定為：
+
+            $$
+            H_0: \phi = 0 \quad \text{殘差具有單根，沒有共整合關係}
+            $$
+
+            $$
+            H_1: \phi < 0 \quad \text{殘差為定態，存在共整合關係}
+            $$
+
+            因此，若 ADF 檢定得到的 `p_value` 越小，代表越有理由拒絕「沒有共整合」的虛無假設。
+
+            #### 4. 雙向共整合檢定與候選 pair 排序
+
+            因為 OLS 迴歸具有方向性，所以本策略會對同一組 pair 做雙向檢定：
+
+            $$
+            x_{X,t} = \alpha_{XY} + \beta_{XY}x_{Y,t} + \varepsilon_{XY,t}
+            $$
+
+            $$
+            x_{Y,t} = \alpha_{YX} + \beta_{YX}x_{X,t} + \varepsilon_{YX,t}
+            $$
+
+            分別取得兩個方向的檢定結果：
+
+            $$
+            (coint\_t_{XY}, p_{XY}), \quad (coint\_t_{YX}, p_{YX})
+            $$
+
+            程式會選擇 p-value 較小的方向作為該 pair 的共整合強度代表：
+
+            $$
+            p^*_{XY} = \min(p_{XY}, p_{YX})
+            $$
+
+            $$
+            coint\_t^*_{XY}
+            =
+            \begin{cases}
+            coint\_t_{XY}, & \text{if } p_{XY} \le p_{YX} \\
+            coint\_t_{YX}, & \text{if } p_{YX} < p_{XY}
+            \end{cases}
+            $$
+
+            初步候選 pair 集合定義為：
+
+            $$
+            \mathcal{C}_0
+            =
+            \left\{
+            (X,Y):
+            p^*_{XY} \le pvalue\_threshold,
+            \; n_{XY} \ge min\_obs
+            \right\}
+            $$
+
+            接著依照 $coint\_t^*_{XY}$ 由小到大排序：
+
+            $$
+            coint\_t^*_{(1)}
+            \le
+            coint\_t^*_{(2)}
+            \le
+            \cdots
+            \le
+            coint\_t^*_{(m)}
+            $$
+
+            由於 `coint_t` 越負代表殘差越接近定態，因此排序越前面的 pair 代表共整合關係越強。
+
+            #### 5. Beta 與同產業篩選公式
+
+            為避免兩檔股票暴露於差異過大的市場風險，本策略會估計每檔股票相對大盤的 beta。先計算個股與大盤的 log return：
+
+            $$
+            r_{i,t} = \Delta \log(P_{i,t})
+            =
+            \log(P_{i,t}) - \log(P_{i,t-1})
+            $$
+
+            $$
+            r_{M,t} = \Delta \log(M_t)
+            =
+            \log(M_t) - \log(M_{t-1})
+            $$
+
+            其中 $M_t$ 為大盤指數價格。股票 $i$ 的 beta 定義為：
+
+            $$
+            \beta_i
+            =
+            \frac{Cov(r_{i,t}, r_{M,t})}{Var(r_{M,t})}
+            $$
+
+            對 pair $(X,Y)$，beta 差距為：
+
+            $$
+            beta\_diff_{XY}
+            =
+            |\beta_X - \beta_Y|
+            $$
+
+            最終候選 pair 集合為：
+
+            $$
+            \mathcal{C}_{final}
+            =
+            \left\{
+            (X,Y) \in \mathcal{C}_0:
+            Industry_X = Industry_Y,
+            \;
+            |\beta_X - \beta_Y| < beta\_diff\_threshold
+            \right\}
+            $$
+
+            最後再從 $\mathcal{C}_{final}$ 中取排序前 `k_final` 組 pair，作為該週允許交易的候選清單。
+
+            #### 6. Spread 與 z-score 建構
+
+            在單一 pair 回測中，若 pair $(X,Y)$ 在當週候選清單中，策略會使用該週 formation period 重新估計 OLS：
+
+            $$
+            x_{X,t} = \alpha + h x_{Y,t} + \varepsilon_t
+            $$
+
+            其中 $h$ 即程式中的 `hedge_ratio`。spread 定義為：
+
+            $$
+            S_t = x_{X,t} - \alpha - h x_{Y,t}
+            $$
+
+            在 formation period 內計算 spread 的平均數與標準差：
+
+            $$
+            \mu_S
+            =
+            \frac{1}{L}
+            \sum_{t \in \mathcal{F}_f}
+            S_t
+            $$
+
+            $$
+            \sigma_S
+            =
+            \sqrt{
+            \frac{1}{L}
+            \sum_{t \in \mathcal{F}_f}
+            (S_t-\mu_S)^2
+            }
+            $$
+
+            每日交易訊號使用 z-score 衡量 spread 偏離均衡的程度：
+
+            $$
+            z_t
+            =
+            \frac{S_t - \mu_S}{\sigma_S}
+            $$
+
+            若 $z_t$ 為正且偏高，代表 $X$ 相對於 $Y$ 偏貴，策略傾向放空 spread；若 $z_t$ 為負且偏低，代表 $X$ 相對於 $Y$ 偏便宜，策略傾向做多 spread。
+
+            #### 7. 進出場方向與部位權重
+
+            設進場方向為 $d_t$：
+
+            $$
+            d_t =
+            \begin{cases}
+            -1, & z_{t-1} \le entry\_z \text{ 且 } entry\_z < z_t < stop\_z \\
+            +1, & z_{t-1} \ge -entry\_z \text{ 且 } -stop\_z < z_t < -entry\_z
+            \end{cases}
+            $$
+
+            其中：
+
+            - $d_t=-1$：spread 過高，放空 spread，也就是放空 $X$、做多 $Y$。
+            - $d_t=+1$：spread 過低，做多 spread，也就是做多 $X$、放空 $Y$。
+
+            由於 spread 為 $S_t=x_{X,t}-\alpha-hx_{Y,t}$，未標準化的 pair 權重可寫為：
+
+            $$
+            raw_X = 1, \quad raw_Y = -h
+            $$
+
+            程式會用 gross exposure 做正規化：
+
+            $$
+            G = |1| + |h|
+            $$
+
+            因此實際交易權重為：
+
+            $$
+            w_X = d_t \frac{1}{G}
+            $$
+
+            $$
+            w_Y = d_t \frac{-h}{G}
+            $$
+
+            若目前資金為 $V_t$，則兩檔股票的下單金額為：
+
+            $$
+            Dollar_X = V_t w_X
+            $$
+
+            $$
+            Dollar_Y = V_t w_Y
+            $$
+
+            股數則為：
+
+            $$
+            Shares_X = \frac{Dollar_X}{Open_{X,t+1}}
+            $$
+
+            $$
+            Shares_Y = \frac{Dollar_Y}{Open_{Y,t+1}}
+            $$
+
+            也就是今日收盤確認訊號後，在下一個交易日開盤價成交。
+
+            #### 8. 出場條件
+
+            持倉後每天用進場當下估計的 spread 參數持續計算 $z_t$。若符合以下任一條件，則於下一個交易日開盤出場：
+
+            $$
+            |z_t| < exit\_z
+            \quad \Rightarrow \quad
+            \text{均值回歸出場}
+            $$
+
+            $$
+            |z_t| > stop\_z
+            \quad \Rightarrow \quad
+            \text{停損出場}
+            $$
+
+            $$
+            holding\_days \ge max\_holding\_days
+            \quad \Rightarrow \quad
+            \text{最大持有天數出場}
+            $$
+
+            若發生 stop loss，策略會暫停重新進場，直到：
+
+            $$
+            |z_t| < reentry\_reset\_z
+            $$
+
+            才重新允許該 pair 產生新的進場訊號。這樣可以避免 spread 持續發散時反覆進場，降低連續停損風險。
             """
         )
     st.markdown(
