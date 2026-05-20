@@ -1145,15 +1145,109 @@ def show_summary_metrics(summary_df: pd.DataFrame) -> None:
     c8.metric("Initial Capital", f"{float(row['initial_capital']):,.0f}" if "initial_capital" in row and pd.notna(row["initial_capital"]) else "NA")
 
 
+
+# ============================================================
+# Safe Output Helpers for Streamlit / Excel
+# ============================================================
+
+def _is_missing_scalar(value: object) -> bool:
+    """Return True only for scalar missing values; lists/dicts/arrays are not treated as scalars."""
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(missing, (bool, np.bool_)):
+        return bool(missing)
+    return False
+
+
+def _format_mixed_cell_for_display(value: object) -> str:
+    """
+    Convert object-dtype values into a single Arrow-safe string representation.
+
+    Streamlit uses PyArrow to render dataframes. If a single object column contains
+    mixed Python types, for example strings mixed with numbers, lists, dicts, dates,
+    or None, PyArrow may raise ArrowInvalid. Converting only object-like columns to
+    strings keeps numeric/datetime columns usable while preventing the red error box.
+    """
+    if _is_missing_scalar(value):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return ""
+        return value.strftime("%Y-%m-%d") if value.time() == pd.Timestamp(0).time() else value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, np.datetime64):
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return ""
+        return ts.strftime("%Y-%m-%d") if ts.time() == pd.Timestamp(0).time() else ts.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, (list, tuple, set, dict, np.ndarray)):
+        return str(value)
+    return str(value)
+
+
+def prepare_dataframe_for_output(obj: pd.DataFrame | pd.Series | object) -> pd.DataFrame:
+    """
+    Make a DataFrame safe for Streamlit display and Excel export.
+
+    Key fix: object/categorical/timedelta columns are converted to strings so PyArrow
+    no longer needs to infer a single incompatible type from mixed Python objects.
+    """
+    if obj is None:
+        return pd.DataFrame()
+    if isinstance(obj, pd.Series):
+        df = obj.to_frame(obj.name or "value").copy()
+    elif isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    else:
+        try:
+            df = pd.DataFrame(obj).copy()
+        except Exception:
+            df = pd.DataFrame({"value": [_format_mixed_cell_for_display(obj)]})
+
+    df.columns = [str(c) for c in df.columns]
+    if df.empty:
+        return df
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    for col in df.columns:
+        s = df[col]
+
+        if pd.api.types.is_datetime64_any_dtype(s):
+            dt = pd.to_datetime(s, errors="coerce")
+            try:
+                if getattr(dt.dt, "tz", None) is not None:
+                    dt = dt.dt.tz_localize(None)
+            except Exception:
+                pass
+            df[col] = dt.astype("datetime64[ns]")
+            continue
+
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_categorical_dtype(s) or pd.api.types.is_timedelta64_dtype(s):
+            df[col] = s.map(_format_mixed_cell_for_display).astype("string")
+            continue
+
+    return df
+
+
+def safe_streamlit_dataframe(obj: pd.DataFrame | pd.Series | object, **kwargs) -> None:
+    """Display a dataframe without PyArrow type-inference crashes."""
+    try:
+        st.dataframe(prepare_dataframe_for_output(obj), **kwargs)
+    except Exception:
+        fallback = prepare_dataframe_for_output(obj).astype("string")
+        st.dataframe(fallback, **kwargs)
+
 def df_to_excel_bytes(sheets: dict[str, pd.DataFrame | pd.Series]) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for name, obj in sheets.items():
             safe_name = str(name)[:31]
-            if isinstance(obj, pd.Series):
-                obj.to_frame(obj.name or "value").to_excel(writer, sheet_name=safe_name)
-            elif isinstance(obj, pd.DataFrame):
-                obj.to_excel(writer, sheet_name=safe_name, index=True)
+            df = prepare_dataframe_for_output(obj)
+            df.to_excel(writer, sheet_name=safe_name, index=True)
     output.seek(0)
     return output.getvalue()
 
@@ -1304,7 +1398,7 @@ def render_pair_selection_tab(settings: AppSettings) -> None:
     st.subheader("① 選股 / 選 Pair")
     universe = get_universe_by_industry(settings.industry)
     st.write(f"目前股票池：**{settings.industry}**，共 **{len(universe)}** 檔。")
-    st.dataframe(universe[["code", "name", "industry", "ticker_yf"]], use_container_width=True, hide_index=True)
+    safe_streamlit_dataframe(universe[["code", "name", "industry", "ticker_yf"]], use_container_width=True, hide_index=True)
 
     ref_date = st.date_input("選 Pair 參考日期：使用此日期前的 rolling formation 選 pair", value=settings.trading_start.date())
     run_screen = st.button("執行選股 / 選 Pair", type="primary", use_container_width=True)
@@ -1359,7 +1453,7 @@ def render_pair_selection_tab(settings: AppSettings) -> None:
     for col in ["distance", "coint_t", "p_value", "beta_x", "beta_y", "beta_diff"]:
         if col in show.columns:
             show[col] = pd.to_numeric(show[col], errors="coerce").round(6)
-    st.dataframe(show[display_cols], use_container_width=True, hide_index=True)
+    safe_streamlit_dataframe(show[display_cols], use_container_width=True, hide_index=True)
 
     labels = []
     for idx, row in final_candidates.iterrows():
@@ -1440,13 +1534,13 @@ def render_backtest_tab(settings: AppSettings) -> None:
         st.plotly_chart(plot_trade_pnl(trades_df), use_container_width=True)
     with table_tab:
         st.markdown("#### 交易紀錄")
-        st.dataframe(trades_df, use_container_width=True, hide_index=True)
+        safe_streamlit_dataframe(trades_df, use_container_width=True, hide_index=True)
         st.markdown("#### 每週選股狀態")
-        st.dataframe(result["weekly_summary"], use_container_width=True, hide_index=True)
+        safe_streamlit_dataframe(result["weekly_summary"], use_container_width=True, hide_index=True)
         st.markdown("#### 歷史候選 pair")
-        st.dataframe(result["selected_pairs_history"], use_container_width=True, hide_index=True)
+        safe_streamlit_dataframe(result["selected_pairs_history"], use_container_width=True, hide_index=True)
         st.markdown("#### Z-score / eligible 狀態")
-        st.dataframe(z_df, use_container_width=True)
+        safe_streamlit_dataframe(z_df, use_container_width=True)
 
     excel_bytes = df_to_excel_bytes({
         "summary": result["summary"],
@@ -2482,6 +2576,43 @@ def strategy3_create_positions(alpha: pd.DataFrame, price_df: pd.DataFrame, top_
     return positions.sort_values(["formation_date", "position_rank"]).reset_index(drop=True)
 
 
+
+def strategy3_latest_month_holdings(positions: pd.DataFrame) -> pd.DataFrame:
+    """Return the most recent monthly holding list from the generated positions table."""
+    if positions is None or positions.empty:
+        return pd.DataFrame()
+
+    df = positions.copy()
+    date_col = "formation_date" if "formation_date" in df.columns else "holding_start" if "holding_start" in df.columns else None
+    if date_col is None:
+        return df.reset_index(drop=True)
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    latest_date = df[date_col].max()
+    if pd.isna(latest_date):
+        return pd.DataFrame()
+
+    latest = df[df[date_col] == latest_date].copy()
+
+    sort_cols = [c for c in ["position_rank", "alpha_rank", "rank_in_top150"] if c in latest.columns]
+    if sort_cols:
+        latest = latest.sort_values(sort_cols, ascending=True)
+    elif "alpha" in latest.columns:
+        latest = latest.sort_values("alpha", ascending=False)
+
+    preferred_cols = [
+        "formation_date", "holding_start", "holding_end",
+        "position_rank", "stock_id", "stock_name", "target_weight",
+        "alpha", "alpha_annualized", "pvalue_alpha", "alpha_rank", "rank_in_top150",
+        "beta_mkt", "beta_smb", "beta_hml", "beta_rmw", "beta_cma",
+        "r2", "adj_r2", "n_obs",
+    ]
+    display_cols = [c for c in preferred_cols if c in latest.columns]
+    if display_cols:
+        latest = latest[display_cols]
+
+    return latest.reset_index(drop=True)
+
 def strategy3_run_backtest(
     positions: pd.DataFrame,
     price_df: pd.DataFrame,
@@ -3235,6 +3366,8 @@ def render_strategy3_page() -> None:
                     if positions.empty:
                         st.error("沒有成功產生持股清單，請檢查 alpha scores 與 price data。")
                     else:
+                        latest_positions = strategy3_latest_month_holdings(positions)
+
                         with st.spinner("執行 t+1 收盤價回測..."):
                             nav_df, trades_df, rebalance_df = strategy3_run_backtest(
                                 positions=positions,
@@ -3259,6 +3392,7 @@ def render_strategy3_page() -> None:
                             "regression_panel": raw_result["regression_panel"],
                             "file_manifest": raw_result["file_manifest"],
                             "positions": positions,
+                            "latest_positions": latest_positions,
                             "nav_df": nav_df,
                             "trades_df": trades_df,
                             "rebalance_df": rebalance_df,
@@ -3292,11 +3426,12 @@ def render_strategy3_page() -> None:
             st.plotly_chart(strategy3_plot_drawdown(nav_df, settings_used.top_n, settings_used.benchmark_ticker), use_container_width=True)
 
             st.markdown("#### 績效比較表")
-            st.dataframe(perf, use_container_width=True, hide_index=True)
+            safe_streamlit_dataframe(perf, use_container_width=True, hide_index=True)
 
             excel_bytes = df_to_excel_bytes({
                 "performance": perf,
                 "nav": nav_df,
+                "latest_holdings": result.get("latest_positions", strategy3_latest_month_holdings(positions)),
                 "positions": positions,
                 "trades": trades_df,
                 "rebalance": rebalance_df,
@@ -3319,31 +3454,47 @@ def render_strategy3_page() -> None:
             st.info("請先到「回測結果」執行策略3回測。")
         else:
             positions = result["positions"]
+            latest_positions = result.get("latest_positions", strategy3_latest_month_holdings(positions))
             trades_df = result["trades_df"]
             rebalance_df = result["rebalance_df"]
             nav_df = result["nav_df"]
 
+            st.markdown("#### 最新月份持股名單")
+            if latest_positions.empty:
+                st.info("目前沒有可顯示的最新月份持股名單。")
+            else:
+                latest_date = None
+                if "formation_date" in latest_positions.columns:
+                    latest_date = pd.to_datetime(latest_positions["formation_date"], errors="coerce").max()
+                elif "holding_start" in latest_positions.columns:
+                    latest_date = pd.to_datetime(latest_positions["holding_start"], errors="coerce").max()
+                if pd.notna(latest_date):
+                    st.caption(f"最新月份：{pd.Timestamp(latest_date).strftime('%Y-%m-%d')}；持股數：{len(latest_positions)}")
+                safe_streamlit_dataframe(latest_positions, use_container_width=True, hide_index=True)
+
+            st.divider()
+
             st.markdown("#### 每月 Alpha Top N 成分股")
-            st.dataframe(positions, use_container_width=True, hide_index=True)
+            safe_streamlit_dataframe(positions, use_container_width=True, hide_index=True)
 
             st.markdown("#### 交易紀錄")
-            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+            safe_streamlit_dataframe(trades_df, use_container_width=True, hide_index=True)
 
             st.markdown("#### 調倉摘要")
-            st.dataframe(rebalance_df, use_container_width=True, hide_index=True)
+            safe_streamlit_dataframe(rebalance_df, use_container_width=True, hide_index=True)
 
             st.markdown("#### NAV 明細")
-            st.dataframe(nav_df, use_container_width=True, hide_index=True)
+            safe_streamlit_dataframe(nav_df, use_container_width=True, hide_index=True)
 
             with st.expander("原始資料與前置作業輸出"):
                 st.markdown("#### Raw data files")
-                st.dataframe(result["file_manifest"], use_container_width=True, hide_index=True)
+                safe_streamlit_dataframe(result["file_manifest"], use_container_width=True, hide_index=True)
                 st.markdown("#### Alpha scores")
-                st.dataframe(result["alpha"], use_container_width=True, hide_index=True)
+                safe_streamlit_dataframe(result["alpha"], use_container_width=True, hide_index=True)
                 st.markdown("#### FF5 factor returns")
-                st.dataframe(result["ff5"], use_container_width=True, hide_index=True)
+                safe_streamlit_dataframe(result["ff5"], use_container_width=True, hide_index=True)
                 st.markdown("#### Top 150 formation characteristics")
-                st.dataframe(result["formations"], use_container_width=True, hide_index=True)
+                safe_streamlit_dataframe(result["formations"], use_container_width=True, hide_index=True)
 
     with tabs[2]:
         render_strategy3_notes()
