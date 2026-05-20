@@ -1307,10 +1307,6 @@ def render_strategy_selector() -> None:
             st.session_state["selected_strategy"] = "ff5_alpha"
             st.rerun()
 
-    st.info(
-        "策略1/2：先在「選股 / 選 Pair」產生候選清單，再進行單一 pair rolling 回測。"
-        "策略3：使用 Colab 產出的 alpha_scores 與 AD PRICE CSV/XLSX，直接產生 Top N 持股與回測。"
-    )
 
 def sidebar_settings(strategy: StrategyName) -> AppSettings:
     if st.sidebar.button("返回策略選擇"):
