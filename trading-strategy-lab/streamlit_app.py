@@ -2548,12 +2548,12 @@ $$
 
 年化 alpha 主要是為了方便解釋其經濟意義；若只是用 alpha 進行股票排序，是否年化不會改變排名，因為所有股票都乘上相同常數 252。
 
-#### GitHub 資料準備
+#### GitHub 資料
 
 **網站必要 CSV**
 
 - `alpha_scores_ff5_top150.csv`
-- `cmoney_daily_adjusted_price.csv`，或將多個 `.xlsx` / `.csv` 放在 `ad_price/` 資料夾
+- `cmoney_daily_adjusted_price.csv`
 
 **alpha_scores_ff5_top150.csv 必要欄位**
 
@@ -2571,51 +2571,6 @@ $$
 
     st.markdown(
         """
-### GitHub 上傳步驟
-
-1. 在專案根目錄建立資料夾：
-   ```text
-   data/strategy3/
-   ```
-
-2. 把 Colab 產出的 alpha 檔放進去：
-   ```text
-   data/strategy3/alpha_scores_ff5_top150.csv
-   ```
-
-3. 把 AD PRICE 還原收盤價資料整理成一個 CSV 後放進去：
-   ```text
-   data/strategy3/cmoney_daily_adjusted_price.csv
-   ```
-
-4. 你的 GitHub repo 建議結構：
-   ```text
-   your-repo/
-   ├── app.py
-   ├── requirements.txt
-   └── data/
-       └── strategy3/
-           ├── alpha_scores_ff5_top150.csv
-           └── cmoney_daily_adjusted_price.csv
-   ```
-
-5. `requirements.txt` 至少需要：
-   ```text
-   streamlit
-   pandas
-   numpy
-   plotly
-   statsmodels
-   yfinance
-   openpyxl
-   ```
-
-6. 如果 CSV 超過 GitHub 單檔 100MB 限制，建議：
-   - 使用 Git LFS；
-   - 或把 AD PRICE 分年放在 `data/strategy3/ad_price/` 資料夾，網站路徑填資料夾；支援 `.csv`、`.xlsx`、`.xls`；
-   - 或改用 Streamlit Cloud secrets / 外部雲端資料源。
-        """
-    )
 
 
 def render_strategy3_page() -> None:
