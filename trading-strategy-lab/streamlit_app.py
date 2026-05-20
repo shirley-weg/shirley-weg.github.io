@@ -1747,49 +1747,7 @@ def render_method_notes(settings: AppSettings) -> None:
             - $d_t=-1$：spread 過高，放空 spread，也就是放空 $X$、做多 $Y$。
             - $d_t=+1$：spread 過低，做多 spread，也就是做多 $X$、放空 $Y$。
 
-            由於 spread 為 $S_t=x_{X,t}-\alpha-hx_{Y,t}$，未標準化的 pair 權重可寫為：
-
-            $$
-            raw_X = 1, \quad raw_Y = -h
-            $$
-
-            程式會用 gross exposure 做正規化：
-
-            $$
-            G = |1| + |h|
-            $$
-
-            因此實際交易權重為：
-
-            $$
-            w_X = d_t \frac{1}{G}
-            $$
-
-            $$
-            w_Y = d_t \frac{-h}{G}
-            $$
-
-            若目前資金為 $V_t$，則兩檔股票的下單金額為：
-
-            $$
-            Dollar_X = V_t w_X
-            $$
-
-            $$
-            Dollar_Y = V_t w_Y
-            $$
-
-            股數則為：
-
-            $$
-            Shares_X = \frac{Dollar_X}{Open_{X,t+1}}
-            $$
-
-            $$
-            Shares_Y = \frac{Dollar_Y}{Open_{Y,t+1}}
-            $$
-
-            也就是今日收盤確認訊號後，在下一個交易日開盤價成交。
+         
 
             #### 8. 出場條件
 
