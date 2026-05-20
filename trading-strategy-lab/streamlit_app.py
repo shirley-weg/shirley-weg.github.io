@@ -1206,7 +1206,7 @@ def render_strategy_selector() -> None:
         st.markdown(
             """
             <div class="strategy-card">
-              <h3>策略3(台股五因子 Alpha 月調倉策略)</h3>
+              <h3>策略3(台股五因子 月調倉策略)</h3>
               <p>
                 使用已建構好的台股五因子 rolling regression alpha，
                 每月從市值前 150 股票池中選出 Alpha Top N，
