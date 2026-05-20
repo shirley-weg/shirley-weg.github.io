@@ -1268,8 +1268,6 @@ def render_strategy_selector() -> None:
             <div class="strategy-card">
               <h3>配對策略1(距離法)</h3>
               <p>
-                依細產業股票池，使用標準化 log price 計算 SSD 距離，
-                篩選距離最小的 pair，再用 rolling formation 與 z-score 進行回測。
               </p>
             </div>
             """,
@@ -1285,8 +1283,6 @@ def render_strategy_selector() -> None:
             <div class="strategy-card">
               <h3>配對策略2(共整合法)</h3>
               <p>
-                依細產業股票池，使用 Engle-Granger 共整合檢定，
-                篩選 p-value 通過且 coint_t 較負的 pair，再執行 rolling 回測。
               </p>
             </div>
             """,
@@ -1302,9 +1298,6 @@ def render_strategy_selector() -> None:
             <div class="strategy-card">
               <h3>策略3(台股五因子 月調倉策略)</h3>
               <p>
-                使用已建構好的台股五因子 rolling regression alpha，
-                每月從市值前 150 股票池中選出 Alpha Top N，
-                以 t+1 收盤價調倉並與 0050 benchmark 比較。
               </p>
             </div>
             """,
