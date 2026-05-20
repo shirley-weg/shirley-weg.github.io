@@ -1463,13 +1463,308 @@ def render_method_notes(settings: AppSettings) -> None:
     st.subheader("③ 方法說明")
     if settings.strategy == "distance":
         st.markdown(
-            """
+            r"""
             ### 配對策略1(距離法)
+
+            本策略使用 **Distance Method（距離法）** 尋找價格走勢相似的股票配對。策略核心概念是：若兩檔股票在 formation period 內的標準化 log price 走勢非常接近，則兩者可能具有短期相對價格均值回歸特性；當兩者的標準化價差偏離過大時，策略預期未來價差會收斂。
+
+            #### 1. 策略流程簡短總結
+
             1. 每週用過去 `lookback_days` 個交易日作為 formation period。
-            2. 對每檔股票取 log price 後標準化。
-            3. 對所有兩兩 pair 計算 `SSD = sum((Z_X - Z_Y)^2)`。
-            4. 先取 SSD 最小的初選 pair，再做 `beta_diff < threshold` 與同產業篩選。
-            5. 單一 pair 回測時，只有當該 pair 在當週候選清單中，才允許開新倉。
+            2. 對股票池內每檔股票取 log price，並在 formation period 內做標準化。
+            3. 對所有兩兩 pair 計算標準化價格距離，也就是 `SSD = sum((Z_X - Z_Y)^2)`。
+            4. 先依 SSD 由小到大排序，取距離最小的前 `preselect_n` 組 pair 作為初選清單。
+            5. 對初選 pair 加上同產業條件與 beta 差距條件，只保留 `same_industry = True` 且 `beta_diff < beta_diff_threshold` 的 pair。
+            6. 單一 pair 回測時，只有當該 pair 在當週候選清單中，才允許開新倉。
+            7. 進場訊號使用進場當下 formation period 重新計算出的標準化參數建立 spread，並將 spread 轉成 z-score。
+            8. 今日收盤產生訊號，下一個交易日開盤成交；出場條件則由均值回歸、停損或最大持有天數決定。
+
+            #### 2. Formation period 與 log price
+
+            在每個週調倉日 $f$，取過去 $L$ 個交易日作為 formation period：
+
+            $$
+            \mathcal{F}_f = \{t=f-L, f-L+1, \dots, f-1\}
+            $$
+
+            對任意股票 $i$，先將價格轉成 log price：
+
+            $$
+            x_{i,t} = \log(P_{i,t})
+            $$
+
+            其中 $P_{i,t}$ 為股票 $i$ 在第 $t$ 日的收盤價，$x_{i,t}$ 為其對數價格。使用 log price 可以降低不同股價水準造成的尺度差異，並讓價格比例變化轉換成加法形式。
+
+            #### 3. 標準化價格序列
+
+            距離法不能直接比較原始股價，因為不同股票的價格水準可能差異很大。因此本策略會在 formation period 內，對每檔股票的 log price 做 z-score 標準化。
+
+            股票 $i$ 在 formation period 內的平均 log price 為：
+
+            $$
+            \mu_i
+            =
+            \frac{1}{L}
+            \sum_{t \in \mathcal{F}_f}
+            x_{i,t}
+            $$
+
+            標準差為：
+
+            $$
+            \sigma_i
+            =
+            \sqrt{
+            \frac{1}{L}
+            \sum_{t \in \mathcal{F}_f}
+            (x_{i,t}-\mu_i)^2
+            }
+            $$
+
+            標準化後的價格序列定義為：
+
+            $$
+            Z_{i,t}
+            =
+            \frac{x_{i,t}-\mu_i}{\sigma_i}
+            $$
+
+            標準化後，每檔股票在 formation period 內都被轉成平均數約為 0、標準差約為 1 的序列，因此可以公平比較兩檔股票的相對走勢是否接近。
+
+            #### 4. Pair distance / SSD 計算公式
+
+            對任意一組候選 pair $(X,Y)$，本策略計算兩檔股票標準化 log price 的平方距離總和：
+
+            $$
+            SSD_{XY}
+            =
+            \sum_{t \in \mathcal{F}_f}
+            (Z_{X,t} - Z_{Y,t})^2
+            $$
+
+            其中：
+
+            | 符號 | 意義 |
+            |---|---|
+            | $Z_{X,t}$ | 股票 $X$ 在第 $t$ 日的標準化 log price |
+            | $Z_{Y,t}$ | 股票 $Y$ 在第 $t$ 日的標準化 log price |
+            | $SSD_{XY}$ | pair $(X,Y)$ 的距離分數 |
+
+            $SSD_{XY}$ 越小，代表兩檔股票在 formation period 內的標準化價格走勢越接近，也就是歷史相對價格關係越穩定。
+
+            初步候選 pair 集合可表示為先對所有 pair 的 SSD 排序：
+
+            $$
+            SSD_{(1)}
+            \le
+            SSD_{(2)}
+            \le
+            \cdots
+            \le
+            SSD_{(m)}
+            $$
+
+            再取前 `preselect_n` 組作為初選集合：
+
+            $$
+            \mathcal{C}_0
+            =
+            \left\{
+            (X,Y):
+            rank(SSD_{XY}) \le preselect\_n,
+            \; n_{XY} \ge min\_obs
+            \right\}
+            $$
+
+            #### 5. Beta 與同產業篩選公式
+
+            為避免兩檔股票雖然價格走勢接近，但實際市場風險暴露差異太大，本策略會估計每檔股票相對大盤的 beta。先計算個股與大盤的 log return：
+
+            $$
+            r_{i,t} = \Delta \log(P_{i,t})
+            =
+            \log(P_{i,t}) - \log(P_{i,t-1})
+            $$
+
+            $$
+            r_{M,t} = \Delta \log(M_t)
+            =
+            \log(M_t) - \log(M_{t-1})
+            $$
+
+            其中 $M_t$ 為大盤指數價格。股票 $i$ 的 beta 定義為：
+
+            $$
+            \beta_i
+            =
+            \frac{Cov(r_{i,t}, r_{M,t})}{Var(r_{M,t})}
+            $$
+
+            對 pair $(X,Y)$，beta 差距為：
+
+            $$
+            beta\_diff_{XY}
+            =
+            |\beta_X - \beta_Y|
+            $$
+
+            最終候選 pair 集合為：
+
+            $$
+            \mathcal{C}_{final}
+            =
+            \left\{
+            (X,Y) \in \mathcal{C}_0:
+            Industry_X = Industry_Y,
+            \;
+            |\beta_X - \beta_Y| < beta\_diff\_threshold
+            \right\}
+            $$
+
+            最後再從 $\mathcal{C}_{final}$ 中取排序前 `k_final` 組 pair，作為該週允許交易的候選清單。
+
+            #### 6. Spread 與 z-score 建構
+
+            在單一 pair 回測中，若 pair $(X,Y)$ 在當週候選清單中，策略會使用該週 formation period 重新計算 $X$ 與 $Y$ 的標準化參數：
+
+            $$
+            Z_{X,t}
+            =
+            \frac{x_{X,t}-\mu_X}{\sigma_X}
+            $$
+
+            $$
+            Z_{Y,t}
+            =
+            \frac{x_{Y,t}-\mu_Y}{\sigma_Y}
+            $$
+
+            距離法的 spread 定義為兩檔股票標準化 log price 的差：
+
+            $$
+            S_t = Z_{X,t} - Z_{Y,t}
+            $$
+
+            在 formation period 內計算 spread 的平均數與標準差：
+
+            $$
+            \mu_S
+            =
+            \frac{1}{L}
+            \sum_{t \in \mathcal{F}_f}
+            S_t
+            $$
+
+            $$
+            \sigma_S
+            =
+            \sqrt{
+            \frac{1}{L}
+            \sum_{t \in \mathcal{F}_f}
+            (S_t-\mu_S)^2
+            }
+            $$
+
+            每日交易訊號使用 z-score 衡量 spread 偏離均衡的程度：
+
+            $$
+            z_t
+            =
+            \frac{S_t - \mu_S}{\sigma_S}
+            $$
+
+            若 $z_t$ 為正且偏高，代表 $X$ 的標準化價格相對於 $Y$ 偏高，策略傾向放空 spread；若 $z_t$ 為負且偏低，代表 $X$ 的標準化價格相對於 $Y$ 偏低，策略傾向做多 spread。
+
+            #### 7. 進出場方向與部位權重
+
+            設進場方向為 $d_t$：
+
+            $$
+            d_t =
+            \begin{cases}
+            -1, & z_{t-1} \le entry\_z \text{ 且 } entry\_z < z_t < stop\_z \\
+            +1, & z_{t-1} \ge -entry\_z \text{ 且 } -stop\_z < z_t < -entry\_z
+            \end{cases}
+            $$
+
+            其中：
+
+            - $d_t=-1$：spread 過高，放空 spread，也就是放空 $X$、做多 $Y$。
+            - $d_t=+1$：spread 過低，做多 spread，也就是做多 $X$、放空 $Y$。
+
+            距離法的 spread 為 $S_t=Z_{X,t}-Z_{Y,t}$，因此未標準化的 pair 權重可寫為：
+
+            $$
+            raw_X = 1, \quad raw_Y = -1
+            $$
+
+            程式會用 gross exposure 做正規化：
+
+            $$
+            G = |1| + |-1| = 2
+            $$
+
+            因此實際交易權重為：
+
+            $$
+            w_X = d_t \frac{1}{2}
+            $$
+
+            $$
+            w_Y = d_t \frac{-1}{2}
+            $$
+
+            若目前資金為 $V_t$，則兩檔股票的下單金額為：
+
+            $$
+            Dollar_X = V_t w_X
+            $$
+
+            $$
+            Dollar_Y = V_t w_Y
+            $$
+
+            股數則為：
+
+            $$
+            Shares_X = \frac{Dollar_X}{Open_{X,t+1}}
+            $$
+
+            $$
+            Shares_Y = \frac{Dollar_Y}{Open_{Y,t+1}}
+            $$
+
+            也就是今日收盤確認訊號後，在下一個交易日開盤價成交。
+
+            #### 8. 出場條件
+
+            持倉後每天用進場當下估計的 spread 參數持續計算 $z_t$。若符合以下任一條件，則於下一個交易日開盤出場：
+
+            $$
+            |z_t| < exit\_z
+            \quad \Rightarrow \quad
+            \text{均值回歸出場}
+            $$
+
+            $$
+            |z_t| > stop\_z
+            \quad \Rightarrow \quad
+            \text{停損出場}
+            $$
+
+            $$
+            holding\_days \ge max\_holding\_days
+            \quad \Rightarrow \quad
+            \text{最大持有天數出場}
+            $$
+
+            若發生 stop loss，策略會暫停重新進場，直到：
+
+            $$
+            |z_t| < reentry\_reset\_z
+            $$
+
+            才重新允許該 pair 產生新的進場訊號。這樣可以避免 spread 持續發散時反覆進場，降低連續停損風險。
             """
         )
     else:
@@ -1747,7 +2042,49 @@ def render_method_notes(settings: AppSettings) -> None:
             - $d_t=-1$：spread 過高，放空 spread，也就是放空 $X$、做多 $Y$。
             - $d_t=+1$：spread 過低，做多 spread，也就是做多 $X$、放空 $Y$。
 
-         
+            由於 spread 為 $S_t=x_{X,t}-\alpha-hx_{Y,t}$，未標準化的 pair 權重可寫為：
+
+            $$
+            raw_X = 1, \quad raw_Y = -h
+            $$
+
+            程式會用 gross exposure 做正規化：
+
+            $$
+            G = |1| + |h|
+            $$
+
+            因此實際交易權重為：
+
+            $$
+            w_X = d_t \frac{1}{G}
+            $$
+
+            $$
+            w_Y = d_t \frac{-h}{G}
+            $$
+
+            若目前資金為 $V_t$，則兩檔股票的下單金額為：
+
+            $$
+            Dollar_X = V_t w_X
+            $$
+
+            $$
+            Dollar_Y = V_t w_Y
+            $$
+
+            股數則為：
+
+            $$
+            Shares_X = \frac{Dollar_X}{Open_{X,t+1}}
+            $$
+
+            $$
+            Shares_Y = \frac{Dollar_Y}{Open_{Y,t+1}}
+            $$
+
+            也就是今日收盤確認訊號後，在下一個交易日開盤價成交。
 
             #### 8. 出場條件
 
@@ -1782,7 +2119,7 @@ def render_method_notes(settings: AppSettings) -> None:
         )
     st.markdown(
         """
-        ### 交易邏輯
+        ### 共同交易邏輯
         - 今日收盤產生訊號，明日開盤成交。
         - 不在 stop zone 進場：只允許 `entry_z < abs(z) < stop_z`。
         - 只在 crossing signal 進場，避免 z-score 長期在極端區間時反覆追單。
