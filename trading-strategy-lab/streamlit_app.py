@@ -3015,12 +3015,12 @@ def strategy3_build_raw_pipeline_cached(
     end_date: pd.Timestamp | str | None = BACKTEST_END_DEFAULT,
 ) -> dict[str, pd.DataFrame]:
     """
-    Build Strategy 3 raw outputs.
+    Build Strategy 3 raw outputs using strategy3_ff5_pipeline.py.
 
-    First tries the external strategy3_ff5_pipeline. If that pipeline fails with
-    KeyError('stock_id') or another column-name related issue, automatically
-    falls back to an internal robust pipeline that normalizes CMoney column
-    names such as 證券代碼 / 股票代號 into stock_id.
+    Important:
+    - This version does NOT silently replace the FF5 pipeline with a simplified fallback.
+    - It validates that DATA/price/formations/ff5/alpha_scores are actually produced.
+    - If raw CMoney formats differ, fix strategy3_ff5_pipeline.py; do not hide the error.
     """
     raw_dir = resolve_strategy3_path(raw_data_path)
     config = FF5RawBuildConfig(
@@ -3031,54 +3031,47 @@ def strategy3_build_raw_pipeline_cached(
         end_date=end_date,
     )
 
-    try:
-        raw_result = run_ff5_raw_pipeline(raw_dir, config)
-        if not isinstance(raw_result, dict):
-            raise ValueError("strategy3_ff5_pipeline 回傳格式不是 dict。")
+    raw_result = run_ff5_raw_pipeline(raw_dir, config)
+    if not isinstance(raw_result, dict):
+        raise ValueError("strategy3_ff5_pipeline 回傳格式不是 dict。")
 
-        # Validate early, so downstream does not fail with a vague KeyError.
-        if "alpha_scores" in raw_result:
-            raw_result["alpha_scores"] = strategy3_normalize_alpha(raw_result["alpha_scores"])
-        if "price_df" in raw_result:
-            raw_result["price_df"] = strategy3_normalize_price(raw_result["price_df"])
+    required_keys = ["alpha_scores", "price_df", "formations", "ff5"]
+    missing_keys = [k for k in required_keys if k not in raw_result]
+    if missing_keys:
+        raise ValueError(f"strategy3_ff5_pipeline 缺少輸出：{missing_keys}")
 
-        required = ["alpha_scores", "price_df"]
-        missing = [k for k in required if k not in raw_result]
-        if missing:
-            raise ValueError(f"strategy3_ff5_pipeline 缺少輸出：{missing}")
+    raw_result["alpha_scores"] = strategy3_normalize_alpha(raw_result["alpha_scores"])
+    raw_result["price_df"] = strategy3_normalize_price(raw_result["price_df"])
 
-        # Add optional keys if upstream does not provide them.
-        for k in ["ff5", "formations", "factor_panel", "regression_panel", "file_manifest"]:
-            if k not in raw_result:
-                raw_result[k] = pd.DataFrame()
+    for key in ["alpha_scores", "price_df", "formations", "ff5"]:
+        value = raw_result.get(key)
+        if not isinstance(value, pd.DataFrame) or value.empty:
+            raise ValueError(f"strategy3_ff5_pipeline 輸出 {key} 為空，停止回測。")
 
-        return raw_result
+    # Strict date filtering for the official backtest window.
+    start_ts = pd.Timestamp(start_date).normalize() if start_date is not None else BACKTEST_START_DEFAULT
+    end_ts = pd.Timestamp(end_date).normalize() if end_date is not None else BACKTEST_END_DEFAULT
 
-    except Exception as exc:
-        msg = str(exc)
-        # This is the exact error currently observed in the app.
-        # We also fallback for common column-name errors because CMoney exports
-        # often differ by version.
-        should_fallback = (
-            isinstance(exc, KeyError)
-            or "stock_id" in msg
-            or "股票代號" in msg
-            or "證券代碼" in msg
-            or "缺少" in msg
-        )
+    raw_result["alpha_scores"] = raw_result["alpha_scores"][
+        (raw_result["alpha_scores"]["formation_date"] >= start_ts)
+        & (raw_result["alpha_scores"]["formation_date"] <= end_ts)
+    ].copy()
 
-        if not should_fallback:
-            raise
+    raw_result["price_df"] = raw_result["price_df"][
+        (raw_result["price_df"]["date"] >= start_ts)
+        & (raw_result["price_df"]["date"] <= end_ts)
+    ].copy()
 
-        return strategy3_build_raw_pipeline_fallback(
-            raw_data_path=raw_data_path,
-            market_cap_top_n=market_cap_top_n,
-            lookback_days=lookback_days,
-            min_obs=min_obs,
-            original_error=exc,
-            start_date=start_date,
-            end_date=end_date,
-        )
+    if raw_result["alpha_scores"].empty:
+        raise ValueError("2019~2026 期間內沒有 alpha_scores，停止回測。請檢查 lookback/min_obs 或原始資料日期。")
+    if raw_result["price_df"].empty:
+        raise ValueError("2019~2026 期間內沒有 price_df，停止回測。請檢查 DATA / AD PRICE 資料日期。")
+
+    for k in ["factor_panel", "regression_panel", "file_manifest"]:
+        if k not in raw_result:
+            raw_result[k] = pd.DataFrame()
+
+    return raw_result
 
 def strategy3_filter_alpha_scores(alpha: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
     filtered = strategy3_normalize_alpha(alpha)
