@@ -1,17 +1,18 @@
 # ============================================================
 # strategy3_ff5_pipeline.py
-# VERSION: V4_BIWEEKLY_REBALANCE_REALDATA_2019_2026
+# VERSION: V5_STREAMLIT_PROGRESS_REALDATA_2019_2026
 # Notes:
 # - Strategy 3 official backtest period: 2019-01-01 to 2026-05-19
-# - Strict mode: run backtest only after real price_df/formations/ff5/alpha_scores are generated
-# - New option: monthly vs biweekly rebalancing for Strategy 3
-# - Robust CMoney column normalization for 2019~2026 formats
+# - Strict mode: backtest starts only after real price_df/formations/ff5/alpha_scores are generated
+# - Strategy 3 supports monthly and biweekly rebalancing
+# - Streamlit web progress bar added for raw data reading, FF5 construction, rolling alpha, backtest, and benchmarks
 # ============================================================
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 import re
 
 import numpy as np
@@ -22,6 +23,39 @@ import statsmodels.api as sm
 FACTOR_COLS = ["MKT_RF", "SMB", "HML", "RMW", "CMA"]
 DEFAULT_START = pd.Timestamp("2019-01-01")
 DEFAULT_END = pd.Timestamp("2026-05-19")
+
+
+ProgressCallback = Callable[[str, int, int, str], None]
+
+
+def emit_progress(
+    progress_callback: ProgressCallback | None,
+    stage: str,
+    current: int,
+    total: int = 100,
+    message: str = "",
+) -> None:
+    """Safely emit progress to Streamlit or any UI callback.
+
+    Callback signature: (stage, current, total, message).
+    current/total are intended as overall progress, usually 0~100.
+    """
+    if progress_callback is None:
+        return
+    try:
+        total = max(int(total), 1)
+        current = max(0, min(int(current), total))
+        progress_callback(str(stage), current, total, str(message or stage))
+    except Exception:
+        # Progress reporting must never break the data pipeline.
+        return
+
+
+def scaled_progress(start: int, end: int, idx: int, total: int) -> int:
+    if total <= 0:
+        return int(end)
+    frac = max(0.0, min(float(idx) / float(total), 1.0))
+    return int(round(start + (end - start) * frac))
 
 
 @dataclass(frozen=True)
@@ -277,15 +311,40 @@ def read_one_table(path: Path) -> pd.DataFrame:
     return df
 
 
-def read_many_excel(paths: list[Path]) -> pd.DataFrame:
+def read_many_excel(
+    paths: list[Path],
+    progress_callback: ProgressCallback | None = None,
+    stage: str = "讀取 Excel",
+    progress_start: int = 0,
+    progress_end: int = 15,
+) -> pd.DataFrame:
     dfs = []
-    for path in paths:
+    total = len(paths)
+    if total == 0:
+        emit_progress(progress_callback, stage, progress_end, 100, "沒有檔案需要讀取")
+        return pd.DataFrame()
+
+    for i, path in enumerate(paths, start=1):
+        emit_progress(
+            progress_callback,
+            stage,
+            scaled_progress(progress_start, progress_end, i - 1, total),
+            100,
+            f"{stage}: {i}/{total} - {path.name}",
+        )
         try:
             df = read_one_table(path)
             if not df.empty:
                 dfs.append(df)
         except Exception as exc:
             raise ValueError(f"Failed to read raw file {path}: {exc}") from exc
+        emit_progress(
+            progress_callback,
+            stage,
+            scaled_progress(progress_start, progress_end, i, total),
+            100,
+            f"{stage}: {i}/{total} - {path.name}",
+        )
     if not dfs:
         return pd.DataFrame()
     return pd.concat(dfs, ignore_index=True, sort=False)
@@ -654,6 +713,9 @@ def build_top_market_cap_formations(
     fin: pd.DataFrame,
     top_n: int,
     rebalance_frequency: str = "monthly",
+    progress_callback: ProgressCallback | None = None,
+    progress_start: int = 30,
+    progress_end: int = 45,
 ) -> pd.DataFrame:
     if data is None or data.empty:
         raise ValueError("Cannot build formations because DATA panel is empty.")
@@ -663,7 +725,15 @@ def build_top_market_cap_formations(
     formation_dates = build_formation_dates(data, rebalance_frequency=rebalance_frequency)
 
     rows = []
-    for formation_date in formation_dates:
+    total_formations = len(formation_dates)
+    for idx, formation_date in enumerate(formation_dates, start=1):
+        emit_progress(
+            progress_callback,
+            "建立股票池",
+            scaled_progress(progress_start, progress_end, idx - 1, total_formations),
+            100,
+            f"建立股票池: {idx}/{total_formations} - {pd.Timestamp(formation_date).date()}",
+        )
         snap = data[data["date"] == formation_date].copy()
         snap = snap.dropna(subset=["market_cap_100m"])
         snap = snap.sort_values("market_cap_100m", ascending=False).head(int(top_n))
@@ -672,6 +742,13 @@ def build_top_market_cap_formations(
         snap["rank"] = np.arange(1, len(snap) + 1)
         snap["formation_date"] = pd.Timestamp(formation_date)
         rows.append(snap)
+        emit_progress(
+            progress_callback,
+            "建立股票池",
+            scaled_progress(progress_start, progress_end, idx, total_formations),
+            100,
+            f"建立股票池: {idx}/{total_formations} - {pd.Timestamp(formation_date).date()}",
+        )
 
     if not rows:
         raise ValueError("No market-cap formation rows were generated for the selected rebalance frequency.")
@@ -722,12 +799,26 @@ def zero_if_nan(x: float) -> float:
     return 0.0 if pd.isna(x) or not np.isfinite(x) else float(x)
 
 
-def build_ff5_factor_returns(returns: pd.DataFrame, formations: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_ff5_factor_returns(
+    returns: pd.DataFrame,
+    formations: pd.DataFrame,
+    progress_callback: ProgressCallback | None = None,
+    progress_start: int = 45,
+    progress_end: int = 65,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     fdates = list(sorted(pd.to_datetime(formations["formation_date"].dropna().unique())))
     panels = []
     returns = returns.copy()
     returns["date"] = parse_date(returns["date"])
+    total_fdates = len(fdates)
     for i, fdate in enumerate(fdates):
+        emit_progress(
+            progress_callback,
+            "建立 FF5 因子資料",
+            scaled_progress(progress_start, int((progress_start + progress_end) / 2), i, max(total_fdates, 1)),
+            100,
+            f"建立 factor panel: {i + 1}/{total_fdates} - {pd.Timestamp(fdate).date()}",
+        )
         fdate = pd.Timestamp(fdate)
         next_fdate = pd.Timestamp(fdates[i + 1]) if i + 1 < len(fdates) else returns["date"].max()
         ret_slice = returns.loc[
@@ -792,14 +883,24 @@ def build_ff5_factor_returns(returns: pd.DataFrame, formations: pd.DataFrame) ->
             "n_stocks": group["stock_id"].nunique(),
         })
 
-    ff5 = (
-        factor_panel
-        .groupby("date")
-        .apply(calc_ff5_one_day)
-        .reset_index()
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    grouped_days = list(factor_panel.groupby("date"))
+    ff5_rows = []
+    total_days = len(grouped_days)
+    mid = int((progress_start + progress_end) / 2)
+    for j, (dt, group) in enumerate(grouped_days, start=1):
+        row = calc_ff5_one_day(group)
+        row["date"] = dt
+        ff5_rows.append(row)
+        if j == 1 or j == total_days or j % 20 == 0:
+            emit_progress(
+                progress_callback,
+                "計算 FF5 因子",
+                scaled_progress(mid, progress_end, j, total_days),
+                100,
+                f"計算 FF5 因子: {j}/{total_days} - {pd.Timestamp(dt).date()}",
+            )
+
+    ff5 = pd.DataFrame(ff5_rows).sort_values("date").reset_index(drop=True)
     ff5["RF"] = 0.0
     ff5["MKT_RF"] = ff5["MKT"] - ff5["RF"]
     return factor_panel, ff5[["date", "MKT_RF", "SMB", "HML", "RMW", "CMA", "RF", "MKT", "SMB_BM", "SMB_OP", "SMB_INV", "n_stocks"]]
@@ -851,6 +952,9 @@ def build_rolling_alpha_scores(
     formations: pd.DataFrame,
     returns: pd.DataFrame,
     config: FF5RawBuildConfig,
+    progress_callback: ProgressCallback | None = None,
+    progress_start: int = 65,
+    progress_end: int = 95,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     ff5 = ff5.copy()
     ff5["date"] = parse_date(ff5["date"])
@@ -884,7 +988,15 @@ def build_rolling_alpha_scores(
     formation_meta_df = pd.DataFrame(formation_meta)
 
     rows = []
-    for fdate in formation_dates:
+    total_alpha_dates = len(formation_dates)
+    for fidx, fdate in enumerate(formation_dates, start=1):
+        emit_progress(
+            progress_callback,
+            "估計 rolling alpha",
+            scaled_progress(progress_start, progress_end, fidx - 1, total_alpha_dates),
+            100,
+            f"估計 rolling alpha: {fidx}/{total_alpha_dates} - {pd.Timestamp(fdate).date()}",
+        )
         fdate = pd.Timestamp(fdate)
         members = formations[formations["formation_date"] == fdate].copy()
         for _, row in members.iterrows():
@@ -906,6 +1018,13 @@ def build_rolling_alpha_scores(
                 "rank_in_top150": row.get("rank", np.nan),
                 **result,
             })
+        emit_progress(
+            progress_callback,
+            "估計 rolling alpha",
+            scaled_progress(progress_start, progress_end, fidx, total_alpha_dates),
+            100,
+            f"估計 rolling alpha: {fidx}/{total_alpha_dates} - {pd.Timestamp(fdate).date()}；累計 alpha={len(rows)}",
+        )
 
     alpha_scores = pd.DataFrame(rows)
     if alpha_scores.empty:
@@ -921,15 +1040,21 @@ def build_rolling_alpha_scores(
     return alpha_scores, panel
 
 
-def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict[str, pd.DataFrame]:
+def run_ff5_raw_pipeline(
+    raw_dir: str | Path,
+    config: FF5RawBuildConfig,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, pd.DataFrame]:
     start, end = _date_bounds(config)
+    emit_progress(progress_callback, "掃描原始資料", 1, 100, "掃描原始資料資料夾...")
     files = discover_strategy3_raw_files(raw_dir)
 
-    data_raw = read_many_excel(files["data"])
-    ad_raw = read_many_excel(files["ad_price"]) if files["ad_price"] else pd.DataFrame()
-    asset_raw = read_many_excel(files["asset"]) if files["asset"] else pd.DataFrame()
-    rmw_raw = read_many_excel(files["rmw"]) if files["rmw"] else pd.DataFrame()
+    data_raw = read_many_excel(files["data"], progress_callback, "讀取 DATA 檔", 2, 12)
+    ad_raw = read_many_excel(files["ad_price"], progress_callback, "讀取 AD PRICE 檔", 12, 18) if files["ad_price"] else pd.DataFrame()
+    asset_raw = read_many_excel(files["asset"], progress_callback, "讀取 ASSET 檔", 18, 22) if files["asset"] else pd.DataFrame()
+    rmw_raw = read_many_excel(files["rmw"], progress_callback, "讀取 RMW 檔", 22, 26) if files["rmw"] else pd.DataFrame()
 
+    emit_progress(progress_callback, "標準化原始資料", 27, 100, "標準化 DATA / AD PRICE / 財報欄位...")
     data = normalize_market_data(data_raw, start, end)
     price_df = normalize_ad_price(ad_raw, data=data, start_date=start, end_date=end)
     returns = price_df[["date", "stock_id", "stock_name", "adj_close", "ret"]].copy()
@@ -940,9 +1065,26 @@ def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict
         fin,
         config.market_cap_top_n,
         rebalance_frequency=config.rebalance_frequency,
+        progress_callback=progress_callback,
+        progress_start=30,
+        progress_end=45,
     )
-    factor_panel, ff5 = build_ff5_factor_returns(returns, formations)
-    alpha_scores, regression_panel = build_rolling_alpha_scores(ff5, formations, returns, config)
+    factor_panel, ff5 = build_ff5_factor_returns(
+        returns,
+        formations,
+        progress_callback=progress_callback,
+        progress_start=45,
+        progress_end=65,
+    )
+    alpha_scores, regression_panel = build_rolling_alpha_scores(
+        ff5,
+        formations,
+        returns,
+        config,
+        progress_callback=progress_callback,
+        progress_start=65,
+        progress_end=95,
+    )
 
     # Data validation: do not pretend success if core outputs are empty.
     if data.empty or price_df.empty or formations.empty or ff5.empty or alpha_scores.empty:
@@ -950,6 +1092,8 @@ def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict
             "Pipeline output validation failed: "
             f"data={len(data)}, price_df={len(price_df)}, formations={len(formations)}, ff5={len(ff5)}, alpha_scores={len(alpha_scores)}"
         )
+
+    emit_progress(progress_callback, "完成資料建構", 100, 100, "FF5 pipeline 完成，準備回傳資料。")
 
     return {
         "file_manifest": build_file_manifest(files),
