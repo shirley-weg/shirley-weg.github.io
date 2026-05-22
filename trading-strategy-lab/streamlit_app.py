@@ -2469,6 +2469,519 @@ def strategy3_read_csv_file(path_str: str) -> pd.DataFrame:
     return _read_one(path)
 
 
+
+# ============================================================
+# Strategy 3 Fallback Raw Pipeline
+# ============================================================
+
+def strategy3_read_one_raw_file_for_fallback(path: Path) -> pd.DataFrame:
+    """Read one CSV/XLS/XLSX file for the fallback pipeline."""
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        last_error = None
+        for enc in ["utf-8-sig", "utf-8", "big5", "cp950"]:
+            try:
+                return pd.read_csv(path, encoding=enc)
+            except Exception as exc:
+                last_error = exc
+        raise last_error
+
+    if suffix in [".xlsx", ".xls"]:
+        # Try the normal first-row header first. If the sheet has a few title
+        # rows above the actual header, try a few alternative header rows.
+        errors: list[str] = []
+        for header in [0, 1, 2, 3]:
+            try:
+                df = pd.read_excel(path, header=header)
+                df.columns = [str(c).strip() for c in df.columns]
+                # Accept this read if it yields at least two non-unnamed columns.
+                usable_cols = [
+                    c for c in df.columns
+                    if c and not c.lower().startswith("unnamed") and c.lower() != "nan"
+                ]
+                if len(usable_cols) >= 2:
+                    return df
+            except Exception as exc:
+                errors.append(str(exc))
+        raise ValueError(f"讀取 Excel 失敗：{path.name}；{errors[-1] if errors else ''}")
+
+    raise ValueError(f"不支援的檔案格式：{path.name}")
+
+
+def strategy3_classify_raw_file(path: Path) -> str:
+    """Classify raw CMoney files by folder/file name."""
+    s = str(path).lower().replace("\\", "/")
+    name = path.name.lower()
+
+    # Avoid accidentally treating the mutual-fund benchmark NAV file as stock data.
+    if "a09012" in s or "benchmark" in s or "奔騰" in s:
+        return "ignore"
+
+    if any(k in s for k in ["ad_price", "ad price", "adprice", "adj_price", "adjusted_price", "還原"]):
+        return "price"
+    if any(k in s for k in ["/asset", "asset", "資產負債"]):
+        return "asset"
+    if any(k in s for k in ["/rmw", "rmw", "損益", "profit"]):
+        return "rmw"
+    if "data" in s or "_data" in name:
+        return "data"
+    if any(k in s for k in ["price", "收盤"]):
+        return "price"
+
+    return "other"
+
+
+def strategy3_collect_raw_files_for_fallback(raw_data_path: str) -> pd.DataFrame:
+    """Collect raw files recursively and attach category metadata."""
+    base = resolve_strategy3_path(raw_data_path)
+    if base.is_file():
+        files = [base]
+    else:
+        files = []
+        for pattern in ["*.csv", "*.xlsx", "*.xls"]:
+            files.extend(sorted(base.rglob(pattern)))
+
+    files = [f for f in files if not f.name.startswith("~$") and f.suffix.lower() in [".csv", ".xlsx", ".xls"]]
+
+    records = []
+    for f in files:
+        category = strategy3_classify_raw_file(f)
+        if category == "ignore":
+            continue
+        records.append({
+            "category": category,
+            "source_file": f.name,
+            "source_path": str(f),
+            "suffix": f.suffix.lower(),
+        })
+
+    return pd.DataFrame(records)
+
+
+def strategy3_read_raw_category_for_fallback(file_manifest: pd.DataFrame, categories: list[str]) -> pd.DataFrame:
+    """Read and concatenate files of selected categories."""
+    if file_manifest is None or file_manifest.empty:
+        return pd.DataFrame()
+
+    selected = file_manifest[file_manifest["category"].isin(categories)].copy()
+    if selected.empty:
+        return pd.DataFrame()
+
+    frames = []
+    for _, row in selected.iterrows():
+        p = Path(row["source_path"])
+        try:
+            df = strategy3_read_one_raw_file_for_fallback(p)
+            if df is None or df.empty:
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+            df["source_file"] = row["source_file"]
+            df["source_category"] = row["category"]
+            frames.append(df)
+        except Exception as exc:
+            # Keep scanning other files. The file manifest will still show the skipped file.
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def strategy3_normalize_price_fallback(price_raw: pd.DataFrame, data_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build canonical price_df from AD PRICE first; if unavailable, use DATA close price.
+    Output columns: date, stock_id, stock_name, adj_close.
+    """
+    errors: list[str] = []
+
+    for label, raw in [("AD PRICE", price_raw), ("DATA", data_raw)]:
+        if raw is None or raw.empty:
+            continue
+        try:
+            df = raw.copy()
+            df.columns = [str(c).strip() for c in df.columns]
+            df = strategy3_prepare_stock_id_column(df, label)
+
+            date_col = strategy3_find_column(df, [
+                "date", "trading_date", "tradedate", "年月日", "日期", "交易日期", "資料日期",
+            ])
+            if date_col is not None and date_col != "date":
+                df = df.rename(columns={date_col: "date"})
+
+            name_col = strategy3_find_column(df, [
+                "stock_name", "stockname", "name", "股票名稱", "證券名稱", "證券簡稱", "簡稱", "公司簡稱", "名稱",
+            ])
+            if name_col is not None and name_col != "stock_name":
+                df = df.rename(columns={name_col: "stock_name"})
+
+            close_col = strategy3_find_column(df, [
+                "adj_close", "adjusted_close", "adjustedclose", "還原收盤價", "還原收盤價元",
+                "收盤價", "收盤價元", "close", "Close", "price", "價格",
+            ])
+            if close_col is not None and close_col != "adj_close":
+                df = df.rename(columns={close_col: "adj_close"})
+
+            required = ["date", "stock_id", "adj_close"]
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                errors.append(f"{label} 缺少 {missing}；欄位={list(df.columns)}")
+                continue
+
+            if "stock_name" not in df.columns:
+                df["stock_name"] = ""
+
+            df["date"] = parse_strategy3_date_series(df["date"])
+            df["adj_close"] = strategy3_to_num(df["adj_close"])
+
+            out = (
+                df[["date", "stock_id", "stock_name", "adj_close"]]
+                .dropna(subset=["date", "stock_id", "adj_close"])
+                .copy()
+            )
+            out = out[out["adj_close"] > 0]
+            out = out.drop_duplicates(["date", "stock_id"], keep="last")
+            out = out.sort_values(["date", "stock_id"]).reset_index(drop=True)
+
+            if not out.empty:
+                return out
+
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    raise ValueError(
+        "fallback pipeline 無法建立 price_df。請確認 AD PRICE 或 DATA 檔至少含日期、股票代號、收盤價/還原收盤價。"
+        f"讀取錯誤：{errors}"
+    )
+
+
+def strategy3_normalize_characteristics_fallback(data_raw: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+    """Create a monthly characteristic table used by the fallback alpha model."""
+    if data_raw is None or data_raw.empty:
+        # Last resort: build a minimal characteristic table from prices.
+        tmp = price_df.copy()
+        tmp["market_cap"] = np.nan
+        tmp["bm"] = np.nan
+        tmp["profitability"] = np.nan
+        tmp["asset_growth"] = np.nan
+        return tmp[["date", "stock_id", "stock_name", "market_cap", "bm", "profitability", "asset_growth"]]
+
+    df = data_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = strategy3_prepare_stock_id_column(df, "DATA")
+
+    date_col = strategy3_find_column(df, [
+        "date", "trading_date", "tradedate", "年月日", "日期", "交易日期", "資料日期",
+    ])
+    if date_col is not None and date_col != "date":
+        df = df.rename(columns={date_col: "date"})
+
+    name_col = strategy3_find_column(df, [
+        "stock_name", "stockname", "name", "股票名稱", "證券名稱", "證券簡稱", "簡稱", "公司簡稱", "名稱",
+    ])
+    if name_col is not None and name_col != "stock_name":
+        df = df.rename(columns={name_col: "stock_name"})
+
+    mcap_col = strategy3_find_column(df, [
+        "market_cap", "marketcap", "市值", "市值百萬元", "市值(百萬元)", "總市值", "市場價值", "market_value",
+    ])
+    pb_col = strategy3_find_column(df, [
+        "pb", "pbr", "price_to_book", "股價淨值比", "市淨率", "PB", "P/B",
+    ])
+    bm_col = strategy3_find_column(df, [
+        "bm", "b/m", "book_to_market", "帳面市值比", "淨值市價比", "B/M",
+    ])
+
+    if "stock_name" not in df.columns:
+        df["stock_name"] = ""
+
+    if "date" not in df.columns:
+        raise ValueError(f"DATA 缺少日期欄位；目前欄位={list(df.columns)}")
+
+    df["date"] = parse_strategy3_date_series(df["date"])
+
+    if mcap_col is not None:
+        df["market_cap"] = strategy3_to_num(df[mcap_col])
+    else:
+        df["market_cap"] = np.nan
+
+    if bm_col is not None:
+        df["bm"] = strategy3_to_num(df[bm_col])
+    elif pb_col is not None:
+        pb = strategy3_to_num(df[pb_col])
+        df["bm"] = np.where(pb > 0, 1.0 / pb, np.nan)
+    else:
+        df["bm"] = np.nan
+
+    df["profitability"] = np.nan
+    df["asset_growth"] = np.nan
+
+    out = (
+        df[["date", "stock_id", "stock_name", "market_cap", "bm", "profitability", "asset_growth"]]
+        .dropna(subset=["date", "stock_id"])
+        .drop_duplicates(["date", "stock_id"], keep="last")
+        .sort_values(["date", "stock_id"])
+        .reset_index(drop=True)
+    )
+
+    # Fill stock_name from price_df when DATA has no name.
+    if "stock_name" in price_df.columns and not price_df.empty:
+        name_map = (
+            price_df[price_df["stock_name"].astype(str).str.len() > 0]
+            .drop_duplicates("stock_id")
+            .set_index("stock_id")["stock_name"]
+            .to_dict()
+        )
+        out["stock_name"] = out["stock_name"].where(out["stock_name"].astype(str).str.len() > 0, out["stock_id"].map(name_map).fillna(""))
+
+    return out
+
+
+def strategy3_safe_weighted_mean(values: pd.Series, weights: pd.Series | None = None) -> float:
+    values = pd.to_numeric(values, errors="coerce")
+    if weights is None:
+        return float(values.mean()) if values.notna().any() else np.nan
+
+    weights = pd.to_numeric(weights, errors="coerce")
+    mask = values.notna() & weights.notna() & (weights > 0)
+    if not mask.any():
+        return float(values.mean()) if values.notna().any() else np.nan
+
+    w = weights.loc[mask]
+    v = values.loc[mask]
+    total = w.sum()
+    if total <= 0:
+        return float(v.mean()) if v.notna().any() else np.nan
+    return float((v * w).sum() / total)
+
+
+def strategy3_build_raw_pipeline_fallback(
+    raw_data_path: str,
+    market_cap_top_n: int,
+    lookback_days: int,
+    min_obs: int,
+    original_error: Exception | None = None,
+) -> dict[str, pd.DataFrame]:
+    """
+    Fallback when strategy3_ff5_pipeline fails with KeyError('stock_id').
+
+    It builds a robust MKT-based rolling alpha model from CMoney DATA / AD PRICE.
+    If the external full FF5 pipeline works, the app still uses it first. This
+    fallback is only activated when the upstream pipeline fails, mainly because
+    of column-name differences such as stock_id vs 證券代碼 / 股票代號.
+    """
+    file_manifest = strategy3_collect_raw_files_for_fallback(raw_data_path)
+
+    if file_manifest.empty:
+        raise ValueError(f"fallback pipeline 找不到任何 CSV/XLSX/XLS 原始資料：{raw_data_path}")
+
+    price_raw = strategy3_read_raw_category_for_fallback(file_manifest, ["price"])
+    data_raw = strategy3_read_raw_category_for_fallback(file_manifest, ["data"])
+
+    # If no explicit AD PRICE files are found, DATA close price will be used.
+    price_df = strategy3_normalize_price_fallback(price_raw, data_raw)
+    characteristics = strategy3_normalize_characteristics_fallback(data_raw, price_df)
+
+    prices_wide = (
+        price_df.pivot_table(index="date", columns="stock_id", values="adj_close", aggfunc="last")
+        .sort_index()
+        .ffill()
+    )
+    returns_wide = prices_wide.pct_change()
+
+    if prices_wide.empty or returns_wide.empty:
+        raise ValueError("fallback pipeline 無法由價格資料建立日報酬。")
+
+    trading_dates = pd.DatetimeIndex(prices_wide.index)
+    formation_dates = (
+        pd.Series(trading_dates, index=trading_dates)
+        .groupby(trading_dates.to_period("M"))
+        .last()
+        .dropna()
+        .tolist()
+    )
+    formation_dates = [pd.Timestamp(d) for d in formation_dates]
+
+    # Name map.
+    name_map = (
+        price_df[price_df["stock_name"].astype(str).str.len() > 0]
+        .drop_duplicates("stock_id")
+        .set_index("stock_id")["stock_name"]
+        .to_dict()
+    )
+
+    alpha_rows: list[dict[str, object]] = []
+    factor_rows: list[dict[str, object]] = []
+    formation_rows: list[dict[str, object]] = []
+    regression_panel_rows: list[pd.DataFrame] = []
+
+    for fdate in formation_dates:
+        if fdate not in returns_wide.index:
+            continue
+
+        # Use the latest characteristics available at or before the formation date.
+        char_hist = characteristics[characteristics["date"] <= fdate].copy()
+        if char_hist.empty:
+            available = prices_wide.loc[:fdate].dropna(axis=1, how="all").columns.tolist()
+            char_latest = pd.DataFrame({
+                "stock_id": available,
+                "stock_name": [name_map.get(s, "") for s in available],
+                "market_cap": np.nan,
+                "bm": np.nan,
+                "profitability": np.nan,
+                "asset_growth": np.nan,
+            })
+        else:
+            char_latest = (
+                char_hist.sort_values(["stock_id", "date"])
+                .drop_duplicates("stock_id", keep="last")
+                .copy()
+            )
+
+        # Keep only stocks with price data by the formation date.
+        existing_stocks = prices_wide.loc[:fdate].dropna(axis=1, how="all").columns.astype(str).tolist()
+        char_latest = char_latest[char_latest["stock_id"].isin(existing_stocks)].copy()
+
+        if char_latest.empty:
+            continue
+
+        if "market_cap" in char_latest.columns and char_latest["market_cap"].notna().any():
+            char_latest = char_latest.sort_values("market_cap", ascending=False)
+        else:
+            # Fallback ranking: stocks with more available price observations are preferred.
+            obs_count = prices_wide.loc[:fdate].notna().sum().rename("price_obs")
+            char_latest["price_obs"] = char_latest["stock_id"].map(obs_count).fillna(0)
+            char_latest = char_latest.sort_values("price_obs", ascending=False)
+
+        universe = char_latest.head(int(market_cap_top_n)).copy()
+        if universe.empty:
+            continue
+
+        formation_rows.append(universe.assign(formation_date=fdate))
+
+        universe_stocks = universe["stock_id"].astype(str).tolist()
+        window_returns = returns_wide.loc[:fdate, universe_stocks].tail(int(lookback_days)).copy()
+        window_returns = window_returns.dropna(how="all")
+
+        if len(window_returns) < int(min_obs):
+            continue
+
+        mcap_map = universe.set_index("stock_id")["market_cap"].to_dict() if "market_cap" in universe.columns else {}
+        weights = pd.Series({sid: mcap_map.get(sid, np.nan) for sid in universe_stocks}, dtype=float)
+        if weights.notna().sum() == 0 or (weights.fillna(0) > 0).sum() == 0:
+            weights = pd.Series(1.0, index=universe_stocks)
+        weights = weights.reindex(universe_stocks).fillna(0.0)
+        if weights.sum() <= 0:
+            weights = pd.Series(1.0, index=universe_stocks)
+        weights = weights / weights.sum()
+
+        mkt_ret = window_returns.mul(weights, axis=1).sum(axis=1, min_count=1)
+        factor_df = pd.DataFrame({
+            "date": window_returns.index,
+            "formation_date": fdate,
+            "MKT_RF": mkt_ret.values,
+            "SMB": 0.0,
+            "HML": 0.0,
+            "RMW": 0.0,
+            "CMA": 0.0,
+            "RF": 0.0,
+        }).dropna(subset=["MKT_RF"])
+
+        if factor_df.empty:
+            continue
+
+        factor_rows.extend(factor_df.to_dict("records"))
+
+        # Regression per stock: Ri,t = alpha + beta_mkt * MKT_t + error.
+        x = sm.add_constant(factor_df.set_index("date")["MKT_RF"], has_constant="add")
+
+        for sid in universe_stocks:
+            if sid not in window_returns.columns:
+                continue
+
+            y = window_returns[sid].reindex(x.index)
+            reg = pd.concat([y.rename("stock_return"), x], axis=1).dropna()
+
+            if len(reg) < int(min_obs):
+                continue
+
+            try:
+                model = sm.OLS(reg["stock_return"], reg[["const", "MKT_RF"]]).fit()
+            except Exception:
+                continue
+
+            alpha = float(model.params.get("const", np.nan))
+            beta_mkt = float(model.params.get("MKT_RF", np.nan))
+            pvalue_alpha = float(model.pvalues.get("const", np.nan)) if hasattr(model, "pvalues") else np.nan
+
+            alpha_rows.append({
+                "formation_date": fdate,
+                "stock_id": sid,
+                "stock_name": name_map.get(sid, ""),
+                "alpha": alpha,
+                "alpha_annualized": alpha * 252.0 if pd.notna(alpha) else np.nan,
+                "pvalue_alpha": pvalue_alpha,
+                "beta_mkt": beta_mkt,
+                "beta_smb": 0.0,
+                "beta_hml": 0.0,
+                "beta_rmw": 0.0,
+                "beta_cma": 0.0,
+                "r2": float(model.rsquared) if hasattr(model, "rsquared") else np.nan,
+                "adj_r2": float(model.rsquared_adj) if hasattr(model, "rsquared_adj") else np.nan,
+                "n_obs": int(len(reg)),
+                "rank_in_top150": int(universe_stocks.index(sid) + 1),
+                "fallback_pipeline": True,
+            })
+
+            tmp = reg.reset_index().rename(columns={"index": "date"})
+            tmp["formation_date"] = fdate
+            tmp["stock_id"] = sid
+            regression_panel_rows.append(tmp)
+
+    alpha_scores = pd.DataFrame(alpha_rows)
+    if not alpha_scores.empty:
+        alpha_scores["alpha_rank"] = (
+            alpha_scores.groupby("formation_date")["alpha"]
+            .rank(method="first", ascending=False)
+            .astype(int)
+        )
+        alpha_scores = alpha_scores.sort_values(["formation_date", "alpha"], ascending=[True, False]).reset_index(drop=True)
+
+    ff5 = pd.DataFrame(factor_rows)
+    if not ff5.empty:
+        ff5 = ff5.drop_duplicates(["date", "formation_date"], keep="last").sort_values(["date", "formation_date"]).reset_index(drop=True)
+
+    formations = pd.concat(formation_rows, ignore_index=True) if formation_rows else pd.DataFrame()
+    regression_panel = pd.concat(regression_panel_rows, ignore_index=True) if regression_panel_rows else pd.DataFrame()
+
+    file_manifest_out = file_manifest.copy()
+    file_manifest_out["fallback_used"] = True
+    file_manifest_out["original_pipeline_error"] = repr(original_error) if original_error is not None else ""
+
+    if alpha_scores.empty:
+        raise ValueError(
+            "fallback pipeline 已成功讀取價格資料，但沒有產生 alpha_scores。"
+            "請檢查 lookback/min obs 是否過高，或資料期間是否足夠。"
+            f"原始 pipeline 錯誤：{repr(original_error)}"
+        )
+
+    return {
+        "alpha_scores": alpha_scores,
+        "price_df": price_df,
+        "ff5": ff5,
+        "formations": formations,
+        "factor_panel": ff5.copy(),
+        "regression_panel": regression_panel,
+        "file_manifest": file_manifest_out,
+        "fallback_warning": pd.DataFrame([{
+            "message": "外部 strategy3_ff5_pipeline 失敗，因此本次使用內建 fallback pipeline。fallback 以市場因子 MKT rolling alpha 估計，SMB/HML/RMW/CMA 置為 0。",
+            "original_error": repr(original_error),
+        }]),
+    }
+
+
+
 @st.cache_data(show_spinner=False)
 def strategy3_build_raw_pipeline_cached(
     raw_data_path: str,
@@ -2476,14 +2989,67 @@ def strategy3_build_raw_pipeline_cached(
     lookback_days: int,
     min_obs: int,
 ) -> dict[str, pd.DataFrame]:
+    """
+    Build Strategy 3 raw outputs.
+
+    First tries the external strategy3_ff5_pipeline. If that pipeline fails with
+    KeyError('stock_id') or another column-name related issue, automatically
+    falls back to an internal robust pipeline that normalizes CMoney column
+    names such as 證券代碼 / 股票代號 into stock_id.
+    """
     raw_dir = resolve_strategy3_path(raw_data_path)
     config = FF5RawBuildConfig(
         market_cap_top_n=int(market_cap_top_n),
         lookback_days=int(lookback_days),
         min_obs=int(min_obs),
     )
-    return run_ff5_raw_pipeline(raw_dir, config)
 
+    try:
+        raw_result = run_ff5_raw_pipeline(raw_dir, config)
+        if not isinstance(raw_result, dict):
+            raise ValueError("strategy3_ff5_pipeline 回傳格式不是 dict。")
+
+        # Validate early, so downstream does not fail with a vague KeyError.
+        if "alpha_scores" in raw_result:
+            raw_result["alpha_scores"] = strategy3_normalize_alpha(raw_result["alpha_scores"])
+        if "price_df" in raw_result:
+            raw_result["price_df"] = strategy3_normalize_price(raw_result["price_df"])
+
+        required = ["alpha_scores", "price_df"]
+        missing = [k for k in required if k not in raw_result]
+        if missing:
+            raise ValueError(f"strategy3_ff5_pipeline 缺少輸出：{missing}")
+
+        # Add optional keys if upstream does not provide them.
+        for k in ["ff5", "formations", "factor_panel", "regression_panel", "file_manifest"]:
+            if k not in raw_result:
+                raw_result[k] = pd.DataFrame()
+
+        return raw_result
+
+    except Exception as exc:
+        msg = str(exc)
+        # This is the exact error currently observed in the app.
+        # We also fallback for common column-name errors because CMoney exports
+        # often differ by version.
+        should_fallback = (
+            isinstance(exc, KeyError)
+            or "stock_id" in msg
+            or "股票代號" in msg
+            or "證券代碼" in msg
+            or "缺少" in msg
+        )
+
+        if not should_fallback:
+            raise
+
+        return strategy3_build_raw_pipeline_fallback(
+            raw_data_path=raw_data_path,
+            market_cap_top_n=market_cap_top_n,
+            lookback_days=lookback_days,
+            min_obs=min_obs,
+            original_error=exc,
+        )
 
 def strategy3_filter_alpha_scores(alpha: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
     filtered = strategy3_normalize_alpha(alpha)
@@ -2531,25 +3097,43 @@ def strategy3_find_column(df: pd.DataFrame, candidates: list[str]) -> str | None
 
 
 def strategy3_prepare_stock_id_column(df: pd.DataFrame, context: str) -> pd.DataFrame:
-    """Ensure a DataFrame has a canonical stock_id column."""
+    """
+    Ensure a DataFrame has a canonical stock_id column.
+
+    This version is intentionally defensive because CMoney / upstream pipeline
+    outputs may use different stock-code column names, may put stock codes in
+    the index, or may combine code and name in a single string such as
+    "2330 台積電".
+    """
     out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
 
-    if "stock_id" not in out.columns:
-        stock_col = strategy3_find_column(out, [
-            "stock_id", "stockid", "stock_code", "stockcode", "code", "ticker", "symbol",
-            "股票代號", "證券代碼", "證券碼", "代號", "股號", "公司代號", "簡稱代號",
-        ])
-        if stock_col is not None:
-            out = out.rename(columns={stock_col: "stock_id"})
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [
+            "_".join([str(x).strip() for x in col if str(x).strip() and str(x).strip().lower() != "nan"])
+            for col in out.columns
+        ]
+    else:
+        out.columns = [str(c).strip() for c in out.columns]
 
-    if "stock_id" not in out.columns:
-        # Some pipeline outputs may keep stock code in the index.
-        if out.index.name and strategy3_canonical_col_key(out.index.name) in {
-            "stockid", "stockcode", "股票代號", "證券代碼", "代號", "code", "ticker", "symbol"
+    # Some pipeline outputs may keep stock code in the index.
+    if "stock_id" not in out.columns and out.index.name:
+        index_key = strategy3_canonical_col_key(out.index.name)
+        if index_key in {
+            "stockid", "stockcode", "stock", "code", "ticker", "symbol",
+            "股票代號", "股票代碼", "證券代碼", "證券代號", "代號", "公司代號", "股號",
         }:
             old_index_name = out.index.name
             out = out.reset_index().rename(columns={old_index_name: "stock_id"})
+
+    if "stock_id" not in out.columns:
+        stock_col = strategy3_find_column(out, [
+            "stock_id", "stockid", "stock_code", "stockcode", "stock", "code", "ticker", "symbol",
+            "security_id", "securityid", "證券代碼", "證券代號", "股票代號", "股票代碼",
+            "證券碼", "代號", "股號", "公司代號", "簡稱代號", "證券代碼/名稱",
+            "證券代號名稱", "股票代號名稱", "代碼名稱", "證券簡稱",
+        ])
+        if stock_col is not None:
+            out = out.rename(columns={stock_col: "stock_id"})
 
     if "stock_id" not in out.columns:
         raise ValueError(
@@ -2558,9 +3142,8 @@ def strategy3_prepare_stock_id_column(df: pd.DataFrame, context: str) -> pd.Data
         )
 
     out["stock_id"] = clean_stock_id(out["stock_id"])
-    out = out[out["stock_id"].notna() & (out["stock_id"].astype(str).str.len() > 0)].copy()
+    out = out[out["stock_id"].notna() & out["stock_id"].astype(str).str.fullmatch(r"\d{4}")].copy()
     return out
-
 
 def strategy3_normalize_alpha(alpha_raw: pd.DataFrame) -> pd.DataFrame:
     """
@@ -3860,6 +4443,10 @@ def render_strategy3_page() -> None:
                         settings.lookback_days,
                         settings.min_obs,
                     )
+                    if "fallback_warning" in raw_result and not raw_result["fallback_warning"].empty:
+                        warning_msg = str(raw_result["fallback_warning"].iloc[0].get("message", "已使用 fallback pipeline。"))
+                        st.warning(warning_msg)
+
                     alpha = strategy3_normalize_alpha(raw_result["alpha_scores"])
                     price_df = strategy3_normalize_price(raw_result["price_df"])
 
@@ -3914,6 +4501,8 @@ def render_strategy3_page() -> None:
 
             except Exception as exc:
                 st.error(f"策略3回測失敗：{exc}")
+                with st.expander("顯示完整錯誤 traceback"):
+                    st.exception(exc)
 
         result = st.session_state.get("strategy3_result")
         if not result:
