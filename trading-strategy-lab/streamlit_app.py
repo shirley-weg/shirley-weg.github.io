@@ -6,6 +6,7 @@ from io import BytesIO
 from typing import Literal
 import itertools
 import logging
+import re
 import warnings
 from pathlib import Path
 import numpy as np
@@ -1321,8 +1322,8 @@ def sidebar_settings(strategy: StrategyName) -> AppSettings:
     industry = st.sidebar.selectbox("細產業股票池", industries, index=industries.index(default_ind), help="可選全部，但全部股票池執行共整合篩選會較慢。")
 
     st.sidebar.header("資料與回測期間")
-    data_start = st.sidebar.date_input("資料下載起日", value=pd.Timestamp("2022-01-01").date())
-    trading_start = st.sidebar.date_input("正式回測起日", value=pd.Timestamp("2024-01-01").date())
+    data_start = st.sidebar.date_input("資料下載起日", value=pd.Timestamp("2019-01-01").date())
+    trading_start = st.sidebar.date_input("正式回測起日", value=pd.Timestamp("2019-01-01").date())
     use_today = st.sidebar.checkbox("回測到最新資料", value=True)
     if use_today:
         trading_end = None
@@ -2192,6 +2193,7 @@ def render_strategy_page(strategy: StrategyName) -> None:
 @dataclass(frozen=True)
 class FF5AlphaSettings:
     raw_data_path: str
+    backtest_start_date: pd.Timestamp
     market_cap_top_n: int
     lookback_days: int
     min_obs: int
@@ -2202,8 +2204,25 @@ class FF5AlphaSettings:
     initial_capital: float
     commission_rate: float
     sell_tax_rate: float
+
+    # yfinance benchmarks，例如 0050.TW。保留 benchmark_ticker 作為舊版相容的第一個 benchmark。
     benchmark_ticker: str
+    benchmark_tickers: tuple[str, ...]
     benchmark_auto_adjust: bool
+
+    # 自訂基金 benchmark：預設加入統一奔騰基金 A09012.xlsx。
+    fund_benchmark_enabled: bool
+    fund_benchmark_name: str
+    fund_benchmark_path: str
+
+
+def strategy3_parse_benchmark_tickers(raw: str) -> tuple[str, ...]:
+    tickers = []
+    for part in str(raw).replace("；", ",").replace("，", ",").split(","):
+        value = part.strip()
+        if value and value not in tickers:
+            tickers.append(value)
+    return tuple(tickers)
 
 
 def strategy3_sidebar_settings() -> FF5AlphaSettings:
@@ -2219,6 +2238,11 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
         "原始資料資料夾",
         value="data/strategy3",
         help="資料夾內需包含 DATA、AD PRICE、ASSET、RMW Excel。可分子資料夾放置。"
+    )
+    backtest_start_date = st.sidebar.date_input(
+        "策略3正式回測起日",
+        value=pd.Timestamp("2019-01-01").date(),
+        help="策略3 NAV 與 benchmark 績效會從此日之後開始計算。若 rolling lookback 還未滿足，資金會維持現金直到第一個可調倉日。"
     )
 
     st.sidebar.divider()
@@ -2237,11 +2261,27 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
 
     st.sidebar.divider()
     st.sidebar.header("Benchmark")
-    benchmark_ticker = st.sidebar.text_input("Benchmark ticker", value="0050.TW")
+    benchmark_tickers_text = st.sidebar.text_input(
+        "yfinance Benchmark tickers（逗號分隔）",
+        value="0050.TW",
+        help="例如：0050.TW。若要多個 yfinance benchmark，可用逗號分隔。"
+    )
+    benchmark_tickers = strategy3_parse_benchmark_tickers(benchmark_tickers_text)
     benchmark_auto_adjust = st.sidebar.toggle("Benchmark 使用 yfinance auto_adjust", value=True)
+
+    fund_benchmark_enabled = st.sidebar.checkbox("加入統一奔騰基金 benchmark", value=True)
+    fund_benchmark_name = st.sidebar.text_input("基金 benchmark 名稱", value="統一奔騰基金")
+    fund_benchmark_path = st.sidebar.text_input(
+        "統一奔騰基金淨值檔路徑",
+        value="data/strategy3/A09012.xlsx",
+        help="請把 A09012.xlsx 放到 GitHub repo 的 data/strategy3/ 底下，或在這裡填入實際路徑。檔案欄位支援：日期、淨值、漲跌。"
+    )
+
+    benchmark_ticker = benchmark_tickers[0] if len(benchmark_tickers) > 0 else ""
 
     return FF5AlphaSettings(
         raw_data_path=raw_data_path,
+        backtest_start_date=pd.Timestamp(backtest_start_date),
         market_cap_top_n=int(market_cap_top_n),
         lookback_days=int(lookback_days),
         min_obs=int(min_obs),
@@ -2253,9 +2293,12 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
         commission_rate=float(commission_rate),
         sell_tax_rate=float(sell_tax_rate),
         benchmark_ticker=str(benchmark_ticker).strip(),
+        benchmark_tickers=benchmark_tickers,
         benchmark_auto_adjust=bool(benchmark_auto_adjust),
+        fund_benchmark_enabled=bool(fund_benchmark_enabled),
+        fund_benchmark_name=str(fund_benchmark_name).strip() or "統一奔騰基金",
+        fund_benchmark_path=str(fund_benchmark_path).strip(),
     )
-
 
 
 def strategy3_force_datetime_ns(s: pd.Series) -> pd.Series:
@@ -2608,18 +2651,27 @@ def strategy3_run_backtest(
     initial_capital: float,
     commission_rate: float,
     sell_tax_rate: float,
+    backtest_start_date: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     price_lookup = price_df.set_index(["date", "stock_id"])["adj_close"].sort_index()
     name_lookup = price_df.drop_duplicates("stock_id").set_index("stock_id")["stock_name"].to_dict()
     trading_dates = pd.DatetimeIndex(sorted(price_df["date"].dropna().unique()))
 
     rebalance_dates = pd.DatetimeIndex(sorted(positions["holding_start"].dropna().unique()))
+
+    if backtest_start_date is not None:
+        start_ts = pd.Timestamp(backtest_start_date).normalize()
+        rebalance_dates = rebalance_dates[rebalance_dates >= start_ts]
+        backtest_dates = trading_dates[trading_dates >= start_ts]
+    else:
+        start_ts = rebalance_dates[0] if len(rebalance_dates) > 0 else pd.NaT
+        backtest_dates = trading_dates[trading_dates >= start_ts]
+
     rebalance_set = set(rebalance_dates)
 
     if len(rebalance_dates) == 0:
-        raise ValueError("沒有可用 holding_start，無法回測。")
+        raise ValueError("沒有可用 holding_start，無法回測。請確認資料期間、rolling lookback 與正式回測起日。")
 
-    backtest_dates = trading_dates[trading_dates >= rebalance_dates[0]]
     if len(backtest_dates) == 0:
         raise ValueError("AD PRICE 中沒有回測期間價格。")
 
@@ -2858,8 +2910,22 @@ def strategy3_download_benchmark(
     start: str,
     end: str,
     auto_adjust: bool,
-    initial_capital: float,
+    initial_capital: float | None = None,
 ) -> pd.DataFrame:
+    """
+    下載 yfinance benchmark 價格。
+
+    回傳欄位固定為：
+    - date
+    - benchmark_close
+
+    initial_capital 參數保留作為舊版相容；實際 benchmark NAV 會在
+    strategy3_attach_benchmarks() 對齊策略日期後重新 rebased。
+    """
+    ticker = str(ticker).strip()
+    if not ticker:
+        return pd.DataFrame()
+
     yf_end = (pd.Timestamp(end) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
     raw = yf.download(
         ticker,
@@ -2875,60 +2941,174 @@ def strategy3_download_benchmark(
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 
+    if "Close" not in raw.columns:
+        return pd.DataFrame()
+
     bench = raw.reset_index().rename(columns={"Date": "date", "Close": "benchmark_close"})
     bench["date"] = strategy3_force_datetime_ns(bench["date"])
-    bench = bench[["date", "benchmark_close"]].dropna().sort_values("date")
-    bench["benchmark_daily_return"] = bench["benchmark_close"].pct_change()
-    bench.loc[bench.index[0], "benchmark_daily_return"] = 0.0
-    bench["benchmark_nav"] = initial_capital * (1 + bench["benchmark_daily_return"]).cumprod()
-    bench["benchmark_cum_return"] = bench["benchmark_nav"] / initial_capital - 1
-    bench["benchmark_running_max"] = bench["benchmark_nav"].cummax()
-    bench["benchmark_drawdown"] = bench["benchmark_nav"] / bench["benchmark_running_max"] - 1
+    bench["benchmark_close"] = strategy3_to_num(bench["benchmark_close"])
+    bench = (
+        bench[["date", "benchmark_close"]]
+        .dropna(subset=["date", "benchmark_close"])
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
     return bench
 
 
-def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
+def strategy3_benchmark_slug(label: str) -> str:
     """
-    下載 benchmark，對齊策略日期，並將 benchmark NAV rebased 到策略第一天。
-
-    修正重點：
-    - yfinance 的 date 有時是 datetime64[s]，策略 NAV 是 datetime64[ns]。
-      pd.merge_asof 需要左右 key 完全同型別，所以這裡強制轉成 datetime64[ns]。
+    將 benchmark 名稱轉成安全欄位後綴。
+    例：0050.TW -> 0050_TW；統一奔騰基金 -> 統一奔騰基金。
     """
-    out = nav_df.copy()
-    out["date"] = strategy3_force_datetime_ns(out["date"])
-    out = out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    label = str(label).strip()
+    slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", label).strip("_")
+    return slug or "benchmark"
 
-    # 多抓幾天，避免策略第一天不是 benchmark 交易日導致缺值
-    start = (out["date"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
-    end = out["date"].max().strftime("%Y-%m-%d")
 
-    bench = strategy3_download_benchmark(
-        settings.benchmark_ticker,
-        start,
-        end,
-        settings.benchmark_auto_adjust,
-        settings.initial_capital,
+def strategy3_unique_benchmark_specs(settings: FF5AlphaSettings) -> list[dict[str, str]]:
+    specs: list[dict[str, str]] = []
+
+    for ticker in settings.benchmark_tickers:
+        ticker = str(ticker).strip()
+        if not ticker:
+            continue
+        specs.append({
+            "source": "yfinance",
+            "label": ticker,
+            "ticker": ticker,
+            "path": "",
+        })
+
+    if settings.fund_benchmark_enabled and str(settings.fund_benchmark_path).strip():
+        specs.append({
+            "source": "fund_file",
+            "label": settings.fund_benchmark_name or "統一奔騰基金",
+            "ticker": "",
+            "path": settings.fund_benchmark_path,
+        })
+
+    used: dict[str, int] = {}
+    out: list[dict[str, str]] = []
+    for spec in specs:
+        base_slug = strategy3_benchmark_slug(spec["label"])
+        count = used.get(base_slug, 0) + 1
+        used[base_slug] = count
+        slug = base_slug if count == 1 else f"{base_slug}_{count}"
+        spec = dict(spec)
+        spec["slug"] = slug
+        out.append(spec)
+
+    return out
+
+
+def strategy3_benchmark_label_text(settings: FF5AlphaSettings) -> str:
+    labels = [spec["label"] for spec in strategy3_unique_benchmark_specs(settings)]
+    return "、".join(labels) if labels else "無 benchmark"
+
+
+@st.cache_data(show_spinner=False)
+def strategy3_read_fund_benchmark_file(path_str: str) -> pd.DataFrame:
+    """
+    讀取基金淨值檔，預設支援 CMoney / 投信常見欄位：
+    - 日期
+    - 淨值
+    - 漲跌
+
+    只會使用「日期」與「淨值」建立 benchmark_close。
+    """
+    raw = strategy3_read_csv_file(path_str).copy()
+    if raw.empty:
+        return pd.DataFrame(columns=["date", "benchmark_close"])
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    normalized_map = {
+        str(c).strip().lower().replace(" ", "").replace("_", ""): c
+        for c in raw.columns
+    }
+
+    date_candidates = [
+        "date", "日期", "淨值日期", "資料日期", "navdate", "valuationdate"
+    ]
+    nav_candidates = [
+        "benchmarkclose", "nav", "淨值", "單位淨值", "基金淨值", "netassetvalue", "close"
+    ]
+
+    date_col = None
+    for key in date_candidates:
+        if key.lower().replace(" ", "").replace("_", "") in normalized_map:
+            date_col = normalized_map[key.lower().replace(" ", "").replace("_", "")]
+            break
+
+    nav_col = None
+    for key in nav_candidates:
+        if key.lower().replace(" ", "").replace("_", "") in normalized_map:
+            nav_col = normalized_map[key.lower().replace(" ", "").replace("_", "")]
+            break
+
+    if date_col is None and len(raw.columns) >= 1:
+        date_col = raw.columns[0]
+    if nav_col is None and len(raw.columns) >= 2:
+        nav_col = raw.columns[1]
+
+    if date_col is None or nav_col is None:
+        raise ValueError(
+            f"基金 benchmark 檔案缺少日期或淨值欄位。目前欄位：{list(raw.columns)}"
+        )
+
+    bench = pd.DataFrame({
+        "date": parse_strategy3_date_series(raw[date_col]),
+        "benchmark_close": strategy3_to_num(raw[nav_col]),
+    })
+
+    bench = (
+        bench.dropna(subset=["date", "benchmark_close"])
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
     )
 
     if bench.empty:
-        for c in [
-            "benchmark_close", "benchmark_daily_return", "benchmark_nav",
-            "benchmark_cum_return", "benchmark_drawdown",
-            "active_daily_return", "active_cum_return", "relative_nav"
-        ]:
-            out[c] = np.nan
-        return out
+        raise ValueError("基金 benchmark 檔案讀取後沒有有效的日期/淨值資料。")
 
-    bench = bench.copy()
-    bench["date"] = strategy3_force_datetime_ns(bench["date"])
-    bench = bench.dropna(subset=["date", "benchmark_close"]).sort_values("date").reset_index(drop=True)
+    return bench
 
-    left = out[["date"]].copy().sort_values("date").reset_index(drop=True)
+
+def strategy3_align_single_benchmark(
+    nav_df: pd.DataFrame,
+    bench: pd.DataFrame,
+    label: str,
+    slug: str,
+    initial_capital: float,
+) -> pd.DataFrame:
+    """
+    將單一 benchmark 的 close/NAV 對齊策略日期。
+
+    共同基金不是每天都有報價；這裡使用 merge_asof(direction='backward')，
+    代表若策略日期當天沒有基金淨值，就沿用最近一筆可得基金淨值。
+    """
+    left = nav_df[["date"]].copy().sort_values("date").reset_index(drop=True)
     left["date"] = strategy3_force_datetime_ns(left["date"])
+
+    prefix = f"benchmark_{slug}"
+
+    if bench is None or bench.empty or not {"date", "benchmark_close"}.issubset(set(bench.columns)):
+        aligned = left.copy()
+        for c in ["close", "daily_return", "nav", "cum_return", "drawdown"]:
+            aligned[f"{prefix}_{c}"] = np.nan
+        return aligned
 
     right = bench[["date", "benchmark_close"]].copy().sort_values("date").reset_index(drop=True)
     right["date"] = strategy3_force_datetime_ns(right["date"])
+    right["benchmark_close"] = strategy3_to_num(right["benchmark_close"])
+    right = right.dropna(subset=["date", "benchmark_close"])
+
+    if right.empty:
+        aligned = left.copy()
+        for c in ["close", "daily_return", "nav", "cum_return", "drawdown"]:
+            aligned[f"{prefix}_{c}"] = np.nan
+        return aligned
 
     aligned = pd.merge_asof(
         left,
@@ -2937,47 +3117,169 @@ def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings)
         direction="backward",
     )
 
-    aligned["benchmark_daily_return"] = aligned["benchmark_close"].pct_change()
-    aligned.loc[aligned.index[0], "benchmark_daily_return"] = 0.0
+    aligned = aligned.rename(columns={"benchmark_close": f"{prefix}_close"})
+    close_col = f"{prefix}_close"
+    ret_col = f"{prefix}_daily_return"
+    nav_col = f"{prefix}_nav"
+    cum_col = f"{prefix}_cum_return"
+    running_max_col = f"{prefix}_running_max"
+    dd_col = f"{prefix}_drawdown"
 
-    aligned["benchmark_nav"] = settings.initial_capital * (
-        1 + aligned["benchmark_daily_return"].fillna(0)
-    ).cumprod()
+    close = aligned[close_col].astype(float)
+    ret = close.pct_change(fill_method=None)
+    first_valid_idx = close.first_valid_index()
+    if first_valid_idx is not None:
+        ret.loc[first_valid_idx] = 0.0
 
-    aligned["benchmark_cum_return"] = aligned["benchmark_nav"] / settings.initial_capital - 1
-    aligned["benchmark_running_max"] = aligned["benchmark_nav"].cummax()
-    aligned["benchmark_drawdown"] = aligned["benchmark_nav"] / aligned["benchmark_running_max"] - 1
+    aligned[ret_col] = ret
+    aligned[nav_col] = initial_capital * (1 + aligned[ret_col].fillna(0)).cumprod()
+    aligned.loc[close.isna(), nav_col] = np.nan
+    aligned[cum_col] = aligned[nav_col] / initial_capital - 1
+    aligned[running_max_col] = aligned[nav_col].cummax()
+    aligned[dd_col] = aligned[nav_col] / aligned[running_max_col] - 1
 
-    aligned["date"] = strategy3_force_datetime_ns(aligned["date"])
+    return aligned[[
+        "date",
+        close_col,
+        ret_col,
+        nav_col,
+        cum_col,
+        dd_col,
+    ]]
 
-    out = pd.merge(
-        out,
-        aligned[[
-            "date", "benchmark_close", "benchmark_daily_return",
-            "benchmark_nav", "benchmark_cum_return", "benchmark_drawdown"
-        ]],
-        on="date",
-        how="left",
-    )
 
-    out["active_daily_return"] = out["daily_return"] - out["benchmark_daily_return"]
-    out["active_cum_return"] = out["cum_return"] - out["benchmark_cum_return"]
-    out["relative_nav"] = out["portfolio_nav"] / out["benchmark_nav"]
+def strategy3_attach_benchmarks(nav_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
+    """
+    同時加入多個 benchmark。
+
+    目前支援：
+    1. yfinance benchmark：例如 0050.TW
+    2. 基金淨值檔 benchmark：預設 data/strategy3/A09012.xlsx，也就是統一奔騰基金
+
+    輸出欄位：
+    - benchmark_0050_TW_nav / benchmark_0050_TW_daily_return / ...
+    - benchmark_統一奔騰基金_nav / benchmark_統一奔騰基金_daily_return / ...
+    - benchmark_nav 等舊版欄位會指向第一個成功附加的 benchmark，方便舊圖表或舊邏輯相容。
+    """
+    out = nav_df.copy()
+    out["date"] = strategy3_force_datetime_ns(out["date"])
+    out = out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    if out.empty:
+        return out
+
+    specs = strategy3_unique_benchmark_specs(settings)
+    first_attached: tuple[str, str] | None = None
+
+    # 多抓幾天，避免策略第一天不是 benchmark 交易日或基金淨值日導致缺值。
+    start = (out["date"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    end = out["date"].max().strftime("%Y-%m-%d")
+
+    for spec in specs:
+        label = spec["label"]
+        slug = spec["slug"]
+        source = spec["source"]
+
+        try:
+            if source == "yfinance":
+                bench = strategy3_download_benchmark(
+                    spec["ticker"],
+                    start,
+                    end,
+                    settings.benchmark_auto_adjust,
+                    settings.initial_capital,
+                )
+            elif source == "fund_file":
+                bench = strategy3_read_fund_benchmark_file(spec["path"])
+                bench = bench[
+                    (bench["date"] >= pd.Timestamp(start)) &
+                    (bench["date"] <= pd.Timestamp(end) + pd.Timedelta(days=5))
+                ].copy()
+            else:
+                bench = pd.DataFrame()
+        except Exception as exc:
+            st.warning(f"Benchmark「{label}」讀取失敗：{exc}")
+            bench = pd.DataFrame()
+
+        aligned = strategy3_align_single_benchmark(
+            nav_df=out[["date"]],
+            bench=bench,
+            label=label,
+            slug=slug,
+            initial_capital=settings.initial_capital,
+        )
+
+        out = pd.merge(out, aligned, on="date", how="left")
+
+        prefix = f"benchmark_{slug}"
+        nav_col = f"{prefix}_nav"
+        ret_col = f"{prefix}_daily_return"
+
+        if nav_col in out.columns and out[nav_col].notna().any():
+            out[f"active_{slug}_daily_return"] = out["daily_return"] - out[ret_col]
+            out[f"active_{slug}_cum_return"] = out["cum_return"] - out[f"{prefix}_cum_return"]
+            out[f"relative_nav_{slug}"] = out["portfolio_nav"] / out[nav_col]
+
+            if first_attached is None:
+                first_attached = (label, slug)
+
+    if first_attached is None:
+        for c in [
+            "benchmark_close", "benchmark_daily_return", "benchmark_nav",
+            "benchmark_cum_return", "benchmark_drawdown",
+            "active_daily_return", "active_cum_return", "relative_nav"
+        ]:
+            out[c] = np.nan
+        return out
+
+    first_label, first_slug = first_attached
+    first_prefix = f"benchmark_{first_slug}"
+
+    # 舊版欄位：指向第一個成功 benchmark，通常是 0050.TW。
+    out["benchmark_close"] = out[f"{first_prefix}_close"]
+    out["benchmark_daily_return"] = out[f"{first_prefix}_daily_return"]
+    out["benchmark_nav"] = out[f"{first_prefix}_nav"]
+    out["benchmark_cum_return"] = out[f"{first_prefix}_cum_return"]
+    out["benchmark_drawdown"] = out[f"{first_prefix}_drawdown"]
+    out["active_daily_return"] = out[f"active_{first_slug}_daily_return"]
+    out["active_cum_return"] = out[f"active_{first_slug}_cum_return"]
+    out["relative_nav"] = out[f"relative_nav_{first_slug}"]
+
     return out
+
+
+def strategy3_attach_benchmark(nav_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
+    """舊版函數名稱相容 wrapper；實際會附加所有 settings 中啟用的 benchmarks。"""
+    return strategy3_attach_benchmarks(nav_df, settings)
 
 def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, rebalance_df: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
     def _one(nav_col: str, ret_col: str, label: str) -> dict[str, object]:
-        daily_ret = nav_df[ret_col].dropna()
-        final_nav = nav_df[nav_col].iloc[-1]
+        valid = nav_df[[nav_col, ret_col]].dropna(subset=[nav_col]).copy()
+        if valid.empty:
+            return {
+                "name": label,
+                "initial_capital": settings.initial_capital,
+                "final_nav": np.nan,
+                "total_return": np.nan,
+                "annualized_return": np.nan,
+                "annualized_volatility": np.nan,
+                "sharpe_ratio": np.nan,
+                "max_drawdown": np.nan,
+                "win_rate": np.nan,
+                "n_trading_days": 0,
+            }
+
+        daily_ret = valid[ret_col].dropna()
+        final_nav = valid[nav_col].iloc[-1]
         total_return = final_nav / settings.initial_capital - 1
-        n_days = len(nav_df)
+        n_days = len(valid)
         years = n_days / 252
-        ann_return = (final_nav / settings.initial_capital) ** (1 / years) - 1 if years > 0 else np.nan
-        ann_vol = daily_ret.std() * np.sqrt(252)
-        sharpe = daily_ret.mean() / daily_ret.std() * np.sqrt(252) if daily_ret.std() != 0 else np.nan
-        running_max = nav_df[nav_col].cummax()
-        max_drawdown = (nav_df[nav_col] / running_max - 1).min()
-        win_rate = (daily_ret > 0).mean()
+        ann_return = (final_nav / settings.initial_capital) ** (1 / years) - 1 if years > 0 and final_nav > 0 else np.nan
+        ann_vol = daily_ret.std() * np.sqrt(252) if len(daily_ret) else np.nan
+        sharpe = daily_ret.mean() / daily_ret.std() * np.sqrt(252) if len(daily_ret) and daily_ret.std() != 0 else np.nan
+        running_max = valid[nav_col].cummax()
+        max_drawdown = (valid[nav_col] / running_max - 1).min()
+        win_rate = (daily_ret > 0).mean() if len(daily_ret) else np.nan
         return {
             "name": label,
             "initial_capital": settings.initial_capital,
@@ -2991,15 +3293,24 @@ def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, re
             "n_trading_days": n_days,
         }
 
-    rows = [_one("portfolio_nav", "daily_return", f"FF5 Alpha Top {settings.top_n}")]
-    if "benchmark_nav" in nav_df.columns and nav_df["benchmark_nav"].notna().any():
-        rows.append(_one("benchmark_nav", "benchmark_daily_return", settings.benchmark_ticker))
+    strategy_name = f"FF5 Alpha Top {settings.top_n}"
+    rows = [_one("portfolio_nav", "daily_return", strategy_name)]
+
+    attached_benchmarks: list[tuple[dict[str, str], str]] = []
+    for spec in strategy3_unique_benchmark_specs(settings):
+        slug = spec["slug"]
+        prefix = f"benchmark_{slug}"
+        nav_col = f"{prefix}_nav"
+        ret_col = f"{prefix}_daily_return"
+        if nav_col in nav_df.columns and nav_df[nav_col].notna().any():
+            rows.append(_one(nav_col, ret_col, spec["label"]))
+            attached_benchmarks.append((spec, prefix))
 
     perf = pd.DataFrame(rows)
 
-    total_fee_paid = trades_df["total_fee"].sum() if len(trades_df) > 0 else 0.0
-    total_trade_value = trades_df["trade_value"].sum() if len(trades_df) > 0 else 0.0
-    avg_turnover = rebalance_df["turnover_rate"].mean() if len(rebalance_df) > 0 else np.nan
+    total_fee_paid = trades_df["total_fee"].sum() if len(trades_df) > 0 and "total_fee" in trades_df.columns else 0.0
+    total_trade_value = trades_df["trade_value"].sum() if len(trades_df) > 0 and "trade_value" in trades_df.columns else 0.0
+    avg_turnover = rebalance_df["turnover_rate"].mean() if len(rebalance_df) > 0 and "turnover_rate" in rebalance_df.columns else np.nan
 
     perf["commission_rate"] = np.nan
     perf["sell_tax_rate"] = np.nan
@@ -3009,9 +3320,8 @@ def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, re
     perf["avg_turnover_per_rebalance"] = np.nan
     # keep this column as object dtype; assigning a string into a float column can fail on Streamlit/Pandas
     perf["execution_price"] = ""
-    perf["benchmark"] = settings.benchmark_ticker
+    perf["benchmark"] = strategy3_benchmark_label_text(settings)
 
-    strategy_name = f"FF5 Alpha Top {settings.top_n}"
     perf.loc[perf["name"] == strategy_name, "commission_rate"] = settings.commission_rate
     perf.loc[perf["name"] == strategy_name, "sell_tax_rate"] = settings.sell_tax_rate
     perf.loc[perf["name"] == strategy_name, "n_rebalances"] = len(rebalance_df)
@@ -3020,52 +3330,95 @@ def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, re
     perf.loc[perf["name"] == strategy_name, "avg_turnover_per_rebalance"] = avg_turnover
     perf.loc[perf["name"] == strategy_name, "execution_price"] = "t+1 close"
 
-    if len(perf) >= 2:
-        strat_total = perf.loc[perf["name"] == strategy_name, "total_return"].iloc[0]
-        bench_total = perf.loc[perf["name"] == settings.benchmark_ticker, "total_return"].iloc[0]
-        strat_ann = perf.loc[perf["name"] == strategy_name, "annualized_return"].iloc[0]
-        bench_ann = perf.loc[perf["name"] == settings.benchmark_ticker, "annualized_return"].iloc[0]
+    strat_total = perf.loc[perf["name"] == strategy_name, "total_return"].iloc[0]
+    strat_ann = perf.loc[perf["name"] == strategy_name, "annualized_return"].iloc[0]
 
-        active_ret = nav_df["active_daily_return"].dropna() if "active_daily_return" in nav_df.columns else pd.Series(dtype=float)
+    # 多 benchmark 比較：每個 benchmark 產生一組策略超額績效欄位。
+    for spec, prefix in attached_benchmarks:
+        slug = spec["slug"]
+        label = spec["label"]
+        bench_mask = perf["name"] == label
+        if not bench_mask.any():
+            continue
+
+        bench_total = perf.loc[bench_mask, "total_return"].iloc[0]
+        bench_ann = perf.loc[bench_mask, "annualized_return"].iloc[0]
+
+        active_ret_col = f"active_{slug}_daily_return"
+        active_ret = nav_df[active_ret_col].dropna() if active_ret_col in nav_df.columns else pd.Series(dtype=float)
         tracking_error = active_ret.std() * np.sqrt(252) if len(active_ret) else np.nan
         information_ratio = active_ret.mean() / active_ret.std() * np.sqrt(252) if len(active_ret) and active_ret.std() != 0 else np.nan
 
-        perf["strategy_minus_benchmark_total_return"] = np.nan
-        perf["strategy_minus_benchmark_annualized_return"] = np.nan
-        perf["tracking_error"] = np.nan
-        perf["information_ratio"] = np.nan
+        total_col = f"strategy_minus_{slug}_total_return"
+        ann_col = f"strategy_minus_{slug}_annualized_return"
+        te_col = f"tracking_error_vs_{slug}"
+        ir_col = f"information_ratio_vs_{slug}"
 
-        perf.loc[perf["name"] == strategy_name, "strategy_minus_benchmark_total_return"] = strat_total - bench_total
-        perf.loc[perf["name"] == strategy_name, "strategy_minus_benchmark_annualized_return"] = strat_ann - bench_ann
-        perf.loc[perf["name"] == strategy_name, "tracking_error"] = tracking_error
-        perf.loc[perf["name"] == strategy_name, "information_ratio"] = information_ratio
+        for col in [total_col, ann_col, te_col, ir_col]:
+            if col not in perf.columns:
+                perf[col] = np.nan
+
+        perf.loc[perf["name"] == strategy_name, total_col] = strat_total - bench_total
+        perf.loc[perf["name"] == strategy_name, ann_col] = strat_ann - bench_ann
+        perf.loc[perf["name"] == strategy_name, te_col] = tracking_error
+        perf.loc[perf["name"] == strategy_name, ir_col] = information_ratio
 
     return perf
 
 
-def strategy3_plot_nav(nav_df: pd.DataFrame, top_n: int, benchmark_ticker: str) -> go.Figure:
+def strategy3_plot_nav(nav_df: pd.DataFrame, top_n: int, settings: FF5AlphaSettings) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["portfolio_nav"], mode="lines", name=f"FF5 Alpha Top {top_n}"))
-    if "benchmark_nav" in nav_df.columns and nav_df["benchmark_nav"].notna().any():
-        fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["benchmark_nav"], mode="lines", name=f"{benchmark_ticker} Benchmark"))
-    fig.update_layout(title="Portfolio NAV vs Benchmark", template="plotly_white", height=460, hovermode="x unified")
+
+    for spec in strategy3_unique_benchmark_specs(settings):
+        slug = spec["slug"]
+        nav_col = f"benchmark_{slug}_nav"
+        if nav_col in nav_df.columns and nav_df[nav_col].notna().any():
+            fig.add_trace(go.Scatter(
+                x=nav_df["date"],
+                y=nav_df[nav_col],
+                mode="lines",
+                name=f"{spec['label']} Benchmark",
+            ))
+
+    fig.update_layout(title="Portfolio NAV vs Benchmarks", template="plotly_white", height=460, hovermode="x unified")
     return fig
 
 
-def strategy3_plot_cum_return(nav_df: pd.DataFrame, top_n: int, benchmark_ticker: str) -> go.Figure:
+def strategy3_plot_cum_return(nav_df: pd.DataFrame, top_n: int, settings: FF5AlphaSettings) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["cum_return"], mode="lines", name=f"FF5 Alpha Top {top_n}"))
-    if "benchmark_cum_return" in nav_df.columns and nav_df["benchmark_cum_return"].notna().any():
-        fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["benchmark_cum_return"], mode="lines", name=f"{benchmark_ticker} Benchmark"))
+
+    for spec in strategy3_unique_benchmark_specs(settings):
+        slug = spec["slug"]
+        cum_col = f"benchmark_{slug}_cum_return"
+        if cum_col in nav_df.columns and nav_df[cum_col].notna().any():
+            fig.add_trace(go.Scatter(
+                x=nav_df["date"],
+                y=nav_df[cum_col],
+                mode="lines",
+                name=f"{spec['label']} Benchmark",
+            ))
+
     fig.update_layout(title="Cumulative Return", template="plotly_white", height=420, yaxis_tickformat=".1%", hovermode="x unified")
     return fig
 
 
-def strategy3_plot_drawdown(nav_df: pd.DataFrame, top_n: int, benchmark_ticker: str) -> go.Figure:
+def strategy3_plot_drawdown(nav_df: pd.DataFrame, top_n: int, settings: FF5AlphaSettings) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["drawdown"], fill="tozeroy", mode="lines", name=f"FF5 Alpha Top {top_n}"))
-    if "benchmark_drawdown" in nav_df.columns and nav_df["benchmark_drawdown"].notna().any():
-        fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["benchmark_drawdown"], mode="lines", name=f"{benchmark_ticker} Benchmark"))
+
+    for spec in strategy3_unique_benchmark_specs(settings):
+        slug = spec["slug"]
+        dd_col = f"benchmark_{slug}_drawdown"
+        if dd_col in nav_df.columns and nav_df[dd_col].notna().any():
+            fig.add_trace(go.Scatter(
+                x=nav_df["date"],
+                y=nav_df[dd_col],
+                mode="lines",
+                name=f"{spec['label']} Benchmark",
+            ))
+
     fig.update_layout(title="Drawdown", template="plotly_white", height=350, yaxis_tickformat=".1%", hovermode="x unified")
     return fig
 
@@ -3077,7 +3430,7 @@ def render_strategy3_notes() -> None:
         r"""
 ### 策略3：台股五因子 Alpha 月調倉策略
 
-本策略使用資料期間為 **2023/01/01 至 2026/05/18**。策略核心是先建構台股五因子，再利用五因子模型估計每檔股票的 rolling alpha，最後每月選出 alpha 最高的股票進行投資。
+本策略預設正式回測起日為 **2019/01/01**，並可使用 CMoney 原始資料與統一奔騰基金淨值資料延伸至 **2026/05/19**。策略核心是先建構台股五因子，再利用五因子模型估計每檔股票的 rolling alpha，最後每月選出 alpha 最高的股票進行投資。
 
 #### 1. 策略流程簡短總結
 
@@ -3086,7 +3439,7 @@ def render_strategy3_notes() -> None:
 3. 對股票池內每檔股票使用過去 252 個交易日資料進行 Fama-French 五因子 rolling regression，且至少需要 180 筆有效日資料才估計 alpha。
 4. 每個月取得各股票的 rolling alpha 後，依 alpha 由高到低排序。
 5. 網站端選出 Alpha Top N 股票，並在下一個交易日以收盤價進行月調倉。
-6. 回測時會扣除買賣手續費與賣出交易稅，並與 0050 或自訂 benchmark 進行績效比較。
+6. 回測時會扣除買賣手續費與賣出交易稅，並可同時與 0050.TW、統一奔騰基金或其他自訂 benchmark 進行績效比較。
 
 #### 2. 五個因子的建構公式
 
@@ -3324,7 +3677,8 @@ def render_strategy3_page() -> None:
         st.write(
             f"目前設定：市值前 **{settings.market_cap_top_n}**，Alpha Top **{settings.top_n}**，"
             f"lookback **{settings.lookback_days}**，min obs **{settings.min_obs}**，"
-            f"初始資金 **{settings.initial_capital:,.0f}**，Benchmark：**{settings.benchmark_ticker}**。"
+            f"初始資金 **{settings.initial_capital:,.0f}**，正式回測起日 **{settings.backtest_start_date.date()}**，"
+            f"Benchmark：**{strategy3_benchmark_label_text(settings)}**。"
         )
 
         run = st.button("執行策略3回測", type="primary", use_container_width=True)
@@ -3364,9 +3718,10 @@ def render_strategy3_page() -> None:
                                 initial_capital=settings.initial_capital,
                                 commission_rate=settings.commission_rate,
                                 sell_tax_rate=settings.sell_tax_rate,
+                                backtest_start_date=settings.backtest_start_date,
                             )
 
-                        with st.spinner(f"下載 benchmark：{settings.benchmark_ticker}..."):
+                        with st.spinner(f"整理 benchmarks：{strategy3_benchmark_label_text(settings)}..."):
                             nav_df = strategy3_attach_benchmark(nav_df, settings)
 
                         perf = strategy3_calc_performance(nav_df, trades_df, rebalance_df, settings)
@@ -3410,9 +3765,9 @@ def render_strategy3_page() -> None:
             c3.metric("Max Drawdown", f"{strategy_row['max_drawdown']:.2%}")
             c4.metric("Final NAV", f"{strategy_row['final_nav']:,.0f}")
 
-            st.plotly_chart(strategy3_plot_nav(nav_df, settings_used.top_n, settings_used.benchmark_ticker), use_container_width=True)
-            st.plotly_chart(strategy3_plot_cum_return(nav_df, settings_used.top_n, settings_used.benchmark_ticker), use_container_width=True)
-            st.plotly_chart(strategy3_plot_drawdown(nav_df, settings_used.top_n, settings_used.benchmark_ticker), use_container_width=True)
+            st.plotly_chart(strategy3_plot_nav(nav_df, settings_used.top_n, settings_used), use_container_width=True)
+            st.plotly_chart(strategy3_plot_cum_return(nav_df, settings_used.top_n, settings_used), use_container_width=True)
+            st.plotly_chart(strategy3_plot_drawdown(nav_df, settings_used.top_n, settings_used), use_container_width=True)
 
             st.markdown("#### 績效比較表")
             safe_streamlit_dataframe(perf, use_container_width=True, hide_index=True)
