@@ -2774,6 +2774,8 @@ def strategy3_build_raw_pipeline_fallback(
     lookback_days: int,
     min_obs: int,
     original_error: Exception | None = None,
+    start_date: pd.Timestamp | str | None = BACKTEST_START_DEFAULT,
+    end_date: pd.Timestamp | str | None = BACKTEST_END_DEFAULT,
 ) -> dict[str, pd.DataFrame]:
     """
     Fallback when strategy3_ff5_pipeline fails with KeyError('stock_id').
@@ -2794,6 +2796,15 @@ def strategy3_build_raw_pipeline_fallback(
     # If no explicit AD PRICE files are found, DATA close price will be used.
     price_df = strategy3_normalize_price_fallback(price_raw, data_raw)
     characteristics = strategy3_normalize_characteristics_fallback(data_raw, price_df)
+
+    start_ts = pd.Timestamp(start_date).normalize() if start_date is not None else None
+    end_ts = pd.Timestamp(end_date).normalize() if end_date is not None else None
+    if start_ts is not None:
+        price_df = price_df[price_df["date"] >= start_ts].copy()
+        characteristics = characteristics[characteristics["date"] >= start_ts].copy() if "date" in characteristics.columns else characteristics
+    if end_ts is not None:
+        price_df = price_df[price_df["date"] <= end_ts].copy()
+        characteristics = characteristics[characteristics["date"] <= end_ts].copy() if "date" in characteristics.columns else characteristics
 
     prices_wide = (
         price_df.pivot_table(index="date", columns="stock_id", values="adj_close", aggfunc="last")
@@ -2987,7 +2998,7 @@ def strategy3_build_raw_pipeline_fallback(
         "regression_panel": regression_panel,
         "file_manifest": file_manifest_out,
         "fallback_warning": pd.DataFrame([{
-            "message": "外部 strategy3_ff5_pipeline 失敗，因此本次使用內建 fallback pipeline。fallback 以市場因子 MKT rolling alpha 估計，SMB/HML/RMW/CMA 置為 0。",
+            "message": f"外部 strategy3_ff5_pipeline 失敗，因此本次使用內建 fallback pipeline。fallback 以市場因子 MKT rolling alpha 估計，SMB/HML/RMW/CMA 置為 0。原始錯誤：{repr(original_error)}",
             "original_error": repr(original_error),
         }]),
     }
@@ -3065,6 +3076,8 @@ def strategy3_build_raw_pipeline_cached(
             lookback_days=lookback_days,
             min_obs=min_obs,
             original_error=exc,
+            start_date=start_date,
+            end_date=end_date,
         )
 
 def strategy3_filter_alpha_scores(alpha: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
