@@ -2389,6 +2389,15 @@ def resolve_strategy3_path(path_str: str) -> Path:
         cwd / p,
         cwd / "trading-strategy-lab" / p,
         app_dir.parent / p,
+        # Convenient fallbacks for files such as A09012.xlsx when the sidebar path
+        # is kept as data/strategy3/A09012.xlsx but the file is placed directly
+        # under data/ or strategy3/.
+        app_dir / "data" / p.name,
+        cwd / "data" / p.name,
+        app_dir / "data" / "strategy3" / p.name,
+        cwd / "data" / "strategy3" / p.name,
+        app_dir / "strategy3" / p.name,
+        cwd / "strategy3" / p.name,
     ]
 
     seen = set()
@@ -2477,7 +2486,7 @@ def strategy3_build_raw_pipeline_cached(
 
 
 def strategy3_filter_alpha_scores(alpha: pd.DataFrame, settings: FF5AlphaSettings) -> pd.DataFrame:
-    filtered = alpha.copy()
+    filtered = strategy3_normalize_alpha(alpha)
     if settings.require_positive_alpha:
         filtered = filtered[filtered["alpha"] > 0].copy()
     if settings.use_pvalue_filter and "pvalue_alpha" in filtered.columns:
@@ -2485,24 +2494,143 @@ def strategy3_filter_alpha_scores(alpha: pd.DataFrame, settings: FF5AlphaSetting
     return filtered.sort_values(["formation_date", "alpha"], ascending=[True, False]).reset_index(drop=True)
 
 
+
+def strategy3_canonical_col_key(col: object) -> str:
+    """Return a normalized key for loose column matching."""
+    return re.sub(r"[\s_\-()（）/\\.\[\]【】]+", "", str(col).strip().lower())
+
+
+def strategy3_find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Find a column by exact/loose aliases."""
+    if df is None or (df.empty and len(df.columns) == 0):
+        return None
+
+    exact_map = {str(c).strip(): c for c in df.columns}
+    for cand in candidates:
+        if cand in exact_map:
+            return exact_map[cand]
+
+    normalized_map = {strategy3_canonical_col_key(c): c for c in df.columns}
+    for cand in candidates:
+        key = strategy3_canonical_col_key(cand)
+        if key in normalized_map:
+            return normalized_map[key]
+
+    # Some CMoney columns include units or annotations, e.g. 收盤價(元), 證券代碼/名稱.
+    # Try partial matching only after exact matching fails.
+    for cand in candidates:
+        key = strategy3_canonical_col_key(cand)
+        if not key:
+            continue
+        for col in df.columns:
+            col_key = strategy3_canonical_col_key(col)
+            if key and (key in col_key or col_key in key):
+                return col
+
+    return None
+
+
+def strategy3_prepare_stock_id_column(df: pd.DataFrame, context: str) -> pd.DataFrame:
+    """Ensure a DataFrame has a canonical stock_id column."""
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    if "stock_id" not in out.columns:
+        stock_col = strategy3_find_column(out, [
+            "stock_id", "stockid", "stock_code", "stockcode", "code", "ticker", "symbol",
+            "股票代號", "證券代碼", "證券碼", "代號", "股號", "公司代號", "簡稱代號",
+        ])
+        if stock_col is not None:
+            out = out.rename(columns={stock_col: "stock_id"})
+
+    if "stock_id" not in out.columns:
+        # Some pipeline outputs may keep stock code in the index.
+        if out.index.name and strategy3_canonical_col_key(out.index.name) in {
+            "stockid", "stockcode", "股票代號", "證券代碼", "代號", "code", "ticker", "symbol"
+        }:
+            old_index_name = out.index.name
+            out = out.reset_index().rename(columns={old_index_name: "stock_id"})
+
+    if "stock_id" not in out.columns:
+        raise ValueError(
+            f"{context} 缺少 stock_id 欄位。請確認資料處理 pipeline 輸出含股票代號。"
+            f"目前欄位：{list(out.columns)}"
+        )
+
+    out["stock_id"] = clean_stock_id(out["stock_id"])
+    out = out[out["stock_id"].notna() & (out["stock_id"].astype(str).str.len() > 0)].copy()
+    return out
+
+
 def strategy3_normalize_alpha(alpha_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize alpha_scores from strategy3_ff5_pipeline into canonical columns.
+
+    Required output:
+    - formation_date
+    - stock_id
+    - alpha
+
+    This function is intentionally permissive because the upstream FF5 pipeline
+    or CMoney exports may use names such as 股票代號, 證券代碼, stock_code,
+    rebalance_date, rolling_alpha, alpha_daily, etc.
+    """
+    if alpha_raw is None or alpha_raw.empty:
+        return pd.DataFrame(columns=["formation_date", "stock_id", "alpha"])
+
     df = alpha_raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
+    df = strategy3_prepare_stock_id_column(df, "alpha_scores")
 
-    rename_map = {
-        "形成日": "formation_date",
-        "調倉日": "formation_date",
-        "股票代號": "stock_id",
-        "股票名稱": "stock_name",
-        "年化alpha": "alpha_annualized",
-        "年化Alpha": "alpha_annualized",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    formation_col = strategy3_find_column(df, [
+        "formation_date", "formationdate", "rebalance_date", "rebalancedate",
+        "holding_start", "holdingstart", "date", "日期", "形成日", "調倉日", "月調倉日",
+    ])
+    if formation_col is not None and formation_col != "formation_date":
+        df = df.rename(columns={formation_col: "formation_date"})
+
+    name_col = strategy3_find_column(df, [
+        "stock_name", "stockname", "name", "股票名稱", "證券名稱", "簡稱", "公司簡稱", "名稱",
+    ])
+    if name_col is not None and name_col != "stock_name":
+        df = df.rename(columns={name_col: "stock_name"})
+
+    alpha_col = strategy3_find_column(df, [
+        "alpha", "alpha_daily", "daily_alpha", "rolling_alpha", "ff5_alpha",
+        "五因子alpha", "五因子Alpha", "Alpha",
+    ])
+    if alpha_col is not None and alpha_col != "alpha":
+        df = df.rename(columns={alpha_col: "alpha"})
+
+    # If the pipeline only returns annualized alpha, recover daily alpha for ranking/backtest.
+    annualized_col = strategy3_find_column(df, [
+        "alpha_annualized", "annualized_alpha", "annual_alpha",
+        "年化alpha", "年化Alpha", "年化ALPHA",
+    ])
+    if annualized_col is not None and annualized_col != "alpha_annualized":
+        df = df.rename(columns={annualized_col: "alpha_annualized"})
+
+    if "alpha" not in df.columns and "alpha_annualized" in df.columns:
+        df["alpha"] = strategy3_to_num(df["alpha_annualized"]) / 252.0
+
+    pvalue_col = strategy3_find_column(df, [
+        "pvalue_alpha", "p_value_alpha", "pvalue", "p_value", "alpha_pvalue", "alpha_p_value", "p值", "P值",
+    ])
+    if pvalue_col is not None and pvalue_col != "pvalue_alpha":
+        df = df.rename(columns={pvalue_col: "pvalue_alpha"})
+
+    rank_col = strategy3_find_column(df, [
+        "alpha_rank", "rank", "排名", "alpha排名", "Alpha排名",
+    ])
+    if rank_col is not None and rank_col != "alpha_rank":
+        df = df.rename(columns={rank_col: "alpha_rank"})
 
     required = ["formation_date", "stock_id", "alpha"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"alpha scores 缺少必要欄位：{missing}")
+        raise ValueError(
+            f"alpha_scores 缺少必要欄位：{missing}。目前欄位：{list(df.columns)}"
+        )
 
     df["formation_date"] = parse_strategy3_date_series(df["formation_date"])
     if "holding_start" in df.columns:
@@ -2510,14 +2638,16 @@ def strategy3_normalize_alpha(alpha_raw: pd.DataFrame) -> pd.DataFrame:
     if "holding_end" in df.columns:
         df["holding_end"] = parse_strategy3_date_series(df["holding_end"])
 
-    df["stock_id"] = clean_stock_id(df["stock_id"])
     for c in [
         "alpha", "alpha_annualized", "pvalue_alpha", "alpha_rank",
         "rank_in_top150", "beta_mkt", "beta_smb", "beta_hml", "beta_rmw", "beta_cma",
         "r2", "adj_r2", "n_obs"
     ]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = strategy3_to_num(df[c])
+
+    if "alpha_annualized" not in df.columns and "alpha" in df.columns:
+        df["alpha_annualized"] = df["alpha"] * 252.0
 
     df = df.dropna(subset=["formation_date", "stock_id", "alpha"])
     df = df.drop_duplicates(["formation_date", "stock_id"], keep="last")
@@ -2525,33 +2655,60 @@ def strategy3_normalize_alpha(alpha_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def strategy3_normalize_price(price_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize price_df from strategy3_ff5_pipeline into canonical columns.
+
+    Required output:
+    - date
+    - stock_id
+    - adj_close
+    """
+    if price_raw is None or price_raw.empty:
+        return pd.DataFrame(columns=["date", "stock_id", "stock_name", "adj_close"])
+
     df = price_raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
+    df = strategy3_prepare_stock_id_column(df, "price_df / AD PRICE")
 
-    rename_map = {
-        "日期": "date",
-        "股票代號": "stock_id",
-        "股票名稱": "stock_name",
-        "收盤價": "adj_close",
-        "還原收盤價": "adj_close",
-        "成交量": "volume",
-        "成交金額(千)": "trading_value_thousand",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    date_col = strategy3_find_column(df, [
+        "date", "trading_date", "tradedate", "年月日", "日期", "交易日期", "資料日期",
+    ])
+    if date_col is not None and date_col != "date":
+        df = df.rename(columns={date_col: "date"})
 
-    required = ["date", "stock_id", "adj_close"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"AD PRICE 缺少必要欄位：{missing}")
+    name_col = strategy3_find_column(df, [
+        "stock_name", "stockname", "name", "股票名稱", "證券名稱", "簡稱", "公司簡稱", "名稱",
+    ])
+    if name_col is not None and name_col != "stock_name":
+        df = df.rename(columns={name_col: "stock_name"})
+
+    close_col = strategy3_find_column(df, [
+        "adj_close", "adjusted_close", "adjustedclose", "還原收盤價", "還原收盤價元",
+        "收盤價", "收盤價元", "close", "Close", "price", "價格",
+    ])
+    if close_col is not None and close_col != "adj_close":
+        df = df.rename(columns={close_col: "adj_close"})
 
     if "stock_name" not in df.columns:
         df["stock_name"] = ""
 
+    required = ["date", "stock_id", "adj_close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"price_df / AD PRICE 缺少必要欄位：{missing}。目前欄位：{list(df.columns)}"
+        )
+
     df["date"] = parse_strategy3_date_series(df["date"])
-    df["stock_id"] = clean_stock_id(df["stock_id"])
     df["adj_close"] = strategy3_to_num(df["adj_close"])
 
+    if "volume" in df.columns:
+        df["volume"] = strategy3_to_num(df["volume"])
+    if "trading_value_thousand" in df.columns:
+        df["trading_value_thousand"] = strategy3_to_num(df["trading_value_thousand"])
+
     df = df.dropna(subset=["date", "stock_id", "adj_close"])
+    df = df[df["adj_close"] > 0].copy()
     df = df.drop_duplicates(["date", "stock_id"], keep="last")
     return df.sort_values(["date", "stock_id"]).reset_index(drop=True)
 
@@ -2564,6 +2721,8 @@ def strategy3_next_trading_date(trading_dates: pd.DatetimeIndex, current_date: p
 
 
 def strategy3_create_positions(alpha: pd.DataFrame, price_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    alpha = strategy3_normalize_alpha(alpha)
+    price_df = strategy3_normalize_price(price_df)
     trading_dates = pd.DatetimeIndex(sorted(price_df["date"].dropna().unique()))
     rows: list[pd.DataFrame] = []
 
@@ -2653,6 +2812,15 @@ def strategy3_run_backtest(
     sell_tax_rate: float,
     backtest_start_date: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    price_df = strategy3_normalize_price(price_df)
+    positions = positions.copy()
+    positions = strategy3_prepare_stock_id_column(positions, "positions")
+    if "holding_start" not in positions.columns:
+        raise ValueError(f"positions 缺少 holding_start 欄位，目前欄位：{list(positions.columns)}")
+    positions["holding_start"] = parse_strategy3_date_series(positions["holding_start"])
+    if "target_weight" not in positions.columns:
+        raise ValueError(f"positions 缺少 target_weight 欄位，目前欄位：{list(positions.columns)}")
+
     price_lookup = price_df.set_index(["date", "stock_id"])["adj_close"].sort_index()
     name_lookup = price_df.drop_duplicates("stock_id").set_index("stock_id")["stock_name"].to_dict()
     trading_dates = pd.DatetimeIndex(sorted(price_df["date"].dropna().unique()))
@@ -3692,8 +3860,8 @@ def render_strategy3_page() -> None:
                         settings.lookback_days,
                         settings.min_obs,
                     )
-                    alpha = raw_result["alpha_scores"]
-                    price_df = raw_result["price_df"]
+                    alpha = strategy3_normalize_alpha(raw_result["alpha_scores"])
+                    price_df = strategy3_normalize_price(raw_result["price_df"])
 
                 if alpha.empty:
                     st.error("沒有成功產生 alpha scores，請調低 min obs 或檢查原始資料期間。")
