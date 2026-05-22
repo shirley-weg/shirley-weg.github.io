@@ -1,8 +1,8 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
 import re
 
 import numpy as np
@@ -11,6 +11,8 @@ import statsmodels.api as sm
 
 
 FACTOR_COLS = ["MKT_RF", "SMB", "HML", "RMW", "CMA"]
+DEFAULT_START = pd.Timestamp("2019-01-01")
+DEFAULT_END = pd.Timestamp("2026-05-19")
 
 
 @dataclass(frozen=True)
@@ -18,73 +20,171 @@ class FF5RawBuildConfig:
     market_cap_top_n: int = 150
     lookback_days: int = 252
     min_obs: int = 180
-    # Strategy 3 requested backtest/data window: 2019 through 2026.
-    # The pipeline keeps enough rows inside this window and the Streamlit app
-    # later uses backtest_start_date/backtest_end_date for the actual NAV range.
-    start_date: str | pd.Timestamp | None = "2019-01-01"
-    end_date: str | pd.Timestamp | None = "2026-12-31"
+    start_date: pd.Timestamp | str | None = DEFAULT_START
+    end_date: pd.Timestamp | str | None = DEFAULT_END
 
 
-def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict[str, pd.DataFrame]:
-    """
-    Robust Strategy 3 FF5 pipeline.
+# ============================================================
+# Generic robust helpers
+# ============================================================
 
-    Key fixes:
-    - classify raw files by both file name and parent folder name, so folders like
-      data/, ad_price/, asset/, rmw/ work even when filenames only contain dates.
-    - DATA is required; AD PRICE is optional and falls back to DATA close price.
-    - ASSET/RMW are optional; if missing or unusable, HML/SMB can still be built
-      from DATA and RMW/CMA neutral buckets are used instead of crashing.
-    - all outputs use canonical columns: date, stock_id, stock_name, adj_close.
-    """
-    files = discover_strategy3_raw_files(raw_dir)
+def _as_timestamp(value, default: pd.Timestamp | None = None) -> pd.Timestamp | None:
+    """Safely convert scalar to Timestamp; prevents Timestamp/float comparisons."""
+    if value is None:
+        return default
+    if isinstance(value, float) and np.isnan(value):
+        return default
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return default
+    if pd.isna(ts):
+        return default
+    return pd.Timestamp(ts).normalize()
 
-    data_raw = read_many_excel(files.get("data", []), required=True, label="DATA")
-    ad_raw = read_many_excel(files.get("ad_price", []), required=False, label="AD PRICE")
-    asset_raw = read_many_excel(files.get("asset", []), required=False, label="ASSET")
-    rmw_raw = read_many_excel(files.get("rmw", []), required=False, label="RMW")
 
-    data = normalize_market_data(data_raw)
+def _date_bounds(config: FF5RawBuildConfig) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    return _as_timestamp(config.start_date, DEFAULT_START), _as_timestamp(config.end_date, DEFAULT_END)
 
-    if ad_raw is not None and not ad_raw.empty:
-        price_df = normalize_ad_price(ad_raw)
-    else:
-        price_df = normalize_ad_price(data_raw)
 
-    fin = build_financial_panel(asset_raw, rmw_raw)
+def canonical_col_key(col: object) -> str:
+    return re.sub(r"[\s_\-()（）/\\.\[\]【】:：]+", "", str(col).strip().lower())
 
-    start_ts = pd.Timestamp(config.start_date).normalize() if config.start_date is not None else None
-    end_ts = pd.Timestamp(config.end_date).normalize() if config.end_date is not None else None
-    if start_ts is not None:
-        data = data[data["date"] >= start_ts].copy()
-        price_df = price_df[price_df["date"] >= start_ts].copy()
-    if end_ts is not None:
-        data = data[data["date"] <= end_ts].copy()
-        price_df = price_df[price_df["date"] <= end_ts].copy()
 
-    if data.empty:
-        raise ValueError("DATA files have no valid rows after the requested date filtering.")
-    if price_df.empty:
-        raise ValueError("Price data has no valid rows after the requested date filtering.")
+def find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None or len(df.columns) == 0:
+        return None
 
-    returns = price_df[["date", "stock_id", "stock_name", "adj_close", "ret"]].copy()
-    formations = build_top_market_cap_formations(data, fin, config.market_cap_top_n)
-    factor_panel, ff5 = build_ff5_factor_returns(returns, formations)
-    alpha_scores, regression_panel = build_rolling_alpha_scores(ff5, formations, returns, config)
+    exact_map = {str(c).strip(): c for c in df.columns}
+    for cand in candidates:
+        if cand in exact_map:
+            return exact_map[cand]
 
-    return {
-        "file_manifest": build_file_manifest(files),
-        "ff5": ff5,
-        "formations": formations,
-        "factor_panel": factor_panel,
-        "alpha_scores": alpha_scores,
-        "price_df": price_df,
-        "regression_panel": regression_panel,
-    }
+    norm_map = {canonical_col_key(c): c for c in df.columns}
+    for cand in candidates:
+        key = canonical_col_key(cand)
+        if key in norm_map:
+            return norm_map[key]
 
+    # Partial matching for columns with units, e.g. 收盤價(元), 股票代號/名稱
+    for cand in candidates:
+        key = canonical_col_key(cand)
+        if not key:
+            continue
+        for col in df.columns:
+            ckey = canonical_col_key(col)
+            if key == ckey or key in ckey or ckey in key:
+                return col
+
+    return None
+
+
+def rename_by_alias(df: pd.DataFrame, alias_map: dict[str, list[str]]) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    ren = {}
+    for target, aliases in alias_map.items():
+        if target in out.columns:
+            continue
+        found = find_column(out, aliases)
+        if found is not None and found != target:
+            ren[found] = target
+    if ren:
+        out = out.rename(columns=ren)
+    return out
+
+
+def clean_stock_id(s: pd.Series) -> pd.Series:
+    extracted = s.astype(str).str.extract(r"(\d+)")[0]
+    return extracted.where(extracted.notna(), "").str.zfill(4)
+
+
+def to_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("--", "", regex=False)
+        .str.replace("- -", "", regex=False)
+        .str.replace("—", "", regex=False)
+        .str.replace("－", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    )
+
+
+def parse_date(s: pd.Series) -> pd.Series:
+    """Robust date parser for CMoney exports: yyyy/mm/dd, yyyymmdd, Excel serial, Timestamp."""
+    if s is None:
+        return pd.Series(dtype="datetime64[ns]")
+
+    raw = s.copy()
+    raw_str = raw.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+
+    # 20191231 / 20191231.0
+    compact = raw_str.str.replace(r"\.0$", "", regex=True)
+    is_yyyymmdd = compact.str.fullmatch(r"\d{8}")
+    if is_yyyymmdd.any():
+        out.loc[is_yyyymmdd] = pd.to_datetime(compact.loc[is_yyyymmdd], format="%Y%m%d", errors="coerce")
+
+    # 2019/12/31, 2019-12-31, Timestamp
+    remain = out.isna()
+    if remain.any():
+        out.loc[remain] = pd.to_datetime(raw.loc[remain], errors="coerce")
+
+    # Excel serial only when it looks like a serial number, not yyyyMMdd
+    numeric = pd.to_numeric(raw, errors="coerce")
+    serial_like = numeric.between(20000, 60000) & compact.str.fullmatch(r"\d+")
+    serial_like = serial_like & out.isna()
+    if serial_like.any():
+        out.loc[serial_like] = pd.to_datetime(
+            numeric.loc[serial_like],
+            unit="D",
+            origin="1899-12-30",
+            errors="coerce",
+        )
+
+    return out.dt.normalize().astype("datetime64[ns]")
+
+
+def parse_cmoney_quarter(s: pd.Series) -> pd.Series:
+    """Parse strings like 2023Q1, 2023/1, 2023年第1季, 2023 1 into Period[Q]."""
+    if s is None:
+        return pd.Series(dtype=object)
+    text = s.astype(str).str.strip()
+    parsed = text.str.extract(r"(\d{4})\D*(?:q|Q|第)?\D*(\d{1,2})")
+    years = pd.to_numeric(parsed[0], errors="coerce")
+    quarters = pd.to_numeric(parsed[1], errors="coerce")
+    out = pd.Series(pd.NaT, index=s.index, dtype=object)
+    valid = years.notna() & quarters.notna() & quarters.between(1, 4)
+    if valid.any():
+        out.loc[valid] = pd.PeriodIndex.from_fields(
+            year=years.loc[valid].astype(int),
+            quarter=quarters.loc[valid].astype(int),
+            freq="Q",
+        )
+    return out
+
+
+def filter_date_range(df: pd.DataFrame, date_col: str, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    if df is None or df.empty or date_col not in df.columns:
+        return df
+    out = df.copy()
+    out[date_col] = parse_date(out[date_col])
+    out = out.dropna(subset=[date_col])
+    if start is not None:
+        out = out[out[date_col] >= start]
+    if end is not None:
+        out = out[out[date_col] <= end]
+    return out
+
+
+# ============================================================
+# File discovery / reading
+# ============================================================
 
 def discover_strategy3_raw_files(raw_dir: str | Path) -> dict[str, list[Path]]:
-    """Discover CMoney raw files by filename OR folder name."""
     base = Path(raw_dir).expanduser().resolve()
     if not base.exists():
         raise FileNotFoundError(f"Strategy 3 raw data folder not found: {base}")
@@ -96,41 +196,43 @@ def discover_strategy3_raw_files(raw_dir: str | Path) -> dict[str, list[Path]]:
         and not p.name.startswith("~$")
     ]
 
-    def key(path: Path) -> str:
-        rel = str(path.relative_to(base)).lower().replace("\\", "/")
-        return rel.replace("-", "_").replace(" ", "_")
+    def blob(path: Path) -> str:
+        rel = str(path.relative_to(base)).upper().replace("\\", "/")
+        return rel
 
-    def classify(path: Path) -> str:
-        s = key(path)
-        name = path.name.lower().replace("-", "_").replace(" ", "_")
-        if any(tok in s for tok in ["a09012", "benchmark", "奔騰", "統一奔騰"]):
-            return "ignore"
-        if any(tok in s for tok in ["ad_price", "adprice", "adj_price", "adjusted_price", "還原"]):
-            return "ad_price"
-        if any(tok in s for tok in ["/asset/", "asset/", "_asset", "asset", "資產負債"]):
-            return "asset"
-        if any(tok in s for tok in ["/rmw/", "rmw/", "_rmw", "rmw", "損益", "profit"]):
-            return "rmw"
-        if any(tok in s for tok in ["/data/", "data/", "_data", "data", "日收盤", "市值"]):
-            return "data"
-        if any(tok in name for tok in ["price", "收盤"]):
-            return "ad_price"
-        return "other"
+    def is_group(path: Path, group: str) -> bool:
+        b = blob(path)
+        # use both folder and filename; supports data/xxx.xlsx, ad_price/xxx.xlsx
+        if group == "ad_price":
+            return ("AD_PRICE" in b or "AD PRICE" in b or "ADPRICE" in b or "/AD_PRICE/" in b or "/AD PRICE/" in b)
+        if group == "asset":
+            return ("ASSET" in b or "/ASSET/" in b)
+        if group == "rmw":
+            return ("RMW" in b or "/RMW/" in b)
+        if group == "data":
+            return (
+                ("DATA" in b or "/DATA/" in b)
+                and not is_group(path, "ad_price")
+                and not is_group(path, "asset")
+                and not is_group(path, "rmw")
+                and "A09012" not in b
+            )
+        return False
 
-    groups: dict[str, list[Path]] = {"data": [], "ad_price": [], "asset": [], "rmw": []}
-    for p in candidates:
-        c = classify(p)
-        if c in groups:
-            groups[c].append(p)
-    for k in groups:
-        groups[k] = sorted(groups[k])
+    ad_price = sorted(p for p in candidates if is_group(p, "ad_price"))
+    asset = sorted(p for p in candidates if is_group(p, "asset"))
+    rmw = sorted(p for p in candidates if is_group(p, "rmw"))
+    data = sorted(p for p in candidates if is_group(p, "data"))
 
-    if not groups["data"]:
+    if not data:
         found = "\n".join(str(p.relative_to(base)) for p in candidates[:120])
         raise FileNotFoundError(
-            f"Missing raw DATA files. Checked folder: {base}\nFound files:\n{found}"
+            "Missing required DATA files. "
+            f"Checked folder: {base}\nFound files:\n{found}"
         )
-    return groups
+
+    # AD PRICE / ASSET / RMW are allowed to be absent; downstream uses DATA/neutral fallback.
+    return {"data": data, "ad_price": ad_price, "asset": asset, "rmw": rmw}
 
 
 def build_file_manifest(files: dict[str, list[Path]]) -> pd.DataFrame:
@@ -143,416 +245,289 @@ def build_file_manifest(files: dict[str, list[Path]]) -> pd.DataFrame:
                 "path": str(p),
                 "size_mb": p.stat().st_size / 1_000_000,
             })
-    return pd.DataFrame(rows, columns=["group", "file_name", "path", "size_mb"])
+    return pd.DataFrame(rows)
 
 
-def read_many_excel(paths: list[Path], required: bool = True, label: str = "Excel") -> pd.DataFrame:
-    """Read CSV/XLS/XLSX files and concatenate; try multiple header rows."""
+def read_one_table(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".csv":
+        for enc in ["utf-8-sig", "cp950", "big5", "utf-8"]:
+            try:
+                df = pd.read_csv(path, encoding=enc)
+                break
+            except Exception:
+                df = None
+        if df is None:
+            raise ValueError(f"Cannot read CSV file: {path}")
+    else:
+        df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    df["source_file"] = path.name
+    return df
+
+
+def read_many_excel(paths: list[Path]) -> pd.DataFrame:
     dfs = []
     for path in paths:
-        suffix = path.suffix.lower()
         try:
-            if suffix == ".csv":
-                last_error = None
-                for enc in ["utf-8-sig", "utf-8", "big5", "cp950"]:
-                    try:
-                        df = pd.read_csv(path, encoding=enc)
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                else:
-                    raise last_error  # type: ignore[misc]
-            elif suffix in {".xlsx", ".xls"}:
-                df = None
-                errors = []
-                for header in [0, 1, 2, 3, 4, 5]:
-                    try:
-                        tmp = pd.read_excel(path, header=header)
-                        tmp.columns = [str(c).strip() for c in tmp.columns]
-                        usable_cols = [c for c in tmp.columns if c and not c.lower().startswith("unnamed") and c.lower() != "nan"]
-                        joined = "|".join(usable_cols)
-                        if len(usable_cols) >= 2 and any(tok in joined for tok in ["日期", "年月", "年季", "股票", "證券", "date", "stock"]):
-                            df = tmp
-                            break
-                        if df is None and len(usable_cols) >= 4:
-                            df = tmp
-                    except Exception as exc:
-                        errors.append(str(exc))
-                if df is None:
-                    raise ValueError(f"Unable to read {path.name}; {errors[-1] if errors else ''}")
-            else:
-                continue
-            df.columns = [str(c).strip() for c in df.columns]
-            df = df.loc[:, [c for c in df.columns if c and not str(c).lower().startswith("unnamed")]]
-            df["source_file"] = path.name
-            dfs.append(df)
+            df = read_one_table(path)
+            if not df.empty:
+                dfs.append(df)
         except Exception as exc:
-            if required:
-                raise ValueError(f"Failed to read {label} file {path.name}: {exc}") from exc
-            continue
+            raise ValueError(f"Failed to read raw file {path}: {exc}") from exc
     if not dfs:
-        if required:
-            raise FileNotFoundError(f"No readable {label} files were provided.")
         return pd.DataFrame()
     return pd.concat(dfs, ignore_index=True, sort=False)
 
 
-def clean_stock_id(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.extract(r"(\d+)")[0].str.zfill(4)
-
-
-def to_num(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(
-        s.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("--", "", regex=False)
-        .str.replace("- -", "", regex=False)
-        .str.strip(),
-        errors="coerce",
-    )
-
-
-def parse_date(s: pd.Series) -> pd.Series:
-    raw = s.copy()
-    raw_str = raw.astype(str).str.strip()
-    out = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
-
-    is_yyyymmdd = raw_str.str.fullmatch(r"\d{8}")
-    if is_yyyymmdd.any():
-        out.loc[is_yyyymmdd] = pd.to_datetime(raw_str.loc[is_yyyymmdd], format="%Y%m%d", errors="coerce")
-
-    remain = ~is_yyyymmdd
-    out.loc[remain] = pd.to_datetime(raw.loc[remain], errors="coerce")
-
-    numeric = pd.to_numeric(raw, errors="coerce")
-    is_excel_serial = numeric.between(20000, 60000) & raw_str.str.fullmatch(r"\d+(\.0)?")
-    if is_excel_serial.any():
-        out.loc[is_excel_serial] = pd.to_datetime(
-            numeric.loc[is_excel_serial],
-            unit="D",
-            origin="1899-12-30",
-            errors="coerce",
-        )
-
-    return out.dt.normalize().astype("datetime64[ns]")
-
-
-def parse_cmoney_quarter(s: pd.Series) -> pd.Series:
-    parsed = s.astype(str).str.extract(r"(\d{4})\D+(\d{1,2})")
-    years = pd.to_numeric(parsed[0], errors="coerce")
-    quarters = pd.to_numeric(parsed[1], errors="coerce")
-    out = pd.Series(pd.NaT, index=s.index, dtype=object)
-    valid = years.notna() & quarters.notna()
-    if valid.any():
-        out.loc[valid] = pd.PeriodIndex.from_fields(
-            year=years.loc[valid].astype(int),
-            quarter=quarters.loc[valid].astype(int),
-            freq="Q",
-        )
-    return out
-
-
-
 # ============================================================
-# Robust CMoney Column Helpers
+# Normalizers
 # ============================================================
 
-def canonical_col_key(col: object) -> str:
-    """Canonicalize CMoney / English column names for loose matching."""
-    s = str(col).strip().lower()
-    s = s.replace("（", "(").replace("）", ")")
-    s = re.sub(r"[\s_\-./\\:：()\[\]{}]+", "", s)
-    s = s.replace("％", "%")
-    return s
+COMMON_ALIASES = {
+    "date": ["date", "日期", "年月日", "交易日期", "資料日期"],
+    "stock_id": ["stock_id", "stock_code", "code", "ticker", "symbol", "股票代號", "股票代碼", "證券代碼", "證券代號", "公司代號", "代號"],
+    "stock_name": ["stock_name", "name", "股票名稱", "證券名稱", "簡稱", "公司名稱"],
+}
 
+def normalize_market_data(data_raw: pd.DataFrame, start_date=None, end_date=None) -> pd.DataFrame:
+    if data_raw is None or data_raw.empty:
+        raise ValueError("DATA files are empty.")
 
-def find_column(df: pd.DataFrame, candidates: list[str], contains: list[str] | None = None) -> str | None:
-    if df is None or df.empty:
-        return None
-    cols = [str(c).strip() for c in df.columns]
-    direct = {c: c for c in cols}
-    for c in candidates:
-        if c in direct:
-            return direct[c]
-    cmap = {canonical_col_key(c): c for c in cols}
-    for c in candidates:
-        key = canonical_col_key(c)
-        if key in cmap:
-            return cmap[key]
-    if contains:
-        contains_keys = [canonical_col_key(c) for c in contains]
-        for col in cols:
-            key = canonical_col_key(col)
-            if all(token in key for token in contains_keys):
-                return col
-    return None
-
-
-def prepare_stock_id_column(df: pd.DataFrame, context: str) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-
-    if "stock_id" not in out.columns:
-        stock_col = find_column(out, [
-            "stock_id", "stock_code", "code", "ticker", "symbol", "證券代碼", "證券代號",
-            "股票代號", "股票代碼", "公司代號", "代號", "簡稱代號",
-        ])
-        if stock_col is None and out.index.name is not None:
-            idx_key = canonical_col_key(out.index.name)
-            if idx_key in {canonical_col_key(c) for c in ["stock_id", "股票代號", "證券代碼", "代號"]}:
-                out = out.reset_index()
-                stock_col = str(out.columns[0])
-        if stock_col is None:
-            raise ValueError(f"{context} 缺少 stock_id / 股票代號欄位，目前欄位：{list(out.columns)}")
-        out = out.rename(columns={stock_col: "stock_id"})
-
-    out["stock_id"] = clean_stock_id(out["stock_id"])
-    out = out[out["stock_id"].notna()].copy()
-    return out
-
-
-def filter_by_date_range(df: pd.DataFrame, date_col: str, start_date=None, end_date=None) -> pd.DataFrame:
-    if df is None or df.empty or date_col not in df.columns:
-        return df
-    out = df.copy()
-    out[date_col] = parse_date(out[date_col])
-    if start_date is not None:
-        out = out[out[date_col] >= pd.Timestamp(start_date).normalize()].copy()
-    if end_date is not None:
-        out = out[out[date_col] <= pd.Timestamp(end_date).normalize()].copy()
-    return out
-
-def normalize_market_data(data_raw: pd.DataFrame) -> pd.DataFrame:
-    df = prepare_stock_id_column(data_raw, "DATA files").copy()
-
-    date_col = find_column(df, ["date", "trading_date", "年月日", "日期"])
-    name_col = find_column(df, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱", "公司名稱"])
-    close_col = find_column(df, ["close", "收盤價", "收盤價(元)", "收盤", "Close"])
-    volume_col = find_column(df, ["volume", "成交量", "成交股數", "成交量(千股)", "成交量(張)"])
-    tv_col = find_column(df, ["trading_value_thousand", "成交金額(千)", "成交金額", "成交值", "成交金額(元)"])
-    cap_col = find_column(df, ["capital_million", "股本(百萬)", "股本", "實收資本額(百萬)"])
-    mcap_col = find_column(df, [
-        "market_cap_100m", "總市值(億)", "總市值", "市值(億)", "市場總值(億)",
-        "market_cap", "市值", "總市值(百萬)", "市場總值",
-    ])
-    pb_col = find_column(df, ["pb", "股價淨值比", "PBR", "PB", "price_to_book"])
-    turnover_col = find_column(df, ["turnover_pct", "週轉率(%)", "週轉率", "turnover"])
-
-    missing = []
-    if date_col is None:
-        missing.append("date/日期")
-    if mcap_col is None:
-        missing.append("market_cap_100m/總市值(億)")
-    if missing:
-        raise ValueError(f"DATA files are missing required columns: {missing}. Current columns: {list(df.columns)}")
-
-    out = pd.DataFrame({
-        "date": parse_date(df[date_col]),
-        "stock_id": clean_stock_id(df["stock_id"]),
-        "stock_name": df[name_col].astype(str).str.strip() if name_col is not None else "",
-        "close": to_num(df[close_col]) if close_col is not None else np.nan,
-        "volume": to_num(df[volume_col]) if volume_col is not None else np.nan,
-        "trading_value_thousand": to_num(df[tv_col]) if tv_col is not None else np.nan,
-        "capital_million": to_num(df[cap_col]) if cap_col is not None else np.nan,
-        "market_cap_100m": to_num(df[mcap_col]),
-        "pb": to_num(df[pb_col]) if pb_col is not None else np.nan,
-        "turnover_pct": to_num(df[turnover_col]) if turnover_col is not None else np.nan,
+    df = rename_by_alias(data_raw, {
+        **COMMON_ALIASES,
+        "open": ["open", "開盤價"],
+        "close": ["close", "收盤價", "收盤價(元)", "價格"],
+        "volume": ["volume", "成交量"],
+        "trading_value_thousand": ["trading_value_thousand", "成交金額(千)", "成交金額", "成交值"],
+        "capital_million": ["capital_million", "股本(百萬)", "股本"],
+        "market_cap_100m": ["market_cap_100m", "總市值(億)", "市值(億)", "總市值", "市值"],
+        "pb": ["pb", "股價淨值比", "PBR", "PB"],
+        "turnover_pct": ["turnover_pct", "週轉率(%)", "週轉率"],
     })
 
-    return (
-        out.dropna(subset=["date", "stock_id", "market_cap_100m"])
+    # Some exports combine code and name into one column.
+    if "stock_id" not in df.columns:
+        combined = find_column(df, ["股票代號/名稱", "證券代碼/名稱", "代號名稱"])
+        if combined is not None:
+            df["stock_id"] = df[combined]
+            if "stock_name" not in df.columns:
+                df["stock_name"] = df[combined].astype(str).str.replace(r"^\s*\d+\s*", "", regex=True)
+
+    required = ["date", "stock_id", "market_cap_100m"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"DATA files are missing required columns: {missing}; current columns={list(data_raw.columns)}")
+
+    df["date"] = parse_date(df["date"])
+    df["stock_id"] = clean_stock_id(df["stock_id"])
+    if "stock_name" not in df.columns:
+        df["stock_name"] = ""
+
+    for col in ["open", "close", "volume", "trading_value_thousand", "capital_million", "market_cap_100m", "pb", "turnover_pct"]:
+        if col in df.columns:
+            df[col] = to_num(df[col])
+        else:
+            df[col] = np.nan
+
+    start, end = _as_timestamp(start_date, None), _as_timestamp(end_date, None)
+    df = filter_date_range(df, "date", start, end)
+
+    columns = ["date", "stock_id", "stock_name", "open", "close", "volume", "trading_value_thousand", "capital_million", "market_cap_100m", "pb", "turnover_pct"]
+    out = (
+        df.dropna(subset=["date", "stock_id", "market_cap_100m"])
+        .query("stock_id != ''")
         .drop_duplicates(["date", "stock_id"], keep="last")
+        .loc[:, columns]
         .sort_values(["date", "stock_id"])
         .reset_index(drop=True)
     )
+    if out.empty:
+        raise ValueError("DATA normalization produced zero rows. Please check date range and required columns.")
+    return out
 
-def normalize_ad_price(ad_raw: pd.DataFrame) -> pd.DataFrame:
-    df = prepare_stock_id_column(ad_raw, "AD PRICE files").copy()
 
-    date_col = find_column(df, ["date", "trading_date", "年月日", "日期"])
-    name_col = find_column(df, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱", "公司名稱"])
-    close_col = find_column(df, [
-        "adj_close", "adjusted_close", "還原收盤價", "調整收盤價", "收盤價", "收盤價(元)",
-        "close", "Close", "price",
-    ])
-    volume_col = find_column(df, ["volume", "成交量", "成交股數", "成交量(千股)", "成交量(張)"])
-    tv_col = find_column(df, ["trading_value_thousand", "成交金額(千)", "成交金額", "成交值", "成交金額(元)"])
-    mcap_col = find_column(df, ["market_cap_100m", "總市值(億)", "總市值", "市值(億)", "市值", "市場總值"])
+def normalize_ad_price(ad_raw: pd.DataFrame, data: pd.DataFrame | None = None, start_date=None, end_date=None) -> pd.DataFrame:
+    # If AD PRICE is missing, use DATA close as adjusted close.
+    if ad_raw is None or ad_raw.empty:
+        if data is None or data.empty or "close" not in data.columns:
+            raise ValueError("AD PRICE files are missing and DATA close is unavailable.")
+        df = data[["date", "stock_id", "stock_name", "close", "volume", "trading_value_thousand", "market_cap_100m"]].copy()
+        df = df.rename(columns={"close": "adj_close"})
+    else:
+        df = rename_by_alias(ad_raw, {
+            **COMMON_ALIASES,
+            "adj_close": ["adj_close", "close", "Close", "收盤價", "收盤價(元)", "還原收盤價", "調整收盤價", "Adj Close", "adjclose"],
+            "volume": ["volume", "成交量"],
+            "trading_value_thousand": ["trading_value_thousand", "成交金額(千)", "成交金額", "成交值"],
+            "market_cap_100m": ["market_cap_100m", "總市值(億)", "市值(億)", "總市值", "市值"],
+        })
 
-    missing = []
-    if date_col is None:
-        missing.append("date/日期")
-    if close_col is None:
-        missing.append("adj_close/收盤價")
+    required = ["date", "stock_id", "adj_close"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"AD PRICE files are missing required columns: {missing}. Current columns: {list(df.columns)}")
+        raise ValueError(f"AD PRICE files are missing required columns: {missing}; current columns={list(ad_raw.columns) if ad_raw is not None else []}")
 
-    out = pd.DataFrame({
-        "date": parse_date(df[date_col]),
-        "stock_id": clean_stock_id(df["stock_id"]),
-        "stock_name": df[name_col].astype(str).str.strip() if name_col is not None else "",
-        "adj_close": to_num(df[close_col]),
-        "volume": to_num(df[volume_col]) if volume_col is not None else np.nan,
-        "trading_value_thousand": to_num(df[tv_col]) if tv_col is not None else np.nan,
-        "market_cap_100m": to_num(df[mcap_col]) if mcap_col is not None else np.nan,
-    })
+    if "stock_name" not in df.columns:
+        df["stock_name"] = ""
+    df["date"] = parse_date(df["date"])
+    df["stock_id"] = clean_stock_id(df["stock_id"])
+    df["adj_close"] = to_num(df["adj_close"])
+    for col in ["volume", "trading_value_thousand", "market_cap_100m"]:
+        if col in df.columns:
+            df[col] = to_num(df[col])
+        else:
+            df[col] = np.nan
+
+    start, end = _as_timestamp(start_date, None), _as_timestamp(end_date, None)
+    df = filter_date_range(df, "date", start, end)
 
     out = (
-        out.dropna(subset=["date", "stock_id", "adj_close"])
-        .query("adj_close > 0")
+        df.dropna(subset=["date", "stock_id", "adj_close"])
+        .query("stock_id != '' and adj_close > 0")
         .drop_duplicates(["date", "stock_id"], keep="last")
         .sort_values(["stock_id", "date"])
         .reset_index(drop=True)
     )
     out["ret"] = out.groupby("stock_id")["adj_close"].pct_change()
     out.loc[~np.isfinite(out["ret"]), "ret"] = np.nan
-    return out.sort_values(["date", "stock_id"]).reset_index(drop=True)
+    out = out.sort_values(["date", "stock_id"]).reset_index(drop=True)
+    if out.empty:
+        raise ValueError("Price normalization produced zero rows. Please check AD PRICE/DATA date range.")
+    return out
+
+
+def normalize_asset(asset_raw: pd.DataFrame) -> pd.DataFrame:
+    if asset_raw is None or asset_raw.empty:
+        return pd.DataFrame()
+    asset = rename_by_alias(asset_raw, {
+        **COMMON_ALIASES,
+        "year_quarter": ["year_quarter", "年季", "季度", "季別"],
+        "total_assets_thousand": ["total_assets_thousand", "資產總計(千)", "資產總額(千)", "資產總計", "資產總額"],
+        "total_liabilities_thousand": ["total_liabilities_thousand", "負債總計(千)", "負債總額(千)", "負債總計", "負債總額"],
+        "equity_total_thousand": ["equity_total_thousand", "權益總計(千)", "權益總額(千)", "股東權益總計(千)", "權益總計", "淨值"],
+        "announce_date_asset": ["announce_date_asset", "公告日期", "發布日期", "財報公告日"],
+    })
+    required = ["stock_id", "year_quarter"]
+    if any(c not in asset.columns for c in required):
+        return pd.DataFrame()
+    asset["stock_id"] = clean_stock_id(asset["stock_id"])
+    asset["fiscal_q"] = parse_cmoney_quarter(asset["year_quarter"])
+    if "announce_date_asset" in asset.columns:
+        asset["announce_date_asset"] = parse_date(asset["announce_date_asset"])
+    else:
+        # Conservative public availability: quarter end + 90 days
+        q_end = asset["fiscal_q"].apply(lambda p: p.end_time if pd.notna(p) else pd.NaT)
+        asset["announce_date_asset"] = pd.to_datetime(q_end, errors="coerce") + pd.Timedelta(days=90)
+    for col in ["total_assets_thousand", "total_liabilities_thousand", "equity_total_thousand"]:
+        if col in asset.columns:
+            asset[col] = to_num(asset[col])
+        else:
+            asset[col] = np.nan
+    asset = asset.dropna(subset=["stock_id", "fiscal_q", "announce_date_asset"]).sort_values(["stock_id", "fiscal_q"])
+    if asset.empty:
+        return pd.DataFrame()
+    asset["asset_growth"] = asset.groupby("stock_id")["total_assets_thousand"].pct_change(4)
+    return asset[["stock_id", "stock_name", "fiscal_q", "announce_date_asset", "total_assets_thousand", "total_liabilities_thousand", "equity_total_thousand", "asset_growth"]]
+
+
+def normalize_rmw(rmw_raw: pd.DataFrame) -> pd.DataFrame:
+    if rmw_raw is None or rmw_raw.empty:
+        return pd.DataFrame()
+    rmw = rename_by_alias(rmw_raw, {
+        **COMMON_ALIASES,
+        "year_quarter": ["year_quarter", "年季", "季度", "季別"],
+        "revenue_thousand": ["revenue_thousand", "營業收入淨額(千)", "營業收入(千)", "營收(千)", "營業收入淨額"],
+        "operating_income_thousand": ["operating_income_thousand", "營業利益(千)", "營業利益", "營業淨利(千)", "營業淨利"],
+        "pretax_income_thousand": ["pretax_income_thousand", "稅前純益(千)", "稅前淨利(千)", "稅前純益"],
+        "net_income_thousand": ["net_income_thousand", "稅後純益(千)", "稅後淨利(千)", "本期淨利(千)", "稅後純益"],
+        "eps": ["eps", "每股稅後盈餘(元)", "EPS"],
+        "announce_date_rmw": ["announce_date_rmw", "公告日期", "發布日期", "財報公告日"],
+    })
+    required = ["stock_id", "year_quarter"]
+    if any(c not in rmw.columns for c in required):
+        return pd.DataFrame()
+    rmw["stock_id"] = clean_stock_id(rmw["stock_id"])
+    rmw["fiscal_q"] = parse_cmoney_quarter(rmw["year_quarter"])
+    if "announce_date_rmw" in rmw.columns:
+        rmw["announce_date_rmw"] = parse_date(rmw["announce_date_rmw"])
+    else:
+        q_end = rmw["fiscal_q"].apply(lambda p: p.end_time if pd.notna(p) else pd.NaT)
+        rmw["announce_date_rmw"] = pd.to_datetime(q_end, errors="coerce") + pd.Timedelta(days=90)
+    for col in ["revenue_thousand", "operating_income_thousand", "pretax_income_thousand", "net_income_thousand", "eps"]:
+        if col in rmw.columns:
+            rmw[col] = to_num(rmw[col])
+        else:
+            rmw[col] = np.nan
+    rmw = rmw.dropna(subset=["stock_id", "fiscal_q", "announce_date_rmw"])
+    if rmw.empty:
+        return pd.DataFrame()
+    if "stock_name" not in rmw.columns:
+        rmw["stock_name"] = ""
+    return rmw[["stock_id", "stock_name", "fiscal_q", "announce_date_rmw", "revenue_thousand", "operating_income_thousand", "pretax_income_thousand", "net_income_thousand", "eps"]]
+
 
 def build_financial_panel(asset_raw: pd.DataFrame, rmw_raw: pd.DataFrame) -> pd.DataFrame:
-    """Build financial characteristics. ASSET/RMW are optional."""
-    empty_cols = [
-        "stock_id", "stock_name", "fiscal_q", "announce_date",
-        "equity_total_thousand", "total_assets_thousand",
-        "operating_income_thousand", "profitability", "asset_growth",
-    ]
+    asset = normalize_asset(asset_raw)
+    rmw = normalize_rmw(rmw_raw)
 
-    def empty_panel() -> pd.DataFrame:
-        return pd.DataFrame(columns=empty_cols)
+    if asset.empty and rmw.empty:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "fiscal_q", "announce_date", "equity_total_thousand", "total_assets_thousand", "operating_income_thousand", "profitability", "asset_growth"])
 
-    def empty_asset() -> pd.DataFrame:
-        return pd.DataFrame(columns=[
-            "stock_id", "stock_name", "fiscal_q", "announce_date_asset",
-            "total_assets_thousand", "total_liabilities_thousand",
-            "equity_total_thousand", "asset_growth",
-        ])
+    if asset.empty:
+        fin = rmw.copy()
+        fin["equity_total_thousand"] = np.nan
+        fin["total_assets_thousand"] = np.nan
+        fin["asset_growth"] = np.nan
+        fin["announce_date"] = fin["announce_date_rmw"]
+    elif rmw.empty:
+        fin = asset.copy()
+        fin["operating_income_thousand"] = np.nan
+        fin["announce_date"] = fin["announce_date_asset"]
+    else:
+        fin = pd.merge(asset, rmw, on=["stock_id", "fiscal_q"], how="outer", suffixes=("_asset", "_rmw"))
+        if "stock_name_asset" in fin.columns and "stock_name_rmw" in fin.columns:
+            fin["stock_name"] = fin["stock_name_asset"].combine_first(fin["stock_name_rmw"])
+        elif "stock_name" not in fin.columns:
+            fin["stock_name"] = ""
+        fin["announce_date"] = fin[["announce_date_asset", "announce_date_rmw"]].max(axis=1)
 
-    def empty_rmw() -> pd.DataFrame:
-        return pd.DataFrame(columns=[
-            "stock_id", "stock_name", "fiscal_q", "announce_date_rmw",
-            "revenue_thousand", "operating_income_thousand", "pretax_income_thousand",
-            "net_income_thousand", "eps",
-        ])
+    if "profitability" not in fin.columns:
+        fin["profitability"] = fin["operating_income_thousand"] / fin["equity_total_thousand"]
+    fin["announce_date"] = parse_date(fin["announce_date"])
+    cols = ["stock_id", "stock_name", "fiscal_q", "announce_date", "equity_total_thousand", "total_assets_thousand", "operating_income_thousand", "profitability", "asset_growth"]
+    for c in cols:
+        if c not in fin.columns:
+            fin[c] = np.nan
+    return fin[cols].dropna(subset=["stock_id", "announce_date"]).sort_values(["stock_id", "announce_date"]).reset_index(drop=True)
 
-    # ASSET panel
-    asset_out = empty_asset()
-    if asset_raw is not None and not asset_raw.empty:
-        try:
-            asset = prepare_stock_id_column(asset_raw, "ASSET files").copy()
-            asset_q_col = find_column(asset, ["year_quarter", "年季", "季度", "季別", "年月", "財報年月"])
-            if asset_q_col is not None:
-                asset_name_col = find_column(asset, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱", "公司簡稱"])
-                total_assets_col = find_column(asset, ["total_assets_thousand", "資產總計(千)", "資產總計", "總資產", "資產總額"])
-                liabilities_col = find_column(asset, ["total_liabilities_thousand", "負債總計(千)", "負債總計", "總負債", "負債總額"])
-                equity_col = find_column(asset, ["equity_total_thousand", "權益總計(千)", "股東權益總計", "權益總計", "淨值", "權益總額", "股東權益"])
-                announce_asset_col = find_column(asset, ["announce_date_asset", "公告日期", "發布日期", "date", "日期"])
-                fiscal_q = parse_cmoney_quarter(asset[asset_q_col])
-                announce = parse_date(asset[announce_asset_col]) if announce_asset_col is not None else pd.Series(pd.NaT, index=asset.index)
-                asset_out = pd.DataFrame({
-                    "stock_id": clean_stock_id(asset["stock_id"]),
-                    "stock_name": asset[asset_name_col].astype(str).str.strip() if asset_name_col is not None else "",
-                    "fiscal_q": fiscal_q,
-                    "announce_date_asset": announce,
-                    "total_assets_thousand": to_num(asset[total_assets_col]) if total_assets_col is not None else np.nan,
-                    "total_liabilities_thousand": to_num(asset[liabilities_col]) if liabilities_col is not None else np.nan,
-                    "equity_total_thousand": to_num(asset[equity_col]) if equity_col is not None else np.nan,
-                })
-                miss_ann = asset_out["announce_date_asset"].isna() & asset_out["fiscal_q"].notna()
-                if miss_ann.any():
-                    asset_out.loc[miss_ann, "announce_date_asset"] = asset_out.loc[miss_ann, "fiscal_q"].apply(lambda p: p.end_time.normalize() + pd.Timedelta(days=90))
-                asset_out = asset_out.dropna(subset=["stock_id", "fiscal_q"]).sort_values(["stock_id", "fiscal_q"])
-                asset_out["asset_growth"] = asset_out.groupby("stock_id")["total_assets_thousand"].pct_change(4)
-                asset_out = asset_out[[
-                    "stock_id", "stock_name", "fiscal_q", "announce_date_asset",
-                    "total_assets_thousand", "total_liabilities_thousand", "equity_total_thousand", "asset_growth",
-                ]]
-        except Exception:
-            asset_out = empty_asset()
 
-    # RMW/profitability panel
-    rmw_out = empty_rmw()
-    if rmw_raw is not None and not rmw_raw.empty:
-        try:
-            rmw = prepare_stock_id_column(rmw_raw, "RMW files").copy()
-            rmw_q_col = find_column(rmw, ["year_quarter", "年季", "季度", "季別", "年月", "財報年月"])
-            if rmw_q_col is not None:
-                rmw_name_col = find_column(rmw, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱", "公司簡稱"])
-                announce_rmw_col = find_column(rmw, ["announce_date_rmw", "公告日期", "發布日期", "date", "日期"])
-                revenue_col = find_column(rmw, ["revenue_thousand", "營業收入淨額(千)", "營業收入淨額", "營收", "營業收入"])
-                op_income_col = find_column(rmw, ["operating_income_thousand", "營業利益(千)", "營業利益", "營業淨利", "營業利益淨額", "營業利益損失"])
-                pretax_col = find_column(rmw, ["pretax_income_thousand", "稅前純益(千)", "稅前純益", "稅前淨利", "稅前淨利淨損"])
-                net_income_col = find_column(rmw, ["net_income_thousand", "稅後純益(千)", "稅後純益", "本期淨利", "淨利", "稅後淨利"])
-                eps_col = find_column(rmw, ["eps", "每股稅後盈餘(元)", "每股盈餘", "EPS"])
-                fiscal_q = parse_cmoney_quarter(rmw[rmw_q_col])
-                announce = parse_date(rmw[announce_rmw_col]) if announce_rmw_col is not None else pd.Series(pd.NaT, index=rmw.index)
-                op_income = to_num(rmw[op_income_col]) if op_income_col is not None else pd.Series(np.nan, index=rmw.index)
-                pretax = to_num(rmw[pretax_col]) if pretax_col is not None else pd.Series(np.nan, index=rmw.index)
-                net_income = to_num(rmw[net_income_col]) if net_income_col is not None else pd.Series(np.nan, index=rmw.index)
-                op_income = op_income.where(op_income.notna(), pretax).where(lambda x: x.notna(), net_income)
-                rmw_out = pd.DataFrame({
-                    "stock_id": clean_stock_id(rmw["stock_id"]),
-                    "stock_name": rmw[rmw_name_col].astype(str).str.strip() if rmw_name_col is not None else "",
-                    "fiscal_q": fiscal_q,
-                    "announce_date_rmw": announce,
-                    "revenue_thousand": to_num(rmw[revenue_col]) if revenue_col is not None else np.nan,
-                    "operating_income_thousand": op_income,
-                    "pretax_income_thousand": pretax,
-                    "net_income_thousand": net_income,
-                    "eps": to_num(rmw[eps_col]) if eps_col is not None else np.nan,
-                })
-                miss_ann = rmw_out["announce_date_rmw"].isna() & rmw_out["fiscal_q"].notna()
-                if miss_ann.any():
-                    rmw_out.loc[miss_ann, "announce_date_rmw"] = rmw_out.loc[miss_ann, "fiscal_q"].apply(lambda p: p.end_time.normalize() + pd.Timedelta(days=90))
-                rmw_out = rmw_out.dropna(subset=["stock_id", "fiscal_q"])
-                rmw_out = rmw_out[[
-                    "stock_id", "stock_name", "fiscal_q", "announce_date_rmw",
-                    "revenue_thousand", "operating_income_thousand", "pretax_income_thousand", "net_income_thousand", "eps",
-                ]]
-        except Exception:
-            rmw_out = empty_rmw()
-
-    if asset_out.empty and rmw_out.empty:
-        return empty_panel()
-
-    fin = pd.merge(asset_out, rmw_out, on=["stock_id", "fiscal_q"], how="outer", suffixes=("_asset", "_rmw"))
-    if fin.empty:
-        return empty_panel()
-    fin["stock_name"] = fin.get("stock_name_asset", pd.Series(index=fin.index, dtype=object)).combine_first(
-        fin.get("stock_name_rmw", pd.Series(index=fin.index, dtype=object))
-    )
-    for col in ["announce_date_asset", "announce_date_rmw"]:
-        if col not in fin.columns:
-            fin[col] = pd.NaT
-    fin["announce_date"] = fin[["announce_date_asset", "announce_date_rmw"]].max(axis=1)
-    for col in ["equity_total_thousand", "total_assets_thousand", "operating_income_thousand", "asset_growth"]:
-        if col not in fin.columns:
-            fin[col] = np.nan
-    fin["profitability"] = fin["operating_income_thousand"] / fin["equity_total_thousand"]
-    fin = fin[empty_cols]
-    return fin.dropna(subset=["stock_id", "announce_date"]).sort_values(["stock_id", "announce_date"]).reset_index(drop=True)
-
+# ============================================================
+# FF5 construction
+# ============================================================
 
 def merge_latest_fin_by_stock(formations: pd.DataFrame, fin: pd.DataFrame) -> pd.DataFrame:
-    if formations is None or formations.empty:
-        return pd.DataFrame()
-    if fin is None or fin.empty or "stock_id" not in fin.columns or "announce_date" not in fin.columns:
+    if fin is None or fin.empty or "announce_date" not in fin.columns:
         out = formations.copy()
-        for col in [
-            "fiscal_q", "announce_date", "equity_total_thousand", "total_assets_thousand",
-            "operating_income_thousand", "profitability", "asset_growth",
-        ]:
-            if col not in out.columns:
-                out[col] = np.nan
+        for c in ["equity_total_thousand", "total_assets_thousand", "operating_income_thousand", "profitability", "asset_growth"]:
+            out[c] = np.nan
         return out
 
     results = []
-    fin = fin.sort_values(["stock_id", "announce_date"])
-    formations = formations.sort_values(["stock_id", "formation_date"])
+    fin = fin.copy()
+    fin["announce_date"] = parse_date(fin["announce_date"])
+    fin = fin.dropna(subset=["stock_id", "announce_date"]).sort_values(["stock_id", "announce_date"])
+    formations = formations.copy()
+    formations["formation_date"] = parse_date(formations["formation_date"])
+    formations = formations.dropna(subset=["stock_id", "formation_date"]).sort_values(["stock_id", "formation_date"])
 
     for stock_id, group in formations.groupby("stock_id"):
         stock_fin = fin[fin["stock_id"] == stock_id].sort_values("announce_date")
         group = group.sort_values("formation_date")
         if stock_fin.empty:
-            results.append(group)
+            tmp = group.copy()
+            for c in ["equity_total_thousand", "total_assets_thousand", "operating_income_thousand", "profitability", "asset_growth"]:
+                tmp[c] = np.nan
+            results.append(tmp)
             continue
         merged = pd.merge_asof(
             group,
@@ -565,27 +540,32 @@ def merge_latest_fin_by_stock(formations: pd.DataFrame, fin: pd.DataFrame) -> pd
         if "stock_id_fin" in merged.columns:
             merged = merged.drop(columns=["stock_id_fin"])
         if "stock_name_fin" in merged.columns and "stock_name" in merged.columns:
-            merged["stock_name"] = merged["stock_name"].where(merged["stock_name"].notna(), merged["stock_name_fin"])
-            merged = merged.drop(columns=["stock_name_fin"])
+            merged["stock_name"] = merged["stock_name"].combine_first(merged["stock_name_fin"])
         results.append(merged)
 
     return pd.concat(results, ignore_index=True) if results else formations
 
-def assign_tertile(s: pd.Series, low_label: str, mid_label: str, high_label: str) -> pd.Series:
+
+def assign_tertile(s: pd.Series, low_label: str, mid_label: str, high_label: str, neutral_label: str | None = None) -> pd.Series:
     out = pd.Series(index=s.index, dtype="object")
     valid = s.dropna()
     if valid.nunique() < 3:
+        out.loc[:] = neutral_label if neutral_label is not None else mid_label
         return out
     q30, q70 = valid.quantile([0.3, 0.7])
     out.loc[s <= q30] = low_label
     out.loc[(s > q30) & (s < q70)] = mid_label
     out.loc[s >= q70] = high_label
+    out.loc[out.isna()] = neutral_label if neutral_label is not None else mid_label
     return out
 
 
 def build_top_market_cap_formations(data: pd.DataFrame, fin: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    if data is None or data.empty:
+        raise ValueError("Cannot build formations because DATA panel is empty.")
     data = data.copy()
     data["date"] = parse_date(data["date"])
+    data = data.dropna(subset=["date", "stock_id", "market_cap_100m"])
     formation_dates = (
         data[["date"]]
         .drop_duplicates()
@@ -611,54 +591,33 @@ def build_top_market_cap_formations(data: pd.DataFrame, fin: pd.DataFrame, top_n
         raise ValueError("No monthly market-cap formation rows were generated.")
 
     formations = pd.concat(rows, ignore_index=True)
-    keep = [
-        "formation_date", "rank", "stock_id", "stock_name",
-        "market_cap_100m", "pb", "trading_value_thousand",
-    ]
-    for col in keep:
-        if col not in formations.columns:
-            formations[col] = np.nan
-    formations = formations[keep]
+    formations = formations[["formation_date", "rank", "stock_id", "stock_name", "market_cap_100m", "pb", "trading_value_thousand"]]
     formations = merge_latest_fin_by_stock(formations, fin)
 
-    if "equity_total_thousand" not in formations.columns:
-        formations["equity_total_thousand"] = np.nan
-    if "profitability" not in formations.columns:
-        formations["profitability"] = np.nan
-    if "asset_growth" not in formations.columns:
-        formations["asset_growth"] = np.nan
+    formations["bm_from_fin"] = np.nan
+    valid_fin = formations.get("equity_total_thousand", pd.Series(np.nan, index=formations.index)).notna()
+    if valid_fin.any():
+        formations.loc[valid_fin, "bm_from_fin"] = (
+            formations.loc[valid_fin, "equity_total_thousand"] * 1000
+        ) / (formations.loc[valid_fin, "market_cap_100m"] * 100_000_000)
 
-    formations["bm_from_fin"] = (
-        formations["equity_total_thousand"] * 1000
-    ) / (formations["market_cap_100m"] * 100_000_000)
     formations["bm_from_pb"] = 1 / formations["pb"]
     formations.loc[formations["pb"] <= 0, "bm_from_pb"] = np.nan
     formations["bm"] = formations["bm_from_fin"].where(formations["bm_from_fin"].notna(), formations["bm_from_pb"])
-
-    # If financial characteristics are missing, use neutral/zero characteristics.
-    # This prevents hard failures while still allowing MKT and SMB/HML construction.
-    formations["profitability"] = pd.to_numeric(formations["profitability"], errors="coerce")
-    formations["asset_growth"] = pd.to_numeric(formations["asset_growth"], errors="coerce")
 
     def assign_groups(group: pd.DataFrame) -> pd.DataFrame:
         group = group.copy()
         median_cap = group["market_cap_100m"].median()
         group["size_grp"] = np.where(group["market_cap_100m"] <= median_cap, "S", "B")
-        group["bm_grp"] = assign_tertile(group["bm"], "L", "M", "H")
-        group["op_grp"] = assign_tertile(group["profitability"], "W", "N", "R")
-        group["inv_grp"] = assign_tertile(group["asset_growth"], "C", "N", "A")
-        # Fill missing classifications with neutral buckets so factor calculation does not collapse.
-        group["bm_grp"] = group["bm_grp"].fillna("M")
-        group["op_grp"] = group["op_grp"].fillna("N")
-        group["inv_grp"] = group["inv_grp"].fillna("N")
+        group["bm_grp"] = assign_tertile(group["bm"], "L", "M", "H", neutral_label="M")
+        group["op_grp"] = assign_tertile(group.get("profitability", pd.Series(np.nan, index=group.index)), "W", "N", "R", neutral_label="N")
+        group["inv_grp"] = assign_tertile(group.get("asset_growth", pd.Series(np.nan, index=group.index)), "C", "N", "A", neutral_label="N")
         return group
 
-    formations = pd.concat(
-        [assign_groups(group) for _, group in formations.groupby("formation_date")],
-        ignore_index=True,
-    )
+    formations = pd.concat([assign_groups(g) for _, g in formations.groupby("formation_date")], ignore_index=True)
     formations["weight"] = formations["market_cap_100m"]
     return formations.sort_values(["formation_date", "rank"]).reset_index(drop=True)
+
 
 def vw_ret(group: pd.DataFrame, condition: pd.Series) -> float:
     subset = group.loc[condition & group["ret"].notna() & group["weight"].notna()].copy()
@@ -672,9 +631,15 @@ def avg_ignore_nan(values: list[float]) -> float:
     return np.nan if not clean else float(np.mean(clean))
 
 
+def zero_if_nan(x: float) -> float:
+    return 0.0 if pd.isna(x) or not np.isfinite(x) else float(x)
+
+
 def build_ff5_factor_returns(returns: pd.DataFrame, formations: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     fdates = list(sorted(pd.to_datetime(formations["formation_date"].dropna().unique())))
     panels = []
+    returns = returns.copy()
+    returns["date"] = parse_date(returns["date"])
     for i, fdate in enumerate(fdates):
         fdate = pd.Timestamp(fdate)
         next_fdate = pd.Timestamp(fdates[i + 1]) if i + 1 < len(fdates) else returns["date"].max()
@@ -682,18 +647,10 @@ def build_ff5_factor_returns(returns: pd.DataFrame, formations: pd.DataFrame) ->
             (returns["date"] > fdate) & (returns["date"] <= next_fdate),
             ["date", "stock_id", "ret"],
         ].copy()
-        if ret_slice.empty:
-            continue
         members = formations[formations["formation_date"] == fdate].copy()
-        for col in ["size_grp", "bm_grp", "op_grp", "inv_grp"]:
-            if col not in members.columns:
-                members[col] = "N" if col in {"op_grp", "inv_grp"} else "M"
         panel = pd.merge(
             ret_slice,
-            members[[
-                "formation_date", "stock_id", "stock_name", "rank",
-                "market_cap_100m", "weight", "size_grp", "bm_grp", "op_grp", "inv_grp",
-            ]],
+            members[["formation_date", "stock_id", "stock_name", "rank", "market_cap_100m", "weight", "size_grp", "bm_grp", "op_grp", "inv_grp"]],
             on="stock_id",
             how="inner",
         )
@@ -702,10 +659,11 @@ def build_ff5_factor_returns(returns: pd.DataFrame, formations: pd.DataFrame) ->
 
     factor_panel = pd.concat(panels, ignore_index=True) if panels else pd.DataFrame()
     if factor_panel.empty:
-        raise ValueError("No daily factor panel rows were generated.")
+        raise ValueError("No daily factor panel rows were generated. Check price dates versus formation dates.")
 
     def calc_ff5_one_day(group: pd.DataFrame) -> pd.Series:
         mkt = vw_ret(group, pd.Series(True, index=group.index))
+
         sl = vw_ret(group, (group["size_grp"] == "S") & (group["bm_grp"] == "L"))
         sm = vw_ret(group, (group["size_grp"] == "S") & (group["bm_grp"] == "M"))
         sh = vw_ret(group, (group["size_grp"] == "S") & (group["bm_grp"] == "H"))
@@ -734,15 +692,16 @@ def build_ff5_factor_returns(returns: pd.DataFrame, formations: pd.DataFrame) ->
         hml = avg_ignore_nan([sh, bh]) - avg_ignore_nan([sl, bl])
         rmw = avg_ignore_nan([sr, br]) - avg_ignore_nan([sw, bw])
         cma = avg_ignore_nan([sc, bc]) - avg_ignore_nan([sa, ba])
+
         return pd.Series({
-            "MKT": mkt,
-            "SMB": smb,
-            "HML": hml,
-            "RMW": rmw,
-            "CMA": cma,
-            "SMB_BM": smb_bm,
-            "SMB_OP": smb_op,
-            "SMB_INV": smb_inv,
+            "MKT": zero_if_nan(mkt),
+            "SMB": zero_if_nan(smb),
+            "HML": zero_if_nan(hml),
+            "RMW": zero_if_nan(rmw),
+            "CMA": zero_if_nan(cma),
+            "SMB_BM": zero_if_nan(smb_bm),
+            "SMB_OP": zero_if_nan(smb_op),
+            "SMB_INV": zero_if_nan(smb_inv),
             "n_stocks": group["stock_id"].nunique(),
         })
 
@@ -755,24 +714,16 @@ def build_ff5_factor_returns(returns: pd.DataFrame, formations: pd.DataFrame) ->
         .reset_index(drop=True)
     )
     ff5["RF"] = 0.0
-    for col in ["MKT", "SMB", "HML", "RMW", "CMA", "SMB_BM", "SMB_OP", "SMB_INV"]:
-        if col not in ff5.columns:
-            ff5[col] = 0.0
-        ff5[col] = pd.to_numeric(ff5[col], errors="coerce")
-    # Keep MKT as data-driven; fill missing characteristic factors with zero so OLS remains usable.
-    ff5["MKT"] = ff5["MKT"].fillna(0.0)
-    for col in ["SMB", "HML", "RMW", "CMA", "SMB_BM", "SMB_OP", "SMB_INV"]:
-        ff5[col] = ff5[col].fillna(0.0)
     ff5["MKT_RF"] = ff5["MKT"] - ff5["RF"]
-    ff5 = ff5[["date", "MKT_RF", "SMB", "HML", "RMW", "CMA", "RF", "MKT", "SMB_BM", "SMB_OP", "SMB_INV", "n_stocks"]]
-    return factor_panel, ff5
+    return factor_panel, ff5[["date", "MKT_RF", "SMB", "HML", "RMW", "CMA", "RF", "MKT", "SMB_BM", "SMB_OP", "SMB_INV", "n_stocks"]]
+
 
 def run_ols_alpha(reg_df: pd.DataFrame, config: FF5RawBuildConfig) -> dict[str, object] | None:
-    clean = reg_df[["excess_ret"] + FACTOR_COLS].dropna().tail(config.lookback_days)
-    if len(clean) < config.min_obs:
+    clean = reg_df[["excess_ret"] + FACTOR_COLS].dropna().tail(int(config.lookback_days))
+    if len(clean) < int(config.min_obs):
         return None
     y = clean["excess_ret"]
-    x = sm.add_constant(clean[FACTOR_COLS])
+    x = sm.add_constant(clean[FACTOR_COLS], has_constant="add")
     try:
         model = sm.OLS(y, x).fit()
     except Exception:
@@ -801,6 +752,7 @@ def run_ols_alpha(reg_df: pd.DataFrame, config: FF5RawBuildConfig) -> dict[str, 
 
 
 def next_trading_date(trading_dates: pd.DatetimeIndex, current_date: pd.Timestamp) -> pd.Timestamp | pd.NaT:
+    current_date = pd.Timestamp(current_date)
     future = trading_dates[trading_dates > current_date]
     if len(future) == 0:
         return pd.NaT
@@ -816,10 +768,13 @@ def build_rolling_alpha_scores(
     ff5 = ff5.copy()
     ff5["date"] = parse_date(ff5["date"])
     for col in FACTOR_COLS + ["RF"]:
-        ff5[col] = pd.to_numeric(ff5[col], errors="coerce")
+        if col not in ff5.columns:
+            ff5[col] = 0.0
+        ff5[col] = pd.to_numeric(ff5[col], errors="coerce").fillna(0.0)
     ff5 = ff5[["date"] + FACTOR_COLS + ["RF"]].dropna(subset=["date"]).drop_duplicates("date").sort_values("date")
 
     stock_returns = returns[["date", "stock_id", "stock_name", "adj_close", "ret"]].copy()
+    stock_returns["date"] = parse_date(stock_returns["date"])
     panel = pd.merge(stock_returns, ff5, on="date", how="inner")
     panel["excess_ret"] = panel["ret"] - panel["RF"]
     panel = panel.sort_values(["stock_id", "date"]).reset_index(drop=True)
@@ -830,7 +785,7 @@ def build_rolling_alpha_scores(
     }
 
     trading_dates = pd.DatetimeIndex(sorted(ff5["date"].dropna().unique()))
-    formation_dates = sorted(formations["formation_date"].dropna().unique())
+    formation_dates = sorted(pd.to_datetime(formations["formation_date"].dropna().unique()))
     formation_meta = []
     for i, fdate in enumerate(formation_dates):
         fdate = pd.Timestamp(fdate)
@@ -851,8 +806,8 @@ def build_rolling_alpha_scores(
                 continue
             history = stock_panel[stock_id]
             history = history[history.index <= fdate]
-            valid = history[["excess_ret"] + FACTOR_COLS].dropna().tail(config.lookback_days)
-            if len(valid) < config.min_obs:
+            valid = history[["excess_ret"] + FACTOR_COLS].dropna().tail(int(config.lookback_days))
+            if len(valid) < int(config.min_obs):
                 continue
             result = run_ols_alpha(valid, config)
             if result is None:
@@ -867,13 +822,49 @@ def build_rolling_alpha_scores(
 
     alpha_scores = pd.DataFrame(rows)
     if alpha_scores.empty:
-        return alpha_scores, panel
+        raise ValueError(
+            "No alpha scores were generated. "
+            f"Try reducing min_obs ({config.min_obs}) or lookback_days ({config.lookback_days}), "
+            "or verify that price data has enough history before the first formation month."
+        )
 
     alpha_scores = pd.merge(alpha_scores, formation_meta_df, on="formation_date", how="left")
-    alpha_scores["alpha_rank"] = (
-        alpha_scores
-        .groupby("formation_date")["alpha"]
-        .rank(ascending=False, method="first")
-    )
+    alpha_scores["alpha_rank"] = alpha_scores.groupby("formation_date")["alpha"].rank(ascending=False, method="first")
     alpha_scores = alpha_scores.sort_values(["formation_date", "alpha_rank", "stock_id"]).reset_index(drop=True)
     return alpha_scores, panel
+
+
+def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict[str, pd.DataFrame]:
+    start, end = _date_bounds(config)
+    files = discover_strategy3_raw_files(raw_dir)
+
+    data_raw = read_many_excel(files["data"])
+    ad_raw = read_many_excel(files["ad_price"]) if files["ad_price"] else pd.DataFrame()
+    asset_raw = read_many_excel(files["asset"]) if files["asset"] else pd.DataFrame()
+    rmw_raw = read_many_excel(files["rmw"]) if files["rmw"] else pd.DataFrame()
+
+    data = normalize_market_data(data_raw, start, end)
+    price_df = normalize_ad_price(ad_raw, data=data, start_date=start, end_date=end)
+    returns = price_df[["date", "stock_id", "stock_name", "adj_close", "ret"]].copy()
+
+    fin = build_financial_panel(asset_raw, rmw_raw)
+    formations = build_top_market_cap_formations(data, fin, config.market_cap_top_n)
+    factor_panel, ff5 = build_ff5_factor_returns(returns, formations)
+    alpha_scores, regression_panel = build_rolling_alpha_scores(ff5, formations, returns, config)
+
+    # Data validation: do not pretend success if core outputs are empty.
+    if data.empty or price_df.empty or formations.empty or ff5.empty or alpha_scores.empty:
+        raise ValueError(
+            "Pipeline output validation failed: "
+            f"data={len(data)}, price_df={len(price_df)}, formations={len(formations)}, ff5={len(ff5)}, alpha_scores={len(alpha_scores)}"
+        )
+
+    return {
+        "file_manifest": build_file_manifest(files),
+        "ff5": ff5,
+        "formations": formations,
+        "factor_panel": factor_panel,
+        "alpha_scores": alpha_scores,
+        "price_df": price_df,
+        "regression_panel": regression_panel,
+    }
