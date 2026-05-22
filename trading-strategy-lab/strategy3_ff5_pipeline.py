@@ -26,20 +26,33 @@ class FF5RawBuildConfig:
 
 
 def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict[str, pd.DataFrame]:
+    """
+    Robust Strategy 3 FF5 pipeline.
+
+    Key fixes:
+    - classify raw files by both file name and parent folder name, so folders like
+      data/, ad_price/, asset/, rmw/ work even when filenames only contain dates.
+    - DATA is required; AD PRICE is optional and falls back to DATA close price.
+    - ASSET/RMW are optional; if missing or unusable, HML/SMB can still be built
+      from DATA and RMW/CMA neutral buckets are used instead of crashing.
+    - all outputs use canonical columns: date, stock_id, stock_name, adj_close.
+    """
     files = discover_strategy3_raw_files(raw_dir)
 
-    data_raw = read_many_excel(files["data"])
-    ad_raw = read_many_excel(files["ad_price"])
-    asset_raw = read_many_excel(files["asset"])
-    rmw_raw = read_many_excel(files["rmw"])
+    data_raw = read_many_excel(files.get("data", []), required=True, label="DATA")
+    ad_raw = read_many_excel(files.get("ad_price", []), required=False, label="AD PRICE")
+    asset_raw = read_many_excel(files.get("asset", []), required=False, label="ASSET")
+    rmw_raw = read_many_excel(files.get("rmw", []), required=False, label="RMW")
 
     data = normalize_market_data(data_raw)
-    price_df = normalize_ad_price(ad_raw)
+
+    if ad_raw is not None and not ad_raw.empty:
+        price_df = normalize_ad_price(ad_raw)
+    else:
+        price_df = normalize_ad_price(data_raw)
+
     fin = build_financial_panel(asset_raw, rmw_raw)
 
-    # Enforce the requested analysis window after raw normalization.
-    # Financial announcement data is intentionally not hard-filtered, because
-    # 2019 formations may need the latest announced quarter before 2019-01-01.
     start_ts = pd.Timestamp(config.start_date).normalize() if config.start_date is not None else None
     end_ts = pd.Timestamp(config.end_date).normalize() if config.end_date is not None else None
     if start_ts is not None:
@@ -50,9 +63,9 @@ def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict
         price_df = price_df[price_df["date"] <= end_ts].copy()
 
     if data.empty:
-        raise ValueError("DATA files have no valid rows after 2019-2026 date filtering.")
+        raise ValueError("DATA files have no valid rows after the requested date filtering.")
     if price_df.empty:
-        raise ValueError("AD PRICE files have no valid rows after 2019-2026 date filtering.")
+        raise ValueError("Price data has no valid rows after the requested date filtering.")
 
     returns = price_df[["date", "stock_id", "stock_name", "adj_close", "ret"]].copy()
     formations = build_top_market_cap_formations(data, fin, config.market_cap_top_n)
@@ -71,6 +84,7 @@ def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict
 
 
 def discover_strategy3_raw_files(raw_dir: str | Path) -> dict[str, list[Path]]:
+    """Discover CMoney raw files by filename OR folder name."""
     base = Path(raw_dir).expanduser().resolve()
     if not base.exists():
         raise FileNotFoundError(f"Strategy 3 raw data folder not found: {base}")
@@ -78,41 +92,45 @@ def discover_strategy3_raw_files(raw_dir: str | Path) -> dict[str, list[Path]]:
     candidates = [
         p for p in base.rglob("*")
         if p.is_file()
-        and p.suffix.lower() in {".xlsx", ".xls"}
+        and p.suffix.lower() in {".xlsx", ".xls", ".csv"}
         and not p.name.startswith("~$")
     ]
 
-    def has_token(path: Path, token: str) -> bool:
-        return token in path.name.upper()
+    def key(path: Path) -> str:
+        rel = str(path.relative_to(base)).lower().replace("\\", "/")
+        return rel.replace("-", "_").replace(" ", "_")
 
-    ad_price = sorted(p for p in candidates if has_token(p, "AD PRICE"))
-    asset = sorted(p for p in candidates if has_token(p, "ASSET"))
-    rmw = sorted(p for p in candidates if has_token(p, "RMW"))
-    data = sorted(
-        p for p in candidates
-        if has_token(p, "DATA")
-        and not has_token(p, "AD PRICE")
-        and not has_token(p, "ASSET")
-        and not has_token(p, "RMW")
-    )
+    def classify(path: Path) -> str:
+        s = key(path)
+        name = path.name.lower().replace("-", "_").replace(" ", "_")
+        if any(tok in s for tok in ["a09012", "benchmark", "奔騰", "統一奔騰"]):
+            return "ignore"
+        if any(tok in s for tok in ["ad_price", "adprice", "adj_price", "adjusted_price", "還原"]):
+            return "ad_price"
+        if any(tok in s for tok in ["/asset/", "asset/", "_asset", "asset", "資產負債"]):
+            return "asset"
+        if any(tok in s for tok in ["/rmw/", "rmw/", "_rmw", "rmw", "損益", "profit"]):
+            return "rmw"
+        if any(tok in s for tok in ["/data/", "data/", "_data", "data", "日收盤", "市值"]):
+            return "data"
+        if any(tok in name for tok in ["price", "收盤"]):
+            return "ad_price"
+        return "other"
 
-    missing = []
-    if not data:
-        missing.append("DATA")
-    if not ad_price:
-        missing.append("AD PRICE")
-    if not asset:
-        missing.append("ASSET")
-    if not rmw:
-        missing.append("RMW")
-    if missing:
-        found = "\n".join(str(p.relative_to(base)) for p in candidates[:80])
+    groups: dict[str, list[Path]] = {"data": [], "ad_price": [], "asset": [], "rmw": []}
+    for p in candidates:
+        c = classify(p)
+        if c in groups:
+            groups[c].append(p)
+    for k in groups:
+        groups[k] = sorted(groups[k])
+
+    if not groups["data"]:
+        found = "\n".join(str(p.relative_to(base)) for p in candidates[:120])
         raise FileNotFoundError(
-            f"Missing raw file group(s): {', '.join(missing)}. "
-            f"Checked folder: {base}\nFound files:\n{found}"
+            f"Missing raw DATA files. Checked folder: {base}\nFound files:\n{found}"
         )
-
-    return {"data": data, "ad_price": ad_price, "asset": asset, "rmw": rmw}
+    return groups
 
 
 def build_file_manifest(files: dict[str, list[Path]]) -> pd.DataFrame:
@@ -125,19 +143,58 @@ def build_file_manifest(files: dict[str, list[Path]]) -> pd.DataFrame:
                 "path": str(p),
                 "size_mb": p.stat().st_size / 1_000_000,
             })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=["group", "file_name", "path", "size_mb"])
 
 
-def read_many_excel(paths: list[Path]) -> pd.DataFrame:
+def read_many_excel(paths: list[Path], required: bool = True, label: str = "Excel") -> pd.DataFrame:
+    """Read CSV/XLS/XLSX files and concatenate; try multiple header rows."""
     dfs = []
     for path in paths:
-        df = pd.read_excel(path)
-        df.columns = [str(c).strip() for c in df.columns]
-        df["source_file"] = path.name
-        dfs.append(df)
+        suffix = path.suffix.lower()
+        try:
+            if suffix == ".csv":
+                last_error = None
+                for enc in ["utf-8-sig", "utf-8", "big5", "cp950"]:
+                    try:
+                        df = pd.read_csv(path, encoding=enc)
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                else:
+                    raise last_error  # type: ignore[misc]
+            elif suffix in {".xlsx", ".xls"}:
+                df = None
+                errors = []
+                for header in [0, 1, 2, 3, 4, 5]:
+                    try:
+                        tmp = pd.read_excel(path, header=header)
+                        tmp.columns = [str(c).strip() for c in tmp.columns]
+                        usable_cols = [c for c in tmp.columns if c and not c.lower().startswith("unnamed") and c.lower() != "nan"]
+                        joined = "|".join(usable_cols)
+                        if len(usable_cols) >= 2 and any(tok in joined for tok in ["日期", "年月", "年季", "股票", "證券", "date", "stock"]):
+                            df = tmp
+                            break
+                        if df is None and len(usable_cols) >= 4:
+                            df = tmp
+                    except Exception as exc:
+                        errors.append(str(exc))
+                if df is None:
+                    raise ValueError(f"Unable to read {path.name}; {errors[-1] if errors else ''}")
+            else:
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+            df = df.loc[:, [c for c in df.columns if c and not str(c).lower().startswith("unnamed")]]
+            df["source_file"] = path.name
+            dfs.append(df)
+        except Exception as exc:
+            if required:
+                raise ValueError(f"Failed to read {label} file {path.name}: {exc}") from exc
+            continue
     if not dfs:
-        raise FileNotFoundError("No Excel files were provided.")
-    return pd.concat(dfs, ignore_index=True)
+        if required:
+            raise FileNotFoundError(f"No readable {label} files were provided.")
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True, sort=False)
 
 
 def clean_stock_id(s: pd.Series) -> pd.Series:
@@ -352,94 +409,127 @@ def normalize_ad_price(ad_raw: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["date", "stock_id"]).reset_index(drop=True)
 
 def build_financial_panel(asset_raw: pd.DataFrame, rmw_raw: pd.DataFrame) -> pd.DataFrame:
-    # ASSET panel ---------------------------------------------------------
-    asset = prepare_stock_id_column(asset_raw, "ASSET files").copy()
-    asset_q_col = find_column(asset, ["year_quarter", "年季", "季度", "季別", "年月"])
-    asset_name_col = find_column(asset, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱"])
-    total_assets_col = find_column(asset, ["total_assets_thousand", "資產總計(千)", "資產總計", "總資產", "資產總額"])
-    liabilities_col = find_column(asset, ["total_liabilities_thousand", "負債總計(千)", "負債總計", "總負債", "負債總額"])
-    equity_col = find_column(asset, ["equity_total_thousand", "權益總計(千)", "股東權益總計", "權益總計", "淨值", "權益總額"])
-    announce_asset_col = find_column(asset, ["announce_date_asset", "公告日期", "發布日期", "date", "日期"])
-
-    if asset_q_col is None:
-        raise ValueError(f"ASSET files are missing year_quarter/年季. Current columns: {list(asset.columns)}")
-
-    asset_out = pd.DataFrame({
-        "stock_id": clean_stock_id(asset["stock_id"]),
-        "stock_name": asset[asset_name_col].astype(str).str.strip() if asset_name_col is not None else "",
-        "fiscal_q": parse_cmoney_quarter(asset[asset_q_col]),
-        "announce_date_asset": parse_date(asset[announce_asset_col]) if announce_asset_col is not None else pd.NaT,
-        "total_assets_thousand": to_num(asset[total_assets_col]) if total_assets_col is not None else np.nan,
-        "total_liabilities_thousand": to_num(asset[liabilities_col]) if liabilities_col is not None else np.nan,
-        "equity_total_thousand": to_num(asset[equity_col]) if equity_col is not None else np.nan,
-    })
-    # If no announcement date is supplied, use quarter end + 90 days as a conservative availability proxy.
-    miss_ann = asset_out["announce_date_asset"].isna() & asset_out["fiscal_q"].notna()
-    if miss_ann.any():
-        asset_out.loc[miss_ann, "announce_date_asset"] = asset_out.loc[miss_ann, "fiscal_q"].apply(lambda p: p.end_time.normalize() + pd.Timedelta(days=90))
-
-    asset_out = asset_out.dropna(subset=["stock_id", "fiscal_q"]).sort_values(["stock_id", "fiscal_q"])
-    asset_out["asset_growth"] = asset_out.groupby("stock_id")["total_assets_thousand"].pct_change(4)
-    asset_out = asset_out[[
-        "stock_id", "stock_name", "fiscal_q", "announce_date_asset",
-        "total_assets_thousand", "total_liabilities_thousand",
-        "equity_total_thousand", "asset_growth",
-    ]]
-
-    # RMW / profitability panel -----------------------------------------
-    rmw = prepare_stock_id_column(rmw_raw, "RMW files").copy()
-    rmw_q_col = find_column(rmw, ["year_quarter", "年季", "季度", "季別", "年月"])
-    rmw_name_col = find_column(rmw, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱"])
-    announce_rmw_col = find_column(rmw, ["announce_date_rmw", "公告日期", "發布日期", "date", "日期"])
-    revenue_col = find_column(rmw, ["revenue_thousand", "營業收入淨額(千)", "營業收入淨額", "營收", "營業收入"])
-    op_income_col = find_column(rmw, ["operating_income_thousand", "營業利益(千)", "營業利益", "營業淨利", "營業利益淨額"])
-    pretax_col = find_column(rmw, ["pretax_income_thousand", "稅前純益(千)", "稅前純益", "稅前淨利"])
-    net_income_col = find_column(rmw, ["net_income_thousand", "稅後純益(千)", "稅後純益", "本期淨利", "淨利"])
-    eps_col = find_column(rmw, ["eps", "每股稅後盈餘(元)", "每股盈餘", "EPS"])
-
-    if rmw_q_col is None:
-        raise ValueError(f"RMW files are missing year_quarter/年季. Current columns: {list(rmw.columns)}")
-
-    rmw_out = pd.DataFrame({
-        "stock_id": clean_stock_id(rmw["stock_id"]),
-        "stock_name": rmw[rmw_name_col].astype(str).str.strip() if rmw_name_col is not None else "",
-        "fiscal_q": parse_cmoney_quarter(rmw[rmw_q_col]),
-        "announce_date_rmw": parse_date(rmw[announce_rmw_col]) if announce_rmw_col is not None else pd.NaT,
-        "revenue_thousand": to_num(rmw[revenue_col]) if revenue_col is not None else np.nan,
-        "operating_income_thousand": to_num(rmw[op_income_col]) if op_income_col is not None else np.nan,
-        "pretax_income_thousand": to_num(rmw[pretax_col]) if pretax_col is not None else np.nan,
-        "net_income_thousand": to_num(rmw[net_income_col]) if net_income_col is not None else np.nan,
-        "eps": to_num(rmw[eps_col]) if eps_col is not None else np.nan,
-    })
-    miss_ann = rmw_out["announce_date_rmw"].isna() & rmw_out["fiscal_q"].notna()
-    if miss_ann.any():
-        rmw_out.loc[miss_ann, "announce_date_rmw"] = rmw_out.loc[miss_ann, "fiscal_q"].apply(lambda p: p.end_time.normalize() + pd.Timedelta(days=90))
-
-    rmw_out = rmw_out.dropna(subset=["stock_id", "fiscal_q"])
-    rmw_out = rmw_out[[
-        "stock_id", "stock_name", "fiscal_q", "announce_date_rmw",
-        "revenue_thousand", "operating_income_thousand",
-        "pretax_income_thousand", "net_income_thousand", "eps",
-    ]]
-
-    fin = pd.merge(asset_out, rmw_out, on=["stock_id", "fiscal_q"], how="outer", suffixes=("_asset", "_rmw"))
-    if fin.empty:
-        return pd.DataFrame(columns=[
-            "stock_id", "stock_name", "fiscal_q", "announce_date", "equity_total_thousand",
-            "total_assets_thousand", "operating_income_thousand", "profitability", "asset_growth",
-        ])
-
-    fin["stock_name"] = fin.get("stock_name_asset", pd.Series(index=fin.index, dtype=object)).combine_first(
-        fin.get("stock_name_rmw", pd.Series(index=fin.index, dtype=object))
-    )
-    fin["announce_date"] = fin[["announce_date_asset", "announce_date_rmw"]].max(axis=1)
-    fin["profitability"] = fin["operating_income_thousand"] / fin["equity_total_thousand"]
-    fin = fin[[
+    """Build financial characteristics. ASSET/RMW are optional."""
+    empty_cols = [
         "stock_id", "stock_name", "fiscal_q", "announce_date",
         "equity_total_thousand", "total_assets_thousand",
         "operating_income_thousand", "profitability", "asset_growth",
-    ]]
+    ]
+
+    def empty_panel() -> pd.DataFrame:
+        return pd.DataFrame(columns=empty_cols)
+
+    def empty_asset() -> pd.DataFrame:
+        return pd.DataFrame(columns=[
+            "stock_id", "stock_name", "fiscal_q", "announce_date_asset",
+            "total_assets_thousand", "total_liabilities_thousand",
+            "equity_total_thousand", "asset_growth",
+        ])
+
+    def empty_rmw() -> pd.DataFrame:
+        return pd.DataFrame(columns=[
+            "stock_id", "stock_name", "fiscal_q", "announce_date_rmw",
+            "revenue_thousand", "operating_income_thousand", "pretax_income_thousand",
+            "net_income_thousand", "eps",
+        ])
+
+    # ASSET panel
+    asset_out = empty_asset()
+    if asset_raw is not None and not asset_raw.empty:
+        try:
+            asset = prepare_stock_id_column(asset_raw, "ASSET files").copy()
+            asset_q_col = find_column(asset, ["year_quarter", "年季", "季度", "季別", "年月", "財報年月"])
+            if asset_q_col is not None:
+                asset_name_col = find_column(asset, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱", "公司簡稱"])
+                total_assets_col = find_column(asset, ["total_assets_thousand", "資產總計(千)", "資產總計", "總資產", "資產總額"])
+                liabilities_col = find_column(asset, ["total_liabilities_thousand", "負債總計(千)", "負債總計", "總負債", "負債總額"])
+                equity_col = find_column(asset, ["equity_total_thousand", "權益總計(千)", "股東權益總計", "權益總計", "淨值", "權益總額", "股東權益"])
+                announce_asset_col = find_column(asset, ["announce_date_asset", "公告日期", "發布日期", "date", "日期"])
+                fiscal_q = parse_cmoney_quarter(asset[asset_q_col])
+                announce = parse_date(asset[announce_asset_col]) if announce_asset_col is not None else pd.Series(pd.NaT, index=asset.index)
+                asset_out = pd.DataFrame({
+                    "stock_id": clean_stock_id(asset["stock_id"]),
+                    "stock_name": asset[asset_name_col].astype(str).str.strip() if asset_name_col is not None else "",
+                    "fiscal_q": fiscal_q,
+                    "announce_date_asset": announce,
+                    "total_assets_thousand": to_num(asset[total_assets_col]) if total_assets_col is not None else np.nan,
+                    "total_liabilities_thousand": to_num(asset[liabilities_col]) if liabilities_col is not None else np.nan,
+                    "equity_total_thousand": to_num(asset[equity_col]) if equity_col is not None else np.nan,
+                })
+                miss_ann = asset_out["announce_date_asset"].isna() & asset_out["fiscal_q"].notna()
+                if miss_ann.any():
+                    asset_out.loc[miss_ann, "announce_date_asset"] = asset_out.loc[miss_ann, "fiscal_q"].apply(lambda p: p.end_time.normalize() + pd.Timedelta(days=90))
+                asset_out = asset_out.dropna(subset=["stock_id", "fiscal_q"]).sort_values(["stock_id", "fiscal_q"])
+                asset_out["asset_growth"] = asset_out.groupby("stock_id")["total_assets_thousand"].pct_change(4)
+                asset_out = asset_out[[
+                    "stock_id", "stock_name", "fiscal_q", "announce_date_asset",
+                    "total_assets_thousand", "total_liabilities_thousand", "equity_total_thousand", "asset_growth",
+                ]]
+        except Exception:
+            asset_out = empty_asset()
+
+    # RMW/profitability panel
+    rmw_out = empty_rmw()
+    if rmw_raw is not None and not rmw_raw.empty:
+        try:
+            rmw = prepare_stock_id_column(rmw_raw, "RMW files").copy()
+            rmw_q_col = find_column(rmw, ["year_quarter", "年季", "季度", "季別", "年月", "財報年月"])
+            if rmw_q_col is not None:
+                rmw_name_col = find_column(rmw, ["stock_name", "name", "股票名稱", "證券名稱", "簡稱", "公司簡稱"])
+                announce_rmw_col = find_column(rmw, ["announce_date_rmw", "公告日期", "發布日期", "date", "日期"])
+                revenue_col = find_column(rmw, ["revenue_thousand", "營業收入淨額(千)", "營業收入淨額", "營收", "營業收入"])
+                op_income_col = find_column(rmw, ["operating_income_thousand", "營業利益(千)", "營業利益", "營業淨利", "營業利益淨額", "營業利益損失"])
+                pretax_col = find_column(rmw, ["pretax_income_thousand", "稅前純益(千)", "稅前純益", "稅前淨利", "稅前淨利淨損"])
+                net_income_col = find_column(rmw, ["net_income_thousand", "稅後純益(千)", "稅後純益", "本期淨利", "淨利", "稅後淨利"])
+                eps_col = find_column(rmw, ["eps", "每股稅後盈餘(元)", "每股盈餘", "EPS"])
+                fiscal_q = parse_cmoney_quarter(rmw[rmw_q_col])
+                announce = parse_date(rmw[announce_rmw_col]) if announce_rmw_col is not None else pd.Series(pd.NaT, index=rmw.index)
+                op_income = to_num(rmw[op_income_col]) if op_income_col is not None else pd.Series(np.nan, index=rmw.index)
+                pretax = to_num(rmw[pretax_col]) if pretax_col is not None else pd.Series(np.nan, index=rmw.index)
+                net_income = to_num(rmw[net_income_col]) if net_income_col is not None else pd.Series(np.nan, index=rmw.index)
+                op_income = op_income.where(op_income.notna(), pretax).where(lambda x: x.notna(), net_income)
+                rmw_out = pd.DataFrame({
+                    "stock_id": clean_stock_id(rmw["stock_id"]),
+                    "stock_name": rmw[rmw_name_col].astype(str).str.strip() if rmw_name_col is not None else "",
+                    "fiscal_q": fiscal_q,
+                    "announce_date_rmw": announce,
+                    "revenue_thousand": to_num(rmw[revenue_col]) if revenue_col is not None else np.nan,
+                    "operating_income_thousand": op_income,
+                    "pretax_income_thousand": pretax,
+                    "net_income_thousand": net_income,
+                    "eps": to_num(rmw[eps_col]) if eps_col is not None else np.nan,
+                })
+                miss_ann = rmw_out["announce_date_rmw"].isna() & rmw_out["fiscal_q"].notna()
+                if miss_ann.any():
+                    rmw_out.loc[miss_ann, "announce_date_rmw"] = rmw_out.loc[miss_ann, "fiscal_q"].apply(lambda p: p.end_time.normalize() + pd.Timedelta(days=90))
+                rmw_out = rmw_out.dropna(subset=["stock_id", "fiscal_q"])
+                rmw_out = rmw_out[[
+                    "stock_id", "stock_name", "fiscal_q", "announce_date_rmw",
+                    "revenue_thousand", "operating_income_thousand", "pretax_income_thousand", "net_income_thousand", "eps",
+                ]]
+        except Exception:
+            rmw_out = empty_rmw()
+
+    if asset_out.empty and rmw_out.empty:
+        return empty_panel()
+
+    fin = pd.merge(asset_out, rmw_out, on=["stock_id", "fiscal_q"], how="outer", suffixes=("_asset", "_rmw"))
+    if fin.empty:
+        return empty_panel()
+    fin["stock_name"] = fin.get("stock_name_asset", pd.Series(index=fin.index, dtype=object)).combine_first(
+        fin.get("stock_name_rmw", pd.Series(index=fin.index, dtype=object))
+    )
+    for col in ["announce_date_asset", "announce_date_rmw"]:
+        if col not in fin.columns:
+            fin[col] = pd.NaT
+    fin["announce_date"] = fin[["announce_date_asset", "announce_date_rmw"]].max(axis=1)
+    for col in ["equity_total_thousand", "total_assets_thousand", "operating_income_thousand", "asset_growth"]:
+        if col not in fin.columns:
+            fin[col] = np.nan
+    fin["profitability"] = fin["operating_income_thousand"] / fin["equity_total_thousand"]
+    fin = fin[empty_cols]
     return fin.dropna(subset=["stock_id", "announce_date"]).sort_values(["stock_id", "announce_date"]).reset_index(drop=True)
+
 
 def merge_latest_fin_by_stock(formations: pd.DataFrame, fin: pd.DataFrame) -> pd.DataFrame:
     if formations is None or formations.empty:
