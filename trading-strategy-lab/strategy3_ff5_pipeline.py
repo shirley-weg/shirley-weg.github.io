@@ -1,11 +1,8 @@
 # ============================================================
 # strategy3_ff5_pipeline.py
-# VERSION: V5_STREAMLIT_PROGRESS_REALDATA_2019_2026
-# Notes:
-# - Strategy 3 official backtest period: 2019-01-01 to 2026-05-19
-# - Strict mode: backtest starts only after real price_df/formations/ff5/alpha_scores are generated
-# - Strategy 3 supports monthly and biweekly rebalancing
-# - Streamlit web progress bar added for raw data reading, FF5 construction, rolling alpha, backtest, and benchmarks
+# VERSION: V5_1_PROGRESS_NO_CACHE_UI_FIX_2019_2026
+# Strategy 3 period: 2019-01-01 to 2026-05-19
+# Robust real-data pipeline with progress callback support.
 # ============================================================
 
 from __future__ import annotations
