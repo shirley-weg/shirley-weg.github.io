@@ -1,11 +1,11 @@
 # ============================================================
 # streamlit_app.py
-# VERSION: V4_BIWEEKLY_REBALANCE_REALDATA_2019_2026
+# VERSION: V5_STREAMLIT_PROGRESS_REALDATA_2019_2026
 # Notes:
 # - Strategy 3 official backtest period: 2019-01-01 to 2026-05-19
-# - Strict mode: run backtest only after real price_df/formations/ff5/alpha_scores are generated
-# - New option: monthly vs biweekly rebalancing for Strategy 3
-# - Robust CMoney column normalization for 2019~2026 formats
+# - Strict mode: backtest starts only after real price_df/formations/ff5/alpha_scores are generated
+# - Strategy 3 supports monthly and biweekly rebalancing
+# - Streamlit web progress bar added for raw data reading, FF5 construction, rolling alpha, backtest, and benchmarks
 # ============================================================
 
 from __future__ import annotations
@@ -3033,6 +3033,7 @@ def strategy3_build_raw_pipeline_cached(
     start_date: pd.Timestamp | str | None = BACKTEST_START_DEFAULT,
     end_date: pd.Timestamp | str | None = BACKTEST_END_DEFAULT,
     rebalance_frequency: str = "monthly",
+    _progress_callback=None,
 ) -> dict[str, pd.DataFrame]:
     """
     Build Strategy 3 raw outputs using strategy3_ff5_pipeline.py.
@@ -3052,7 +3053,7 @@ def strategy3_build_raw_pipeline_cached(
         rebalance_frequency=rebalance_frequency,
     )
 
-    raw_result = run_ff5_raw_pipeline(raw_dir, config)
+    raw_result = run_ff5_raw_pipeline(raw_dir, config, progress_callback=_progress_callback)
     if not isinstance(raw_result, dict):
         raise ValueError("strategy3_ff5_pipeline 回傳格式不是 dict。")
 
@@ -4490,6 +4491,23 @@ def render_strategy3_page() -> None:
 
         if run:
             try:
+                progress_bar = st.progress(0, text="準備執行策略3回測...")
+                progress_status = st.empty()
+                progress_detail = st.empty()
+
+                def update_strategy3_progress(stage: str, current: int, total: int, message: str = "") -> None:
+                    total_safe = max(int(total), 1)
+                    current_safe = max(0, min(int(current), total_safe))
+                    ratio = current_safe / total_safe
+                    label = message or stage
+                    progress_bar.progress(ratio, text=f"{stage}｜{current_safe}/{total_safe}")
+                    progress_status.info(label)
+                    progress_detail.caption(
+                        "目前正在執行真實資料流程：只有成功產出 price_df、formations、ff5、alpha_scores 後才會進入回測。"
+                    )
+
+                update_strategy3_progress("初始化", 0, 100, "初始化參數與進度條...")
+
                 with st.spinner("讀取原始資料、建立五因子並估計 rolling alpha..."):
                     raw_result = strategy3_build_raw_pipeline_cached(
                         settings.raw_data_path,
@@ -4499,6 +4517,7 @@ def render_strategy3_page() -> None:
                         settings.backtest_start_date,
                         settings.backtest_end_date,
                         settings.rebalance_frequency,
+                        _progress_callback=update_strategy3_progress,
                     )
                     if "fallback_warning" in raw_result and not raw_result["fallback_warning"].empty:
                         warning_msg = str(raw_result["fallback_warning"].iloc[0].get("message", "已使用 fallback pipeline。"))
@@ -4506,6 +4525,8 @@ def render_strategy3_page() -> None:
 
                     alpha = strategy3_normalize_alpha(raw_result["alpha_scores"])
                     price_df = strategy3_normalize_price(raw_result["price_df"])
+
+                update_strategy3_progress("檢查 alpha", 96, 100, "檢查 alpha scores 與篩選條件...")
 
                 if alpha.empty:
                     st.error("沒有成功產生 alpha scores，請調低 min obs 或檢查原始資料期間。")
@@ -4516,30 +4537,31 @@ def render_strategy3_page() -> None:
                     st.error("alpha 篩選後沒有可用股票，請放寬 alpha 或 p-value 條件。")
                     return
 
-                with st.spinner("產生 Top N 持股..."):
-                    positions = strategy3_create_positions(alpha_for_positions, price_df, settings.top_n)
-                    if positions.empty:
-                        st.error("沒有成功產生持股清單，請檢查 alpha scores 與 price data。")
-                    else:
-                        latest_positions = strategy3_latest_month_holdings(positions)
+                update_strategy3_progress("產生持股", 97, 100, "產生 Alpha Top N 持股清單...")
+                positions = strategy3_create_positions(alpha_for_positions, price_df, settings.top_n)
+                if positions.empty:
+                    st.error("沒有成功產生持股清單，請檢查 alpha scores 與 price data。")
+                else:
+                    latest_positions = strategy3_latest_month_holdings(positions)
 
-                        with st.spinner("執行 t+1 收盤價回測..."):
-                            nav_df, trades_df, rebalance_df = strategy3_run_backtest(
-                                positions=positions,
-                                price_df=price_df,
-                                initial_capital=settings.initial_capital,
-                                commission_rate=settings.commission_rate,
-                                sell_tax_rate=settings.sell_tax_rate,
-                                backtest_start_date=settings.backtest_start_date,
-                                backtest_end_date=settings.backtest_end_date,
-                            )
+                    update_strategy3_progress("執行回測", 98, 100, "執行 t+1 收盤價回測...")
+                    nav_df, trades_df, rebalance_df = strategy3_run_backtest(
+                        positions=positions,
+                        price_df=price_df,
+                        initial_capital=settings.initial_capital,
+                        commission_rate=settings.commission_rate,
+                        sell_tax_rate=settings.sell_tax_rate,
+                        backtest_start_date=settings.backtest_start_date,
+                        backtest_end_date=settings.backtest_end_date,
+                    )
 
-                        with st.spinner(f"整理 benchmarks：{strategy3_benchmark_label_text(settings)}..."):
-                            nav_df = strategy3_attach_benchmark(nav_df, settings)
+                    update_strategy3_progress("整理 Benchmark", 99, 100, f"整理 benchmarks：{strategy3_benchmark_label_text(settings)}...")
+                    nav_df = strategy3_attach_benchmark(nav_df, settings)
 
-                        perf = strategy3_calc_performance(nav_df, trades_df, rebalance_df, settings)
+                    perf = strategy3_calc_performance(nav_df, trades_df, rebalance_df, settings)
+                    update_strategy3_progress("完成", 100, 100, "策略3回測完成。")
 
-                        st.session_state["strategy3_result"] = {
+                    st.session_state["strategy3_result"] = {
                             "alpha": alpha,
                             "alpha_for_positions": alpha_for_positions,
                             "price_df": price_df,
