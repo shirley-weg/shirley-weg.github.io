@@ -3024,7 +3024,6 @@ def strategy3_build_raw_pipeline_fallback(
 
 
 
-@st.cache_data(show_spinner=False)
 def strategy3_build_raw_pipeline_cached(
     raw_data_path: str,
     market_cap_top_n: int,
