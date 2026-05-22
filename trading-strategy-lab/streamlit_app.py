@@ -1,3 +1,12 @@
+# ============================================================
+# streamlit_app.py
+# VERSION: V4_BIWEEKLY_REBALANCE_REALDATA_2019_2026
+# Notes:
+# - Strategy 3 official backtest period: 2019-01-01 to 2026-05-19
+# - Strict mode: run backtest only after real price_df/formations/ff5/alpha_scores are generated
+# - New option: monthly vs biweekly rebalancing for Strategy 3
+# - Robust CMoney column normalization for 2019~2026 formats
+# ============================================================
 
 from __future__ import annotations
 
@@ -2210,6 +2219,8 @@ class FF5AlphaSettings:
     initial_capital: float
     commission_rate: float
     sell_tax_rate: float
+    # "monthly" = 每月調倉；"biweekly" = 雙周調倉。
+    rebalance_frequency: str
 
     # yfinance benchmarks，例如 0050.TW。保留 benchmark_ticker 作為舊版相容的第一個 benchmark。
     benchmark_ticker: str
@@ -2236,7 +2247,7 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
         st.session_state["selected_strategy"] = None
         st.rerun()
 
-    st.sidebar.caption("目前策略：策略3(台股五因子 Alpha 月調倉策略)")
+    st.sidebar.caption("目前策略：策略3(台股五因子 Alpha 可選月調倉/雙周調倉策略)")
     st.sidebar.divider()
 
     st.sidebar.header("資料檔案")
@@ -2262,6 +2273,13 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     lookback_days = st.sidebar.slider("Rolling regression lookback", min_value=120, max_value=504, value=252, step=21)
     min_obs = st.sidebar.slider("Regression minimum observations", min_value=60, max_value=252, value=180, step=10)
     top_n = st.sidebar.slider("Alpha Top N 持股檔數", min_value=1, max_value=50, value=10, step=1)
+    rebalance_label = st.sidebar.selectbox(
+        "策略3調倉頻率",
+        options=["每月調倉", "雙周調倉"],
+        index=0,
+        help="每月調倉：每月最後一個有資料日形成股票池，下一個交易日換倉。雙周調倉：每兩週最後一個有資料日形成股票池，下一個交易日換倉。"
+    )
+    rebalance_frequency = "monthly" if rebalance_label == "每月調倉" else "biweekly"
     require_positive_alpha = st.sidebar.toggle("只保留 alpha > 0", value=False)
     use_pvalue_filter = st.sidebar.toggle("使用 alpha p-value 篩選", value=False)
     pvalue_threshold = st.sidebar.slider("Alpha p-value 門檻", min_value=0.01, max_value=0.30, value=0.10, step=0.01)
@@ -2304,6 +2322,7 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
         initial_capital=float(initial_capital),
         commission_rate=float(commission_rate),
         sell_tax_rate=float(sell_tax_rate),
+        rebalance_frequency=str(rebalance_frequency),
         benchmark_ticker=str(benchmark_ticker).strip(),
         benchmark_tickers=benchmark_tickers,
         benchmark_auto_adjust=bool(benchmark_auto_adjust),
@@ -3013,6 +3032,7 @@ def strategy3_build_raw_pipeline_cached(
     min_obs: int,
     start_date: pd.Timestamp | str | None = BACKTEST_START_DEFAULT,
     end_date: pd.Timestamp | str | None = BACKTEST_END_DEFAULT,
+    rebalance_frequency: str = "monthly",
 ) -> dict[str, pd.DataFrame]:
     """
     Build Strategy 3 raw outputs using strategy3_ff5_pipeline.py.
@@ -3029,6 +3049,7 @@ def strategy3_build_raw_pipeline_cached(
         min_obs=int(min_obs),
         start_date=start_date,
         end_date=end_date,
+        rebalance_frequency=rebalance_frequency,
     )
 
     raw_result = run_ff5_raw_pipeline(raw_dir, config)
@@ -3374,7 +3395,7 @@ def strategy3_create_positions(alpha: pd.DataFrame, price_df: pd.DataFrame, top_
 
 
 def strategy3_latest_month_holdings(positions: pd.DataFrame) -> pd.DataFrame:
-    """Return the most recent monthly holding list from the generated positions table."""
+    """Return the most recent holding list from the generated positions table."""
     if positions is None or positions.empty:
         return pd.DataFrame()
 
@@ -4448,8 +4469,8 @@ $$
 
 
 def render_strategy3_page() -> None:
-    st.title("策略3(台股五因子 Alpha 月調倉策略)")
-    st.caption("從原始 CMoney Excel 建立 Top 150 股票池、五因子、rolling alpha，再執行 Alpha Top N 月調倉。")
+    st.title("策略3(台股五因子 Alpha 可選月調倉/雙周調倉策略)")
+    st.caption("從原始 CMoney Excel 建立 Top 150 股票池、五因子、rolling alpha，再執行 Alpha Top N 可選月調倉/雙周調倉。")
 
     settings = strategy3_sidebar_settings()
 
@@ -4460,6 +4481,7 @@ def render_strategy3_page() -> None:
         st.write(
             f"目前設定：市值前 **{settings.market_cap_top_n}**，Alpha Top **{settings.top_n}**，"
             f"lookback **{settings.lookback_days}**，min obs **{settings.min_obs}**，"
+            f"調倉頻率 **{'每月調倉' if settings.rebalance_frequency == 'monthly' else '雙周調倉'}**，"
             f"初始資金 **{settings.initial_capital:,.0f}**，正式回測期間 **{settings.backtest_start_date.date()} ~ {settings.backtest_end_date.date() if settings.backtest_end_date is not None else '最新'}**，"
             f"Benchmark：**{strategy3_benchmark_label_text(settings)}**。"
         )
@@ -4476,6 +4498,7 @@ def render_strategy3_page() -> None:
                         settings.min_obs,
                         settings.backtest_start_date,
                         settings.backtest_end_date,
+                        settings.rebalance_frequency,
                     )
                     if "fallback_warning" in raw_result and not raw_result["fallback_warning"].empty:
                         warning_msg = str(raw_result["fallback_warning"].iloc[0].get("message", "已使用 fallback pipeline。"))
@@ -4493,7 +4516,7 @@ def render_strategy3_page() -> None:
                     st.error("alpha 篩選後沒有可用股票，請放寬 alpha 或 p-value 條件。")
                     return
 
-                with st.spinner("產生 Top N 每月持股..."):
+                with st.spinner("產生 Top N 持股..."):
                     positions = strategy3_create_positions(alpha_for_positions, price_df, settings.top_n)
                     if positions.empty:
                         st.error("沒有成功產生持股清單，請檢查 alpha scores 與 price data。")
