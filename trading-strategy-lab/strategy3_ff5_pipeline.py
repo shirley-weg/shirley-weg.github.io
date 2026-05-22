@@ -1,3 +1,12 @@
+# ============================================================
+# strategy3_ff5_pipeline.py
+# VERSION: V4_BIWEEKLY_REBALANCE_REALDATA_2019_2026
+# Notes:
+# - Strategy 3 official backtest period: 2019-01-01 to 2026-05-19
+# - Strict mode: run backtest only after real price_df/formations/ff5/alpha_scores are generated
+# - New option: monthly vs biweekly rebalancing for Strategy 3
+# - Robust CMoney column normalization for 2019~2026 formats
+# ============================================================
 
 from __future__ import annotations
 
@@ -22,6 +31,9 @@ class FF5RawBuildConfig:
     min_obs: int = 180
     start_date: pd.Timestamp | str | None = DEFAULT_START
     end_date: pd.Timestamp | str | None = DEFAULT_END
+    # "monthly" = 每月調倉；"biweekly" = 雙周調倉。
+    # 這個變數同時控制股票池形成日、FF5 因子持有區間、alpha 訊號形成日。
+    rebalance_frequency: str = "monthly"
 
 
 # ============================================================
@@ -560,21 +572,95 @@ def assign_tertile(s: pd.Series, low_label: str, mid_label: str, high_label: str
     return out
 
 
-def build_top_market_cap_formations(data: pd.DataFrame, fin: pd.DataFrame, top_n: int) -> pd.DataFrame:
+
+def normalize_rebalance_frequency(value: object) -> str:
+    """Normalize user-facing rebalance frequency into canonical values."""
+    raw = str(value or "monthly").strip().lower()
+    mapping = {
+        "m": "monthly",
+        "month": "monthly",
+        "monthly": "monthly",
+        "每月": "monthly",
+        "月調倉": "monthly",
+        "月調整": "monthly",
+        "monthly_rebalance": "monthly",
+        "2w": "biweekly",
+        "2wk": "biweekly",
+        "2week": "biweekly",
+        "2weeks": "biweekly",
+        "biweekly": "biweekly",
+        "bi-weekly": "biweekly",
+        "雙周": "biweekly",
+        "雙週": "biweekly",
+        "雙周調倉": "biweekly",
+        "雙週調倉": "biweekly",
+        "兩周": "biweekly",
+        "兩週": "biweekly",
+    }
+    return mapping.get(raw, "monthly")
+
+
+def build_formation_dates(data: pd.DataFrame, rebalance_frequency: str = "monthly") -> pd.Series:
+    """
+    Build rebalancing formation dates from available DATA dates.
+
+    monthly:
+        每個月最後一個有 DATA 的交易日形成股票池。
+    biweekly:
+        每兩週最後一個有 DATA 的交易日形成股票池。
+        使用 2W-FRI calendar bins；若該 bin 沒有週五交易，會取該 bin 內最後一個有資料日。
+    """
+    if data is None or data.empty or "date" not in data.columns:
+        return pd.Series(dtype="datetime64[ns]")
+
+    dates = (
+        pd.Series(parse_date(data["date"]))
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .reset_index(drop=True)
+    )
+    if dates.empty:
+        return pd.Series(dtype="datetime64[ns]")
+
+    freq = normalize_rebalance_frequency(rebalance_frequency)
+
+    if freq == "biweekly":
+        date_series = pd.Series(dates.values, index=pd.DatetimeIndex(dates.values))
+        out = (
+            date_series
+            .resample("2W-FRI")
+            .max()
+            .dropna()
+            .sort_values()
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+    else:
+        out = (
+            pd.DataFrame({"date": dates})
+            .assign(month=lambda x: x["date"].dt.to_period("M"))
+            .groupby("month")["date"]
+            .max()
+            .sort_values()
+            .reset_index(drop=True)
+        )
+
+    return pd.Series(pd.to_datetime(out, errors="coerce")).dropna().reset_index(drop=True)
+
+
+def build_top_market_cap_formations(
+    data: pd.DataFrame,
+    fin: pd.DataFrame,
+    top_n: int,
+    rebalance_frequency: str = "monthly",
+) -> pd.DataFrame:
     if data is None or data.empty:
         raise ValueError("Cannot build formations because DATA panel is empty.")
     data = data.copy()
     data["date"] = parse_date(data["date"])
     data = data.dropna(subset=["date", "stock_id", "market_cap_100m"])
-    formation_dates = (
-        data[["date"]]
-        .drop_duplicates()
-        .assign(month=lambda x: x["date"].dt.to_period("M"))
-        .groupby("month")["date"]
-        .max()
-        .sort_values()
-        .reset_index(drop=True)
-    )
+    formation_dates = build_formation_dates(data, rebalance_frequency=rebalance_frequency)
 
     rows = []
     for formation_date in formation_dates:
@@ -588,10 +674,11 @@ def build_top_market_cap_formations(data: pd.DataFrame, fin: pd.DataFrame, top_n
         rows.append(snap)
 
     if not rows:
-        raise ValueError("No monthly market-cap formation rows were generated.")
+        raise ValueError("No market-cap formation rows were generated for the selected rebalance frequency.")
 
     formations = pd.concat(rows, ignore_index=True)
-    formations = formations[["formation_date", "rank", "stock_id", "stock_name", "market_cap_100m", "pb", "trading_value_thousand"]]
+    formations["rebalance_frequency"] = normalize_rebalance_frequency(rebalance_frequency)
+    formations = formations[["formation_date", "rebalance_frequency", "rank", "stock_id", "stock_name", "market_cap_100m", "pb", "trading_value_thousand"]]
     formations = merge_latest_fin_by_stock(formations, fin)
 
     formations["bm_from_fin"] = np.nan
@@ -848,7 +935,12 @@ def run_ff5_raw_pipeline(raw_dir: str | Path, config: FF5RawBuildConfig) -> dict
     returns = price_df[["date", "stock_id", "stock_name", "adj_close", "ret"]].copy()
 
     fin = build_financial_panel(asset_raw, rmw_raw)
-    formations = build_top_market_cap_formations(data, fin, config.market_cap_top_n)
+    formations = build_top_market_cap_formations(
+        data,
+        fin,
+        config.market_cap_top_n,
+        rebalance_frequency=config.rebalance_frequency,
+    )
     factor_panel, ff5 = build_ff5_factor_returns(returns, formations)
     alpha_scores, regression_panel = build_rolling_alpha_scores(ff5, formations, returns, config)
 
