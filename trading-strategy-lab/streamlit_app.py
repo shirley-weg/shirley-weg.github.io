@@ -21,6 +21,11 @@ from strategy3_ff5_pipeline import FF5RawBuildConfig, run_ff5_raw_pipeline
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 
+
+# Global backtest window requested for this project.
+BACKTEST_START_DEFAULT = pd.Timestamp("2019-01-01")
+BACKTEST_END_DEFAULT = pd.Timestamp("2026-05-19")
+
 single_stock_futures = [{'code': '1101', 'name': '台泥', 'industry': '水泥工業'},
  {'code': '1102', 'name': '亞泥', 'industry': '水泥工業'},
  {'code': '1210', 'name': '大成', 'industry': '食品工業'},
@@ -1322,14 +1327,14 @@ def sidebar_settings(strategy: StrategyName) -> AppSettings:
     industry = st.sidebar.selectbox("細產業股票池", industries, index=industries.index(default_ind), help="可選全部，但全部股票池執行共整合篩選會較慢。")
 
     st.sidebar.header("資料與回測期間")
-    data_start = st.sidebar.date_input("資料下載起日", value=pd.Timestamp("2019-01-01").date())
-    trading_start = st.sidebar.date_input("正式回測起日", value=pd.Timestamp("2019-01-01").date())
-    use_today = st.sidebar.checkbox("回測到最新資料", value=True)
+    data_start = st.sidebar.date_input("資料下載起日", value=BACKTEST_START_DEFAULT.date())
+    trading_start = st.sidebar.date_input("正式回測起日", value=BACKTEST_START_DEFAULT.date())
+    use_today = st.sidebar.checkbox("回測到最新資料", value=False)
     if use_today:
         trading_end = None
         st.sidebar.caption("回測結束日：yfinance 最新可取得資料")
     else:
-        trading_end = pd.Timestamp(st.sidebar.date_input("正式回測結束日", value=pd.Timestamp.today().date()))
+        trading_end = pd.Timestamp(st.sidebar.date_input("正式回測結束日", value=BACKTEST_END_DEFAULT.date()))
     market_ticker = st.sidebar.text_input("Beta benchmark", value="^TWII")
     auto_adjust = st.sidebar.toggle("使用 yfinance auto_adjust", value=True)
 
@@ -2194,6 +2199,7 @@ def render_strategy_page(strategy: StrategyName) -> None:
 class FF5AlphaSettings:
     raw_data_path: str
     backtest_start_date: pd.Timestamp
+    backtest_end_date: pd.Timestamp | None
     market_cap_top_n: int
     lookback_days: int
     min_obs: int
@@ -2241,8 +2247,13 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     )
     backtest_start_date = st.sidebar.date_input(
         "策略3正式回測起日",
-        value=pd.Timestamp("2019-01-01").date(),
+        value=BACKTEST_START_DEFAULT.date(),
         help="策略3 NAV 與 benchmark 績效會從此日之後開始計算。若 rolling lookback 還未滿足，資金會維持現金直到第一個可調倉日。"
+    )
+    backtest_end_date = st.sidebar.date_input(
+        "策略3正式回測結束日",
+        value=BACKTEST_END_DEFAULT.date(),
+        help="本專案回測期間統一設定為 2019-01-01 到 2026-05-19；若你的資料更新到更後面，可自行調整。"
     )
 
     st.sidebar.divider()
@@ -2282,6 +2293,7 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     return FF5AlphaSettings(
         raw_data_path=raw_data_path,
         backtest_start_date=pd.Timestamp(backtest_start_date),
+        backtest_end_date=pd.Timestamp(backtest_end_date) if backtest_end_date is not None else None,
         market_cap_top_n=int(market_cap_top_n),
         lookback_days=int(lookback_days),
         min_obs=int(min_obs),
@@ -2988,6 +3000,8 @@ def strategy3_build_raw_pipeline_cached(
     market_cap_top_n: int,
     lookback_days: int,
     min_obs: int,
+    start_date: pd.Timestamp | str | None = BACKTEST_START_DEFAULT,
+    end_date: pd.Timestamp | str | None = BACKTEST_END_DEFAULT,
 ) -> dict[str, pd.DataFrame]:
     """
     Build Strategy 3 raw outputs.
@@ -3002,6 +3016,8 @@ def strategy3_build_raw_pipeline_cached(
         market_cap_top_n=int(market_cap_top_n),
         lookback_days=int(lookback_days),
         min_obs=int(min_obs),
+        start_date=start_date,
+        end_date=end_date,
     )
 
     try:
@@ -3394,6 +3410,7 @@ def strategy3_run_backtest(
     commission_rate: float,
     sell_tax_rate: float,
     backtest_start_date: pd.Timestamp | None = None,
+    backtest_end_date: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     price_df = strategy3_normalize_price(price_df)
     positions = positions.copy()
@@ -3412,11 +3429,20 @@ def strategy3_run_backtest(
 
     if backtest_start_date is not None:
         start_ts = pd.Timestamp(backtest_start_date).normalize()
+    else:
+        start_ts = rebalance_dates[0] if len(rebalance_dates) > 0 else pd.NaT
+
+    end_ts = pd.Timestamp(backtest_end_date).normalize() if backtest_end_date is not None else None
+
+    if pd.notna(start_ts):
         rebalance_dates = rebalance_dates[rebalance_dates >= start_ts]
         backtest_dates = trading_dates[trading_dates >= start_ts]
     else:
-        start_ts = rebalance_dates[0] if len(rebalance_dates) > 0 else pd.NaT
-        backtest_dates = trading_dates[trading_dates >= start_ts]
+        backtest_dates = trading_dates
+
+    if end_ts is not None:
+        rebalance_dates = rebalance_dates[rebalance_dates <= end_ts]
+        backtest_dates = backtest_dates[backtest_dates <= end_ts]
 
     rebalance_set = set(rebalance_dates)
 
@@ -4428,7 +4454,7 @@ def render_strategy3_page() -> None:
         st.write(
             f"目前設定：市值前 **{settings.market_cap_top_n}**，Alpha Top **{settings.top_n}**，"
             f"lookback **{settings.lookback_days}**，min obs **{settings.min_obs}**，"
-            f"初始資金 **{settings.initial_capital:,.0f}**，正式回測起日 **{settings.backtest_start_date.date()}**，"
+            f"初始資金 **{settings.initial_capital:,.0f}**，正式回測期間 **{settings.backtest_start_date.date()} ~ {settings.backtest_end_date.date() if settings.backtest_end_date is not None else '最新'}**，"
             f"Benchmark：**{strategy3_benchmark_label_text(settings)}**。"
         )
 
@@ -4442,6 +4468,8 @@ def render_strategy3_page() -> None:
                         settings.market_cap_top_n,
                         settings.lookback_days,
                         settings.min_obs,
+                        settings.backtest_start_date,
+                        settings.backtest_end_date,
                     )
                     if "fallback_warning" in raw_result and not raw_result["fallback_warning"].empty:
                         warning_msg = str(raw_result["fallback_warning"].iloc[0].get("message", "已使用 fallback pipeline。"))
@@ -4474,6 +4502,7 @@ def render_strategy3_page() -> None:
                                 commission_rate=settings.commission_rate,
                                 sell_tax_rate=settings.sell_tax_rate,
                                 backtest_start_date=settings.backtest_start_date,
+                                backtest_end_date=settings.backtest_end_date,
                             )
 
                         with st.spinner(f"整理 benchmarks：{strategy3_benchmark_label_text(settings)}..."):
