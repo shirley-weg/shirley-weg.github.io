@@ -7,7 +7,7 @@
   <title>Trading Strategy Lab | Pair Trading Backtest</title>
   <meta
     name="description"
-    content="Trading Strategy Lab provides a Python-powered pair trading backtest tool and trading strategy research interface."
+    content="Trading Strategy Lab provides a Python-powered pair trading backtest tool, broker branch chip dashboard, and trading strategy research interface."
   />
 
   <style>
@@ -19,6 +19,9 @@
       --panel: #ffffff;
       --teal: #0f766e;
       --teal-dark: #0b4f4a;
+      --gold: #b98500;
+      --gold-soft: #fff7e6;
+      --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
     }
 
     * {
@@ -51,6 +54,9 @@
       background: rgba(246, 248, 251, 0.94);
       backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 20;
     }
 
     nav {
@@ -58,6 +64,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 20px;
     }
 
     .brand {
@@ -66,11 +73,24 @@
       letter-spacing: 0.01em;
     }
 
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+
+    .nav-links a:hover {
+      color: var(--teal);
+    }
+
     .hero {
       min-height: calc(100vh - 68px);
       display: flex;
       align-items: center;
-      padding: 72px 0;
+      padding: 72px 0 42px;
     }
 
     .hero-content {
@@ -119,6 +139,7 @@
       font-weight: 800;
       border: 1px solid transparent;
       transition: 0.18s ease;
+      cursor: pointer;
     }
 
     .btn.primary {
@@ -143,6 +164,125 @@
       transform: translateY(-1px);
     }
 
+    .features {
+      padding: 0 0 76px;
+    }
+
+    .section-head {
+      margin-bottom: 22px;
+    }
+
+    .section-kicker {
+      color: var(--teal);
+      font-size: 0.82rem;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .section-title {
+      margin: 0;
+      font-size: clamp(1.85rem, 4vw, 3rem);
+      line-height: 1.16;
+      letter-spacing: -0.035em;
+    }
+
+    .section-desc {
+      max-width: 780px;
+      color: var(--muted);
+      margin: 12px 0 0;
+      font-size: 1.05rem;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .feature-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 26px;
+      box-shadow: var(--shadow);
+      transition: 0.18s ease;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card:hover {
+      transform: translateY(-3px);
+      border-color: rgba(15, 118, 110, 0.35);
+    }
+
+    .feature-card.highlight {
+      border-color: rgba(185, 133, 0, 0.35);
+      background:
+        linear-gradient(135deg, rgba(255, 247, 230, 0.92), rgba(255, 255, 255, 0.96)),
+        var(--panel);
+    }
+
+    .feature-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.1);
+      color: var(--teal);
+      font-size: 0.78rem;
+      font-weight: 900;
+      margin-bottom: 14px;
+    }
+
+    .feature-card.highlight .feature-badge {
+      background: rgba(185, 133, 0, 0.14);
+      color: var(--gold);
+    }
+
+    .feature-card h2 {
+      margin: 0;
+      font-size: 1.55rem;
+      line-height: 1.28;
+      letter-spacing: -0.02em;
+    }
+
+    .feature-card p {
+      color: var(--muted);
+      margin: 14px 0 0;
+      font-size: 1rem;
+    }
+
+    .feature-list {
+      list-style: none;
+      padding: 0;
+      margin: 18px 0 22px;
+      display: grid;
+      gap: 8px;
+      color: var(--ink);
+      font-weight: 650;
+      font-size: 0.96rem;
+    }
+
+    .feature-list li {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+    }
+
+    .feature-list li::before {
+      content: "✓";
+      color: var(--teal);
+      font-weight: 900;
+    }
+
+    .feature-card.highlight .feature-list li::before {
+      color: var(--gold);
+    }
+
     footer {
       border-top: 1px solid var(--line);
       color: var(--muted);
@@ -155,9 +295,23 @@
         width: min(100% - 28px, 1120px);
       }
 
+      nav {
+        height: auto;
+        min-height: 68px;
+        padding: 14px 0;
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .nav-links {
+        gap: 12px;
+        flex-wrap: wrap;
+        font-size: 0.9rem;
+      }
+
       .hero {
         min-height: auto;
-        padding: 56px 0 72px;
+        padding: 56px 0 58px;
       }
 
       h1 {
@@ -176,6 +330,14 @@
       .btn {
         width: 100%;
       }
+
+      .feature-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .feature-card {
+        padding: 22px;
+      }
     }
   </style>
 </head>
@@ -184,6 +346,11 @@
   <header>
     <nav class="wrap">
       <a class="brand" href="#">Trading Strategy Lab</a>
+
+      <div class="nav-links">
+        <a href="#features">功能入口</a>
+        <a href="./broker.html">券商分點籌碼</a>
+      </div>
     </nav>
   </header>
 
@@ -220,6 +387,68 @@
               開啟回測工具
             </a>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="features" id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <div class="section-kicker">Research Tools</div>
+          <h2 class="section-title">功能入口</h2>
+          <p class="section-desc">
+            目前網站整合策略回測與籌碼資料查詢，後續可持續新增更多量化研究工具。
+          </p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card">
+            <div class="feature-badge">Backtest</div>
+
+            <h2>Pair Trading 回測工具</h2>
+
+            <p>
+              使用 Streamlit 建立的 Pair Trading 策略回測頁面，可設定標的、期間、
+              權重最佳化方法與交易成本，並輸出績效與交易紀錄。
+            </p>
+
+            <ul class="feature-list">
+              <li>支援策略績效與風險指標檢視</li>
+              <li>查看權益曲線與交易明細</li>
+              <li>適合策略研究與參數比較</li>
+            </ul>
+
+            <a
+              class="btn secondary"
+              href="https://shirley-trading-strategy-lab.streamlit.app/"
+              target="_blank"
+              rel="noreferrer"
+            >
+              開啟回測工具
+            </a>
+          </article>
+
+          <article class="feature-card highlight">
+            <div class="feature-badge">Broker Branch Dashboard</div>
+
+            <h2>券商分點籌碼查詢</h2>
+
+            <p>
+              查看每日各券商買進金額、賣出金額與買賣超金額，
+              並依買超金額由大到小排序。也可以搜尋券商、分點代號、
+              分點名稱、股票代號與股票名稱。
+            </p>
+
+            <ul class="feature-list">
+              <li>第一層顯示每間券商每日買賣超金額排行</li>
+              <li>點進券商後查看個股買賣超與分點排行</li>
+              <li>支援搜尋券商分點與個股資料</li>
+            </ul>
+
+            <a class="btn primary" href="./broker.html">
+              進入券商分點查詢
+            </a>
+          </article>
         </div>
       </div>
     </section>
