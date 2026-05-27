@@ -17,12 +17,17 @@
       --gold-soft: #f4e7c2;
       --red: #b91c1c;
       --green: #0f766e;
+      --green-dark: #0b4f4a;
       --blue: #2563eb;
       --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
     }
 
     * {
       box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
     }
 
     body {
@@ -53,7 +58,7 @@
     }
 
     nav {
-      height: 68px;
+      min-height: 68px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -84,12 +89,24 @@
       font-weight: 800;
       font-size: 0.92rem;
       cursor: pointer;
+      transition: 0.18s ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: var(--green);
+      color: var(--green);
     }
 
     .btn.primary {
       background: var(--green);
       color: #fff;
       border-color: var(--green);
+    }
+
+    .btn.primary:hover {
+      background: var(--green-dark);
+      color: #fff;
     }
 
     main {
@@ -160,40 +177,6 @@
       margin-top: 8px;
     }
 
-    .grid {
-      display: grid;
-      grid-template-columns: 1.06fr 0.94fr;
-      gap: 18px;
-      align-items: start;
-    }
-
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-
-    .panel-head {
-      padding: 18px 20px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: baseline;
-    }
-
-    .panel-title {
-      font-size: 1.1rem;
-      font-weight: 900;
-    }
-
-    .panel-subtitle {
-      color: var(--muted);
-      font-size: 0.9rem;
-    }
-
     .summary-stats {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
@@ -228,6 +211,40 @@
 
     .negative {
       color: var(--blue);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.06fr 0.94fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+    }
+
+    .panel-title {
+      font-size: 1.1rem;
+      font-weight: 900;
+    }
+
+    .panel-subtitle {
+      color: var(--muted);
+      font-size: 0.9rem;
     }
 
     .table-wrap {
@@ -311,9 +328,33 @@
       text-align: center;
     }
 
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin: 0 0 12px;
+      flex-wrap: wrap;
+    }
+
+    .tab-btn {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 999px;
+      min-height: 34px;
+      padding: 0 12px;
+      cursor: pointer;
+      font-weight: 800;
+    }
+
+    .tab-btn.active {
+      background: var(--green);
+      color: #fff;
+      border-color: var(--green);
+    }
+
     .stock-row {
       display: grid;
-      grid-template-columns: minmax(150px, 1fr) 92px minmax(110px, 190px) 52px;
+      grid-template-columns: minmax(150px, 1fr) 100px minmax(110px, 190px) 58px;
       gap: 10px;
       align-items: center;
       padding: 10px 0;
@@ -334,7 +375,6 @@
     .bar-track {
       height: 18px;
       background: #e5e7eb;
-      border-radius: 0;
       overflow: hidden;
     }
 
@@ -358,30 +398,6 @@
       color: #475569;
       font-weight: 800;
       font-size: 0.78rem;
-    }
-
-    .tabs {
-      display: flex;
-      gap: 8px;
-      margin: 18px 0 12px;
-      flex-wrap: wrap;
-    }
-
-    .tab-btn {
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-      border-radius: 999px;
-      min-height: 34px;
-      padding: 0 12px;
-      cursor: pointer;
-      font-weight: 800;
-    }
-
-    .tab-btn.active {
-      background: var(--green);
-      color: #fff;
-      border-color: var(--green);
     }
 
     .branch-list {
@@ -410,6 +426,20 @@
       .stock-row {
         grid-template-columns: 1fr;
       }
+
+      nav {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 14px 0;
+      }
+
+      .nav-actions {
+        width: 100%;
+      }
+
+      .nav-actions .btn {
+        flex: 1;
+      }
     }
   </style>
 </head>
@@ -433,8 +463,8 @@
       <div class="eyebrow">Broker Branch Dashboard</div>
       <h1>券商分點籌碼查詢</h1>
       <p class="lead">
-        可依日期查看每間券商的買進金額、賣出金額與買賣超金額，並依買超金額由大到小排序。
-        點選券商後，可進一步查看該券商買賣超個股、分點明細與分點搜尋結果。
+        可依日期查看每間券商的買進金額、賣出金額與買賣超金額，並依買賣超金額由大到小排序。
+        點選券商後，可查看該券商的個股買賣超、分點排行與逐筆明細。
       </p>
       <div class="meta" id="dataMeta">資料載入中...</div>
     </section>
@@ -445,7 +475,7 @@
       <input
         id="searchInput"
         type="search"
-        placeholder="搜尋券商、分點代號、分點名稱、股票代號或股票名稱，例如：元大、凱基、9200、台積電"
+        placeholder="搜尋券商、分點代號或分點名稱，例如：元大、凱基、9200、台北"
       />
 
       <button class="btn primary" id="clearBtn">清除搜尋</button>
@@ -453,17 +483,17 @@
 
     <section class="summary-stats">
       <div class="stat-card">
-        <div class="stat-label">今日券商數</div>
+        <div class="stat-label">目前券商數</div>
         <div class="stat-value" id="statBrokerCount">-</div>
       </div>
 
       <div class="stat-card">
-        <div class="stat-label">全市場買進金額</div>
+        <div class="stat-label">買進金額合計</div>
         <div class="stat-value" id="statBuyValue">-</div>
       </div>
 
       <div class="stat-card">
-        <div class="stat-label">全市場買賣超金額</div>
+        <div class="stat-label">買賣超金額合計</div>
         <div class="stat-value" id="statNetValue">-</div>
       </div>
     </section>
@@ -521,7 +551,7 @@
         <div>
           <div class="panel-title">所有分點資料</div>
           <div class="panel-subtitle">
-            會依目前日期與搜尋條件過濾，預設依買賣超金額由大到小排列
+            依目前日期與搜尋條件過濾，預設依買賣超金額由大到小排列
           </div>
         </div>
       </div>
@@ -553,12 +583,13 @@
   </main>
 
   <script>
-    const DATA_URL = "./broker_data/broker_dashboard_data.json";
+    const INDEX_URL = "./broker_data/broker_dashboard_index.json";
 
     let rawData = null;
     let selectedDate = null;
     let selectedBroker = null;
     let activeTab = "stocks";
+    let detailCache = {};
 
     const dateSelect = document.getElementById("dateSelect");
     const searchInput = document.getElementById("searchInput");
@@ -615,6 +646,10 @@
       return normalizeText(searchInput.value);
     }
 
+    function bySelectedDate(row) {
+      return row.date === selectedDate;
+    }
+
     function rowMatchesQuery(row, q) {
       if (!q) return true;
 
@@ -630,13 +665,9 @@
       return text.includes(q);
     }
 
-    function bySelectedDate(row) {
-      return row.date === selectedDate;
-    }
-
     async function loadData() {
       try {
-        const res = await fetch(`${DATA_URL}?v=${Date.now()}`);
+        const res = await fetch(`${INDEX_URL}?v=${Date.now()}`);
 
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
@@ -646,6 +677,7 @@
 
         selectedDate = rawData.latest_date;
         selectedBroker = null;
+        detailCache = {};
 
         initDateSelect();
         renderAll();
@@ -656,14 +688,50 @@
       } catch (err) {
         console.error(err);
 
-        dataMeta.textContent = "資料載入失敗，請確認 broker_data/broker_dashboard_data.json 是否已放到 GitHub。";
-        brokerTbody.innerHTML = `<tr><td colspan="6">資料載入失敗：${err.message}</td></tr>`;
-        branchTbody.innerHTML = `<tr><td colspan="6">資料載入失敗：${err.message}</td></tr>`;
+        dataMeta.textContent =
+          "資料載入失敗，請確認 broker_data/broker_dashboard_index.json 是否已放到 GitHub。";
+
+        brokerTbody.innerHTML =
+          `<tr><td colspan="6">資料載入失敗：${err.message}</td></tr>`;
+
+        branchTbody.innerHTML =
+          `<tr><td colspan="6">資料載入失敗：${err.message}</td></tr>`;
       }
     }
 
+    async function loadBrokerDetail(broker) {
+      if (!broker) {
+        return [];
+      }
+
+      if (detailCache[broker]) {
+        return detailCache[broker];
+      }
+
+      const relPath = rawData.broker_files?.[broker];
+
+      if (!relPath) {
+        detailCache[broker] = [];
+        return [];
+      }
+
+      const url = `./broker_data/${relPath}?v=${Date.now()}`;
+      const res = await fetch(url);
+
+      if (!res.ok) {
+        throw new Error(`無法載入 ${broker} 明細：HTTP ${res.status}`);
+      }
+
+      const payload = await res.json();
+      detailCache[broker] = payload.rows || [];
+
+      return detailCache[broker];
+    }
+
     function initDateSelect() {
-      dateSelect.innerHTML = rawData.dates
+      const dates = rawData.dates || [rawData.latest_date];
+
+      dateSelect.innerHTML = dates
         .slice()
         .reverse()
         .map(d => `<option value="${d}">${d}</option>`)
@@ -702,10 +770,12 @@
         .sort((a, b) => Number(b.net_value || 0) - Number(a.net_value || 0));
     }
 
-    function getDetailRowsForBroker(broker) {
+    async function getDetailRowsForBroker(broker) {
       const q = getQuery();
 
-      return rawData.stock_detail
+      const rows = await loadBrokerDetail(broker);
+
+      return rows
         .filter(bySelectedDate)
         .filter(row => row.broker === broker)
         .filter(row => rowMatchesQuery(row, q));
@@ -727,7 +797,8 @@
       const rows = getBrokerRows();
 
       if (rows.length === 0) {
-        brokerTbody.innerHTML = `<tr><td colspan="6">找不到符合條件的券商。</td></tr>`;
+        brokerTbody.innerHTML =
+          `<tr><td colspan="6">找不到符合條件的券商。</td></tr>`;
         return;
       }
 
@@ -739,11 +810,15 @@
             <td>
               <span class="rank">${idx + 1}</span>
               <span class="name-main">${row.broker}</span>
-              <span class="name-sub">買張 ${fmtShares(row.buy_shares)} / 賣張 ${fmtShares(row.sell_shares)}</span>
+              <span class="name-sub">
+                買張 ${fmtShares(row.buy_shares)} / 賣張 ${fmtShares(row.sell_shares)}
+              </span>
             </td>
             <td>${fmtYi(row.buy_value)}</td>
             <td>${fmtYi(row.sell_value)}</td>
-            <td class="${signedClass(row.net_value)}"><strong>${fmtSignedYi(row.net_value)}</strong></td>
+            <td class="${signedClass(row.net_value)}">
+              <strong>${fmtSignedYi(row.net_value)}</strong>
+            </td>
             <td>${Number(row.branch_count || 0).toLocaleString("zh-TW")}</td>
             <td>${Number(row.stock_count || 0).toLocaleString("zh-TW")}</td>
           </tr>
@@ -755,7 +830,10 @@
           selectedBroker = tr.dataset.broker;
           activeTab = "stocks";
           renderAll();
-          document.querySelector(".grid").scrollIntoView({ behavior: "smooth", block: "start" });
+          document.querySelector(".grid").scrollIntoView({
+            behavior: "smooth",
+            block: "start"
+          });
         });
       });
     }
@@ -764,7 +842,8 @@
       const rows = getBranchRows();
 
       if (rows.length === 0) {
-        branchTbody.innerHTML = `<tr><td colspan="6">找不到符合條件的分點。</td></tr>`;
+        branchTbody.innerHTML =
+          `<tr><td colspan="6">找不到符合條件的分點。</td></tr>`;
         return;
       }
 
@@ -778,14 +857,16 @@
             <td>${row.broker}</td>
             <td>${fmtYi(row.buy_value)}</td>
             <td>${fmtYi(row.sell_value)}</td>
-            <td class="${signedClass(row.net_value)}"><strong>${fmtSignedYi(row.net_value)}</strong></td>
+            <td class="${signedClass(row.net_value)}">
+              <strong>${fmtSignedYi(row.net_value)}</strong>
+            </td>
             <td>${Number(row.stock_count || 0).toLocaleString("zh-TW")}</td>
           </tr>
         `;
       }).join("");
     }
 
-    function renderDetail() {
+    async function renderDetail() {
       if (!selectedBroker) {
         detailTitle.textContent = "券商詳細資訊";
         detailSubtitle.textContent = "請先點選左側任一券商";
@@ -793,47 +874,62 @@
         return;
       }
 
-      const rows = getDetailRowsForBroker(selectedBroker);
-
-      const brokerRow = rawData.broker_summary
-        .filter(bySelectedDate)
-        .find(row => row.broker === selectedBroker);
-
       detailTitle.textContent = `${selectedBroker} 詳細資訊`;
+      detailSubtitle.textContent = "明細載入中...";
+      detailBody.innerHTML = `<div class="empty">明細載入中...</div>`;
 
-      if (brokerRow) {
-        detailSubtitle.textContent =
-          `${selectedDate}｜買進 ${fmtYi(brokerRow.buy_value)}｜賣出 ${fmtYi(brokerRow.sell_value)}｜買賣超 ${fmtSignedYi(brokerRow.net_value)}`;
-      }
+      try {
+        const rows = await getDetailRowsForBroker(selectedBroker);
 
-      const tabs = `
-        <div class="tabs">
-          <button class="tab-btn ${activeTab === "stocks" ? "active" : ""}" data-tab="stocks">個股買賣超</button>
-          <button class="tab-btn ${activeTab === "branches" ? "active" : ""}" data-tab="branches">分點排行</button>
-          <button class="tab-btn ${activeTab === "raw" ? "active" : ""}" data-tab="raw">逐筆明細</button>
-        </div>
-      `;
+        const brokerRow = rawData.broker_summary
+          .filter(bySelectedDate)
+          .find(row => row.broker === selectedBroker);
 
-      let content = "";
+        if (brokerRow) {
+          detailSubtitle.textContent =
+            `${selectedDate}｜買進 ${fmtYi(brokerRow.buy_value)}｜賣出 ${fmtYi(brokerRow.sell_value)}｜買賣超 ${fmtSignedYi(brokerRow.net_value)}`;
+        }
 
-      if (rows.length === 0) {
-        content = `<div class="empty">此券商在目前搜尋條件下沒有明細。</div>`;
-      } else if (activeTab === "stocks") {
-        content = renderBrokerStockRanking(rows);
-      } else if (activeTab === "branches") {
-        content = renderBrokerBranchRanking();
-      } else {
-        content = renderRawDetailTable(rows);
-      }
+        const tabs = `
+          <div class="tabs">
+            <button class="tab-btn ${activeTab === "stocks" ? "active" : ""}" data-tab="stocks">
+              個股買賣超
+            </button>
+            <button class="tab-btn ${activeTab === "branches" ? "active" : ""}" data-tab="branches">
+              分點排行
+            </button>
+            <button class="tab-btn ${activeTab === "raw" ? "active" : ""}" data-tab="raw">
+              逐筆明細
+            </button>
+          </div>
+        `;
 
-      detailBody.innerHTML = tabs + content;
+        let content = "";
 
-      detailBody.querySelectorAll(".tab-btn").forEach(btn => {
-        btn.addEventListener("click", () => {
-          activeTab = btn.dataset.tab;
-          renderDetail();
+        if (rows.length === 0) {
+          content = `<div class="empty">此券商在目前搜尋條件下沒有明細。</div>`;
+        } else if (activeTab === "stocks") {
+          content = renderBrokerStockRanking(rows);
+        } else if (activeTab === "branches") {
+          content = renderBrokerBranchRanking();
+        } else {
+          content = renderRawDetailTable(rows);
+        }
+
+        detailBody.innerHTML = tabs + content;
+
+        detailBody.querySelectorAll(".tab-btn").forEach(btn => {
+          btn.addEventListener("click", () => {
+            activeTab = btn.dataset.tab;
+            renderDetail();
+          });
         });
-      });
+
+      } catch (err) {
+        console.error(err);
+        detailSubtitle.textContent = "明細載入失敗";
+        detailBody.innerHTML = `<div class="empty">${err.message}</div>`;
+      }
     }
 
     function renderBrokerStockRanking(rows) {
@@ -875,7 +971,11 @@
       return `
         <div>
           ${items.map(item => {
-            const pct = Math.max(3, Math.min(100, Math.abs(item.net_value) / maxAbs * 100));
+            const pct = Math.max(
+              3,
+              Math.min(100, Math.abs(item.net_value) / maxAbs * 100)
+            );
+
             const neg = item.net_value < 0 ? "negative-bar" : "";
 
             return `
@@ -883,7 +983,9 @@
                 <div>
                   <span class="stock-name">${item.stock_name}</span>
                   <span class="stock-code">${item.stock_code}</span>
-                  <span class="name-sub">買張 ${fmtShares(item.buy_shares)} / 賣張 ${fmtShares(item.sell_shares)}</span>
+                  <span class="name-sub">
+                    買張 ${fmtShares(item.buy_shares)} / 賣張 ${fmtShares(item.sell_shares)}
+                  </span>
                 </div>
 
                 <div class="${signedClass(item.net_value)}">
@@ -894,7 +996,9 @@
                   <div class="bar-fill ${neg}" style="width: ${pct}%"></div>
                 </div>
 
-                <div><span class="pill">${item.branches.size} 分點</span></div>
+                <div>
+                  <span class="pill">${item.branches.size} 分點</span>
+                </div>
               </div>
             `;
           }).join("")}
@@ -936,7 +1040,9 @@
                   </td>
                   <td>${fmtYi(row.buy_value)}</td>
                   <td>${fmtYi(row.sell_value)}</td>
-                  <td class="${signedClass(row.net_value)}"><strong>${fmtSignedYi(row.net_value)}</strong></td>
+                  <td class="${signedClass(row.net_value)}">
+                    <strong>${fmtSignedYi(row.net_value)}</strong>
+                  </td>
                   <td>${Number(row.stock_count || 0).toLocaleString("zh-TW")}</td>
                 </tr>
               `).join("")}
@@ -972,8 +1078,12 @@
                   </td>
                   <td>${fmtShares(row.buy_shares)}</td>
                   <td>${fmtShares(row.sell_shares)}</td>
-                  <td class="${signedClass(row.net_shares)}"><strong>${fmtShares(row.net_shares)}</strong></td>
-                  <td class="${signedClass(row.net_value)}"><strong>${fmtSignedYi(row.net_value)}</strong></td>
+                  <td class="${signedClass(row.net_shares)}">
+                    <strong>${fmtShares(row.net_shares)}</strong>
+                  </td>
+                  <td class="${signedClass(row.net_value)}">
+                    <strong>${fmtSignedYi(row.net_value)}</strong>
+                  </td>
                 </tr>
               `).join("")}
             </tbody>
