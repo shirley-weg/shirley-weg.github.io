@@ -23,6 +23,10 @@ import streamlit as st
 import statsmodels.api as sm
 import yfinance as yf
 from statsmodels.tsa.stattools import coint
+try:
+    from scipy.optimize import minimize
+except Exception:
+    minimize = None
 from strategy3_ff5_pipeline import FF5RawBuildConfig, run_ff5_raw_pipeline
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -2214,6 +2218,14 @@ class FF5AlphaSettings:
     use_pvalue_filter: bool
     pvalue_threshold: float
     top_n: int
+
+    # Top N 標的選定後，可選擇是否改用最大 Sharpe ratio 做投組權重最佳化。
+    use_portfolio_optimization: bool
+    portfolio_optimization_lookback: int
+    portfolio_optimization_min_obs: int
+    portfolio_optimization_max_weight: float
+    portfolio_optimization_risk_free_rate: float
+
     initial_capital: float
     commission_rate: float
     sell_tax_rate: float
@@ -2271,6 +2283,56 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
     lookback_days = st.sidebar.slider("Rolling regression lookback", min_value=120, max_value=504, value=252, step=21)
     min_obs = st.sidebar.slider("Regression minimum observations", min_value=60, max_value=252, value=180, step=10)
     top_n = st.sidebar.slider("Alpha Top N 持股檔數", min_value=1, max_value=50, value=10, step=1)
+
+    st.sidebar.divider()
+    st.sidebar.header("投組權重")
+    use_portfolio_optimization = st.sidebar.toggle(
+        "Top N 標的選定後做投組優化（Max Sharpe Ratio）",
+        value=False,
+        help="關閉時維持 Alpha Top N 等權重；開啟時，每個調倉日會只用形成日前的歷史報酬，對當期 Top N 標的求最大 Sharpe ratio 的 long-only 權重。"
+    )
+    if use_portfolio_optimization:
+        portfolio_optimization_lookback = st.sidebar.slider(
+            "Max Sharpe 歷史估計天數",
+            min_value=60,
+            max_value=756,
+            value=252,
+            step=21,
+            help="用形成日前最近 N 個交易日的日報酬估計期望報酬與共變異數。"
+        )
+        portfolio_optimization_min_obs = st.sidebar.slider(
+            "Max Sharpe 最少有效報酬筆數",
+            min_value=20,
+            max_value=252,
+            value=60,
+            step=10,
+            help="單檔股票若有效日報酬筆數低於此值，該次優化會先排除該股票；若資料不足則自動退回等權。"
+        )
+        portfolio_optimization_max_weight = st.sidebar.slider(
+            "Max Sharpe 單檔權重上限",
+            min_value=0.05,
+            max_value=1.00,
+            value=min(0.40, max(1.0 / max(int(top_n), 1), 0.05)),
+            step=0.05,
+            help="long-only 權重上限；若設定過低導致無法讓權重加總為 1，程式會自動調整到至少 1/N。"
+        )
+        portfolio_optimization_risk_free_rate = st.sidebar.number_input(
+            "年化無風險利率（Max Sharpe）",
+            min_value=-0.10,
+            max_value=0.20,
+            value=0.0,
+            step=0.005,
+            format="%.4f",
+            help="Sharpe ratio 分子使用年化投組期望報酬扣除年化無風險利率。"
+        )
+    else:
+        portfolio_optimization_lookback = 252
+        portfolio_optimization_min_obs = 60
+        portfolio_optimization_max_weight = 1.0
+        portfolio_optimization_risk_free_rate = 0.0
+
+    st.sidebar.divider()
+    st.sidebar.header("調倉與交易成本")
     rebalance_label = st.sidebar.selectbox(
         "策略3調倉頻率",
         options=["每月調倉", "雙周調倉"],
@@ -2317,6 +2379,11 @@ def strategy3_sidebar_settings() -> FF5AlphaSettings:
         use_pvalue_filter=bool(use_pvalue_filter),
         pvalue_threshold=float(pvalue_threshold),
         top_n=int(top_n),
+        use_portfolio_optimization=bool(use_portfolio_optimization),
+        portfolio_optimization_lookback=int(portfolio_optimization_lookback),
+        portfolio_optimization_min_obs=int(portfolio_optimization_min_obs),
+        portfolio_optimization_max_weight=float(portfolio_optimization_max_weight),
+        portfolio_optimization_risk_free_rate=float(portfolio_optimization_risk_free_rate),
         initial_capital=float(initial_capital),
         commission_rate=float(commission_rate),
         sell_tax_rate=float(sell_tax_rate),
@@ -3344,7 +3411,279 @@ def strategy3_next_trading_date(trading_dates: pd.DatetimeIndex, current_date: p
     return pd.Timestamp(future[0])
 
 
-def strategy3_create_positions(alpha: pd.DataFrame, price_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+def strategy3_equal_weight_map(stock_ids: list[str]) -> dict[str, float]:
+    """Return a normalized equal-weight dictionary for the given stock ids."""
+    ids = [str(sid).zfill(4) for sid in stock_ids if pd.notna(sid)]
+    ids = list(dict.fromkeys(ids))
+    if len(ids) == 0:
+        return {}
+    w = 1.0 / len(ids)
+    return {sid: w for sid in ids}
+
+
+def strategy3_portfolio_return_window(
+    price_df: pd.DataFrame,
+    stock_ids: list[str],
+    as_of_date: pd.Timestamp,
+    lookback_days: int,
+) -> pd.DataFrame:
+    """
+    Build a daily return matrix for a selected stock list using only information
+    available on or before as_of_date.
+
+    The optimizer therefore uses no future returns from the holding period.
+    """
+    if price_df is None or price_df.empty or len(stock_ids) == 0:
+        return pd.DataFrame()
+
+    ids = [str(sid).zfill(4) for sid in stock_ids if pd.notna(sid)]
+    ids = list(dict.fromkeys(ids))
+    if len(ids) == 0:
+        return pd.DataFrame()
+
+    px = strategy3_normalize_price(price_df)
+    px = px[(px["stock_id"].isin(ids)) & (px["date"] <= pd.Timestamp(as_of_date))].copy()
+    if px.empty:
+        return pd.DataFrame()
+
+    wide = (
+        px.pivot_table(index="date", columns="stock_id", values="adj_close", aggfunc="last")
+        .sort_index()
+    )
+
+    # Need lookback_days + 1 prices to compute roughly lookback_days returns.
+    wide = wide.tail(int(lookback_days) + 1)
+    returns = wide.pct_change(fill_method=None)
+    returns = returns.replace([np.inf, -np.inf], np.nan)
+    return returns
+
+
+def strategy3_max_sharpe_weights_from_returns(
+    returns: pd.DataFrame,
+    selected_stock_ids: list[str],
+    min_obs: int = 60,
+    max_weight: float = 1.0,
+    annual_risk_free_rate: float = 0.0,
+) -> tuple[dict[str, float], dict[str, object]]:
+    """
+    Long-only maximum Sharpe ratio optimizer.
+
+    Objective:
+        maximize (w' mu - rf) / sqrt(w' Sigma w)
+
+    where mu and Sigma are annualized from daily returns.
+
+    Fallback rule:
+        If scipy/SLSQP is unavailable, data are insufficient, or the optimizer
+        fails, return equal weights. This keeps the Streamlit app usable.
+    """
+    selected_ids = [str(sid).zfill(4) for sid in selected_stock_ids if pd.notna(sid)]
+    selected_ids = list(dict.fromkeys(selected_ids))
+    equal_weights = strategy3_equal_weight_map(selected_ids)
+
+    base_meta: dict[str, object] = {
+        "weight_method": "equal_weight",
+        "optimization_status": "not_run",
+        "optimization_message": "",
+        "optimization_n_assets": len(selected_ids),
+        "optimization_n_obs": 0,
+        "optimization_expected_return": np.nan,
+        "optimization_volatility": np.nan,
+        "optimization_sharpe": np.nan,
+    }
+
+    if len(selected_ids) <= 1:
+        base_meta.update({
+            "optimization_status": "single_asset",
+            "optimization_message": "Only one selected asset; weight is 100%.",
+        })
+        return equal_weights, base_meta
+
+    if minimize is None:
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": "scipy.optimize.minimize is unavailable.",
+        })
+        return equal_weights, base_meta
+
+    if returns is None or returns.empty:
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": "No return history before formation date.",
+        })
+        return equal_weights, base_meta
+
+    ret = returns.copy()
+    ret = ret[[c for c in selected_ids if c in ret.columns]]
+    if ret.empty:
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": "Selected assets are not found in the return matrix.",
+        })
+        return equal_weights, base_meta
+
+    valid_cols: list[str] = []
+    for c in ret.columns:
+        s = ret[c].dropna()
+        if len(s) >= int(min_obs) and float(s.std(ddof=0)) > 0:
+            valid_cols.append(c)
+
+    if len(valid_cols) <= 1:
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": f"Need at least two assets with >= {int(min_obs)} valid returns.",
+            "optimization_n_obs": int(ret[valid_cols].dropna(how="any").shape[0]) if valid_cols else 0,
+        })
+        return equal_weights, base_meta
+
+    ret = ret[valid_cols].dropna(how="any")
+    if len(ret) < int(min_obs):
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": f"Common return history has only {len(ret)} rows; min_obs={int(min_obs)}.",
+            "optimization_n_obs": int(len(ret)),
+        })
+        return equal_weights, base_meta
+
+    n = len(valid_cols)
+    max_weight = float(max_weight)
+    if not np.isfinite(max_weight) or max_weight <= 0:
+        max_weight = 1.0
+    max_weight_eff = min(1.0, max(max_weight, 1.0 / n))
+
+    mu = ret.mean().values * 252.0
+    cov = ret.cov().values * 252.0
+    cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # A small diagonal ridge improves numerical stability when assets are highly correlated.
+    cov = cov + np.eye(n) * 1e-10
+
+    rf = float(annual_risk_free_rate)
+
+    def neg_sharpe(w: np.ndarray) -> float:
+        port_return = float(np.dot(w, mu))
+        port_var = float(w @ cov @ w)
+        if port_var <= 0 or not np.isfinite(port_var):
+            return 1e6
+        port_vol = np.sqrt(port_var)
+        sharpe = (port_return - rf) / port_vol
+        if not np.isfinite(sharpe):
+            return 1e6
+        return -float(sharpe)
+
+    x0 = np.repeat(1.0 / n, n)
+    bounds = [(0.0, max_weight_eff) for _ in range(n)]
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
+    try:
+        res = minimize(
+            neg_sharpe,
+            x0,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={"maxiter": 500, "ftol": 1e-12, "disp": False},
+        )
+    except Exception as exc:
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": f"Optimizer exception: {exc}",
+            "optimization_n_assets": n,
+            "optimization_n_obs": int(len(ret)),
+        })
+        return equal_weights, base_meta
+
+    if (not getattr(res, "success", False)) or res.x is None:
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": f"Optimizer failed: {getattr(res, 'message', 'unknown error')}",
+            "optimization_n_assets": n,
+            "optimization_n_obs": int(len(ret)),
+        })
+        return equal_weights, base_meta
+
+    w = np.asarray(res.x, dtype=float)
+    w = np.clip(w, 0.0, max_weight_eff)
+    if w.sum() <= 0 or not np.isfinite(w).all():
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": "Optimizer returned invalid weights.",
+            "optimization_n_assets": n,
+            "optimization_n_obs": int(len(ret)),
+        })
+        return equal_weights, base_meta
+
+    w = w / w.sum()
+
+    weights = {sid: 0.0 for sid in selected_ids}
+    for sid, weight in zip(valid_cols, w):
+        weights[sid] = float(weight)
+
+    # Normalize across all selected ids; invalid ids remain zero.
+    total = sum(weights.values())
+    if total <= 0:
+        base_meta.update({
+            "optimization_status": "fallback_equal_weight",
+            "optimization_message": "All optimized weights are zero after mapping.",
+            "optimization_n_assets": n,
+            "optimization_n_obs": int(len(ret)),
+        })
+        return equal_weights, base_meta
+
+    weights = {sid: float(val / total) for sid, val in weights.items()}
+
+    w_vec = np.array([weights[sid] for sid in valid_cols], dtype=float)
+    opt_return = float(w_vec @ mu)
+    opt_vol = float(np.sqrt(w_vec @ cov @ w_vec))
+    opt_sharpe = float((opt_return - rf) / opt_vol) if opt_vol > 0 else np.nan
+
+    meta = {
+        "weight_method": "max_sharpe",
+        "optimization_status": "success",
+        "optimization_message": str(getattr(res, "message", "")),
+        "optimization_n_assets": n,
+        "optimization_n_obs": int(len(ret)),
+        "optimization_expected_return": opt_return,
+        "optimization_volatility": opt_vol,
+        "optimization_sharpe": opt_sharpe,
+    }
+    return weights, meta
+
+
+def strategy3_get_max_sharpe_weight_map(
+    price_df: pd.DataFrame,
+    stock_ids: list[str],
+    as_of_date: pd.Timestamp,
+    lookback_days: int = 252,
+    min_obs: int = 60,
+    max_weight: float = 1.0,
+    annual_risk_free_rate: float = 0.0,
+) -> tuple[dict[str, float], dict[str, object]]:
+    returns = strategy3_portfolio_return_window(
+        price_df=price_df,
+        stock_ids=stock_ids,
+        as_of_date=as_of_date,
+        lookback_days=lookback_days,
+    )
+    return strategy3_max_sharpe_weights_from_returns(
+        returns=returns,
+        selected_stock_ids=stock_ids,
+        min_obs=min_obs,
+        max_weight=max_weight,
+        annual_risk_free_rate=annual_risk_free_rate,
+    )
+
+
+def strategy3_create_positions(
+    alpha: pd.DataFrame,
+    price_df: pd.DataFrame,
+    top_n: int,
+    use_portfolio_optimization: bool = False,
+    portfolio_optimization_lookback: int = 252,
+    portfolio_optimization_min_obs: int = 60,
+    portfolio_optimization_max_weight: float = 1.0,
+    portfolio_optimization_risk_free_rate: float = 0.0,
+) -> pd.DataFrame:
     alpha = strategy3_normalize_alpha(alpha)
     price_df = strategy3_normalize_price(price_df)
     trading_dates = pd.DatetimeIndex(sorted(price_df["date"].dropna().unique()))
@@ -3364,8 +3703,41 @@ def strategy3_create_positions(alpha: pd.DataFrame, price_df: pd.DataFrame, top_
             continue
 
         n_selected = len(g)
+        stock_ids = g["stock_id"].astype(str).str.zfill(4).tolist()
+        equal_weights = strategy3_equal_weight_map(stock_ids)
+
         g["position_rank"] = np.arange(1, n_selected + 1)
-        g["target_weight"] = 1.0 / n_selected
+        g["target_weight_equal"] = g["stock_id"].map(equal_weights).astype(float)
+        g["target_weight"] = g["target_weight_equal"]
+        g["weight_method"] = "equal_weight"
+        g["optimization_status"] = "not_run"
+        g["optimization_message"] = ""
+        g["optimization_n_assets"] = n_selected
+        g["optimization_n_obs"] = 0
+        g["optimization_expected_return"] = np.nan
+        g["optimization_volatility"] = np.nan
+        g["optimization_sharpe"] = np.nan
+
+        if use_portfolio_optimization:
+            weight_map, opt_meta = strategy3_get_max_sharpe_weight_map(
+                price_df=price_df,
+                stock_ids=stock_ids,
+                as_of_date=pd.Timestamp(fdate),
+                lookback_days=int(portfolio_optimization_lookback),
+                min_obs=int(portfolio_optimization_min_obs),
+                max_weight=float(portfolio_optimization_max_weight),
+                annual_risk_free_rate=float(portfolio_optimization_risk_free_rate),
+            )
+            if weight_map:
+                g["target_weight"] = g["stock_id"].astype(str).str.zfill(4).map(weight_map).fillna(0.0).astype(float)
+                if g["target_weight"].sum() > 0:
+                    g["target_weight"] = g["target_weight"] / g["target_weight"].sum()
+                else:
+                    g["target_weight"] = g["target_weight_equal"]
+
+            for key, value in opt_meta.items():
+                g[key] = value
+
         g["top_n_setting"] = int(top_n)
         g["n_alpha_available"] = int(len(alpha[alpha["formation_date"] == fdate]))
         rows.append(g)
@@ -3389,7 +3761,6 @@ def strategy3_create_positions(alpha: pd.DataFrame, price_df: pd.DataFrame, top_
     )
 
     return positions.sort_values(["formation_date", "position_rank"]).reset_index(drop=True)
-
 
 
 def strategy3_latest_month_holdings(positions: pd.DataFrame) -> pd.DataFrame:
@@ -3417,7 +3788,11 @@ def strategy3_latest_month_holdings(positions: pd.DataFrame) -> pd.DataFrame:
 
     preferred_cols = [
         "formation_date", "holding_start", "holding_end",
-        "position_rank", "stock_id", "stock_name", "target_weight",
+        "position_rank", "stock_id", "stock_name",
+        "target_weight", "target_weight_equal", "weight_method",
+        "optimization_status", "optimization_sharpe",
+        "optimization_expected_return", "optimization_volatility",
+        "optimization_n_assets", "optimization_n_obs",
         "alpha", "alpha_annualized", "pvalue_alpha", "alpha_rank", "rank_in_top150",
         "beta_mkt", "beta_smb", "beta_hml", "beta_rmw", "beta_cma",
         "r2", "adj_r2", "n_obs",
@@ -4095,7 +4470,7 @@ def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, re
             "n_trading_days": n_days,
         }
 
-    strategy_name = f"FF5 Alpha Top {settings.top_n}"
+    strategy_name = f"FF5 Alpha Top {settings.top_n} ({'Max Sharpe' if settings.use_portfolio_optimization else 'Equal Weight'})"
     rows = [_one("portfolio_nav", "daily_return", strategy_name)]
 
     attached_benchmarks: list[tuple[dict[str, str], str]] = []
@@ -4170,7 +4545,8 @@ def strategy3_calc_performance(nav_df: pd.DataFrame, trades_df: pd.DataFrame, re
 
 def strategy3_plot_nav(nav_df: pd.DataFrame, top_n: int, settings: FF5AlphaSettings) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["portfolio_nav"], mode="lines", name=f"FF5 Alpha Top {top_n}"))
+    strategy_label = f"FF5 Alpha Top {top_n} ({'Max Sharpe' if settings.use_portfolio_optimization else 'Equal Weight'})"
+    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["portfolio_nav"], mode="lines", name=strategy_label))
 
     for spec in strategy3_unique_benchmark_specs(settings):
         slug = spec["slug"]
@@ -4189,7 +4565,8 @@ def strategy3_plot_nav(nav_df: pd.DataFrame, top_n: int, settings: FF5AlphaSetti
 
 def strategy3_plot_cum_return(nav_df: pd.DataFrame, top_n: int, settings: FF5AlphaSettings) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["cum_return"], mode="lines", name=f"FF5 Alpha Top {top_n}"))
+    strategy_label = f"FF5 Alpha Top {top_n} ({'Max Sharpe' if settings.use_portfolio_optimization else 'Equal Weight'})"
+    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["cum_return"], mode="lines", name=strategy_label))
 
     for spec in strategy3_unique_benchmark_specs(settings):
         slug = spec["slug"]
@@ -4208,7 +4585,8 @@ def strategy3_plot_cum_return(nav_df: pd.DataFrame, top_n: int, settings: FF5Alp
 
 def strategy3_plot_drawdown(nav_df: pd.DataFrame, top_n: int, settings: FF5AlphaSettings) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["drawdown"], fill="tozeroy", mode="lines", name=f"FF5 Alpha Top {top_n}"))
+    strategy_label = f"FF5 Alpha Top {top_n} ({'Max Sharpe' if settings.use_portfolio_optimization else 'Equal Weight'})"
+    fig.add_trace(go.Scatter(x=nav_df["date"], y=nav_df["drawdown"], fill="tozeroy", mode="lines", name=strategy_label))
 
     for spec in strategy3_unique_benchmark_specs(settings):
         slug = spec["slug"]
@@ -4240,8 +4618,8 @@ def render_strategy3_notes() -> None:
 2. 在每個形成日，根據市值、B/M、獲利能力與資產成長率建構台股五因子：`MKT_RF`、`SMB`、`HML`、`RMW`、`CMA`。
 3. 對股票池內每檔股票使用過去 252 個交易日資料進行 Fama-French 五因子 rolling regression，且至少需要 180 筆有效日資料才估計 alpha。
 4. 每個月取得各股票的 rolling alpha 後，依 alpha 由高到低排序。
-5. 網站端選出 Alpha Top N 股票，並在下一個交易日以收盤價進行月調倉。
-6. 回測時會扣除買賣手續費與賣出交易稅，並可同時與 0050.TW、統一奔騰基金或其他自訂 benchmark 進行績效比較。
+5. 網站端選出 Alpha Top N 股票後，可選擇維持等權重，或使用形成日前歷史報酬做 long-only 最大 Sharpe ratio 投組權重優化。
+6. 交易仍在下一個交易日以收盤價進行調倉，且回測會扣除買賣手續費與賣出交易稅，並可同時與 0050.TW、統一奔騰基金或其他自訂 benchmark 進行績效比較。
 
 #### 2. 五個因子的建構公式
 
@@ -4480,6 +4858,7 @@ def render_strategy3_page() -> None:
             f"目前設定：市值前 **{settings.market_cap_top_n}**，Alpha Top **{settings.top_n}**，"
             f"lookback **{settings.lookback_days}**，min obs **{settings.min_obs}**，"
             f"調倉頻率 **{'每月調倉' if settings.rebalance_frequency == 'monthly' else '雙周調倉'}**，"
+            f"權重方法 **{'Max Sharpe Ratio 投組優化' if settings.use_portfolio_optimization else '等權重'}**，"
             f"初始資金 **{settings.initial_capital:,.0f}**，正式回測期間 **{settings.backtest_start_date.date()} ~ {settings.backtest_end_date.date() if settings.backtest_end_date is not None else '最新'}**，"
             f"Benchmark：**{strategy3_benchmark_label_text(settings)}**。"
         )
@@ -4534,8 +4913,22 @@ def render_strategy3_page() -> None:
                     st.error("alpha 篩選後沒有可用股票，請放寬 alpha 或 p-value 條件。")
                     return
 
-                update_strategy3_progress("產生持股", 97, 100, "產生 Alpha Top N 持股清單...")
-                positions = strategy3_create_positions(alpha_for_positions, price_df, settings.top_n)
+                weight_msg = (
+                    "產生 Alpha Top N 持股清單並執行 Max Sharpe 權重優化..."
+                    if settings.use_portfolio_optimization
+                    else "產生 Alpha Top N 等權持股清單..."
+                )
+                update_strategy3_progress("產生持股", 97, 100, weight_msg)
+                positions = strategy3_create_positions(
+                    alpha_for_positions,
+                    price_df,
+                    settings.top_n,
+                    use_portfolio_optimization=settings.use_portfolio_optimization,
+                    portfolio_optimization_lookback=settings.portfolio_optimization_lookback,
+                    portfolio_optimization_min_obs=settings.portfolio_optimization_min_obs,
+                    portfolio_optimization_max_weight=settings.portfolio_optimization_max_weight,
+                    portfolio_optimization_risk_free_rate=settings.portfolio_optimization_risk_free_rate,
+                )
                 if positions.empty:
                     st.error("沒有成功產生持股清單，請檢查 alpha scores 與 price data。")
                 else:
@@ -4605,6 +4998,22 @@ def render_strategy3_page() -> None:
 
             st.markdown("#### 績效比較表")
             safe_streamlit_dataframe(perf, use_container_width=True, hide_index=True)
+
+            if settings_used.use_portfolio_optimization:
+                latest_weight_view = result.get("latest_positions", strategy3_latest_month_holdings(positions)).copy()
+                weight_cols = [
+                    "formation_date", "holding_start", "position_rank", "stock_id", "stock_name",
+                    "target_weight", "target_weight_equal", "weight_method",
+                    "optimization_status", "optimization_sharpe",
+                    "optimization_expected_return", "optimization_volatility",
+                    "optimization_n_assets", "optimization_n_obs",
+                ]
+                weight_cols = [c for c in weight_cols if c in latest_weight_view.columns]
+                st.markdown("#### 最新一期 Max Sharpe 權重")
+                if len(weight_cols) > 0:
+                    safe_streamlit_dataframe(latest_weight_view[weight_cols], use_container_width=True, hide_index=True)
+                else:
+                    st.info("最新持股資料沒有可顯示的權重欄位。")
 
             excel_bytes = df_to_excel_bytes({
                 "performance": perf,
