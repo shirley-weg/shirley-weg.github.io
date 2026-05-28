@@ -2364,6 +2364,22 @@ def txo_max_drawdown_by_exit_date(d: pd.DataFrame) -> float:
     return float(dd.min()) if len(dd) else np.nan
 
 
+def txo_max_drawdown_pct_by_exit_date(d: pd.DataFrame) -> float:
+    """
+    以累積損益曲線的歷史高點作為分母，計算百分比最大回撤。
+    若累積損益高點尚未大於 0，百分比回撤沒有穩定定義，回傳 NaN。
+    """
+    if d is None or d.empty:
+        return np.nan
+    daily_equity = d.groupby("exit_date")["total_pnl"].sum().sort_index().cumsum()
+    running_max = daily_equity.cummax()
+    valid = running_max > 0
+    if not valid.any():
+        return np.nan
+    dd_pct = (daily_equity.loc[valid] - running_max.loc[valid]) / running_max.loc[valid]
+    return float(dd_pct.min()) if len(dd_pct) else np.nan
+
+
 def txo_prepare_raw(raw: pd.DataFrame) -> pd.DataFrame:
     raw = raw.copy()
     raw = raw.rename(columns={
@@ -2725,7 +2741,7 @@ def txo_plot_equity(trades: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     if len(equity):
         fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines+markers", name="Cumulative P&L"))
-    fig.update_layout(title="TXO Delta Hedge 累積損益", template="plotly_white", height=420, hovermode="x unified")
+    fig.update_layout(title="TXO Delta Hedge 累積損益", template="plotly_white", height=560, hovermode="x unified")
     return fig
 
 
@@ -2734,7 +2750,195 @@ def txo_plot_strategy_pnl(summary: pd.DataFrame) -> go.Figure:
     if summary is not None and not summary.empty:
         fig.add_trace(go.Bar(x=summary["Strategy"], y=summary["Option P&L"], name="Option P&L"))
         fig.add_trace(go.Bar(x=summary["Strategy"], y=summary["Hedge P&L"], name="Hedge P&L"))
-    fig.update_layout(title="Option / Hedge P&L 拆解", template="plotly_white", barmode="group", height=400, hovermode="x unified")
+    fig.update_layout(title="Option / Hedge P&L 拆解", template="plotly_white", barmode="group", height=520, hovermode="x unified")
+    return fig
+
+
+def txo_trade_points_with_s0(df: pd.DataFrame, trades: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
+    """建立 TXO S0 時間序列，並將每筆交易的進場 / 出場日期對應到 S0，用於全期間進出場標註圖。"""
+    if df is None or df.empty:
+        return pd.Series(dtype=float, name="S0"), pd.DataFrame()
+
+    spot = (
+        df.assign(quote_date=pd.to_datetime(df["quote_date"], errors="coerce"))
+          .dropna(subset=["quote_date"])
+          .groupby("quote_date")["S0"]
+          .median()
+          .sort_index()
+    )
+    spot.name = "S0"
+
+    if trades is None or trades.empty or len(spot) == 0:
+        return spot, pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    spot_index = pd.DatetimeIndex(spot.index)
+
+    for trade in trades.itertuples(index=False):
+        entry_date = pd.Timestamp(getattr(trade, "entry_date"))
+        exit_date = pd.Timestamp(getattr(trade, "exit_date"))
+
+        entry_s0 = spot.reindex([entry_date]).iloc[0] if entry_date in spot.index else np.nan
+        exit_s0 = spot.reindex([exit_date]).iloc[0] if exit_date in spot.index else np.nan
+
+        if pd.isna(entry_s0):
+            idx = spot_index.get_indexer([entry_date], method="nearest")[0]
+            entry_s0 = float(spot.iloc[idx]) if idx >= 0 else np.nan
+        if pd.isna(exit_s0):
+            idx = spot_index.get_indexer([exit_date], method="nearest")[0]
+            exit_s0 = float(spot.iloc[idx]) if idx >= 0 else np.nan
+
+        rows.append({
+            "strategy": getattr(trade, "strategy"),
+            "option_type": getattr(trade, "option_type"),
+            "K": float(getattr(trade, "K")),
+            "expiration_date": pd.Timestamp(getattr(trade, "expiration_date")),
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "entry_s0": entry_s0,
+            "exit_s0": exit_s0,
+            "entry_price": float(getattr(trade, "entry_price")),
+            "exit_price": float(getattr(trade, "exit_price")),
+            "entry_resid_z": float(getattr(trade, "entry_resid_z")) if pd.notna(getattr(trade, "entry_resid_z")) else np.nan,
+            "exit_resid_z": float(getattr(trade, "exit_resid_z")) if pd.notna(getattr(trade, "exit_resid_z")) else np.nan,
+            "total_pnl": float(getattr(trade, "total_pnl")),
+            "holding_days": int(getattr(trade, "holding_days")),
+        })
+
+    return spot, pd.DataFrame(rows)
+
+
+def txo_plot_all_entry_exit_points(df: pd.DataFrame, trades: pd.DataFrame) -> go.Figure:
+    spot, points = txo_trade_points_with_s0(df, trades)
+    fig = go.Figure()
+
+    if len(spot):
+        fig.add_trace(go.Scatter(
+            x=spot.index,
+            y=spot.values,
+            mode="lines",
+            name="TXO Spot S0",
+            line=dict(width=2),
+        ))
+
+    if not points.empty:
+        hover_cols = [
+            "strategy", "K", "expiration_date", "entry_price", "exit_price",
+            "total_pnl", "holding_days", "entry_resid_z", "exit_resid_z",
+        ]
+        entry_custom = points[hover_cols].copy()
+        exit_custom = points[hover_cols].copy()
+
+        fig.add_trace(go.Scatter(
+            x=points["entry_date"],
+            y=points["entry_s0"],
+            mode="markers",
+            name="Entry 進場",
+            marker=dict(size=8, symbol="triangle-up", opacity=0.75),
+            customdata=entry_custom,
+            hovertemplate=(
+                "<b>進場</b><br>"
+                "日期=%{x|%Y-%m-%d}<br>"
+                "S0=%{y:,.2f}<br>"
+                "策略=%{customdata[0]}<br>"
+                "K=%{customdata[1]:,.0f}<br>"
+                "到期日=%{customdata[2]|%Y-%m-%d}<br>"
+                "進場價=%{customdata[3]:,.4f}<br>"
+                "Entry z=%{customdata[7]:,.4f}<extra></extra>"
+            ),
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=points["exit_date"],
+            y=points["exit_s0"],
+            mode="markers",
+            name="Exit 出場",
+            marker=dict(size=8, symbol="x", opacity=0.75),
+            customdata=exit_custom,
+            hovertemplate=(
+                "<b>出場</b><br>"
+                "日期=%{x|%Y-%m-%d}<br>"
+                "S0=%{y:,.2f}<br>"
+                "策略=%{customdata[0]}<br>"
+                "K=%{customdata[1]:,.0f}<br>"
+                "到期日=%{customdata[2]|%Y-%m-%d}<br>"
+                "出場價=%{customdata[4]:,.4f}<br>"
+                "Exit z=%{customdata[8]:,.4f}<br>"
+                "Total P&L=%{customdata[5]:,.4f}<br>"
+                "持有天數=%{customdata[6]}<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        title="所有交易進出場點（可縮放查看全期間）",
+        template="plotly_white",
+        height=620,
+        hovermode="closest",
+        xaxis_title="Date",
+        yaxis_title="TXO Spot S0",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(rangeslider_visible=True, rangeselector=dict(
+        buttons=list([
+            dict(count=1, label="1y", step="year", stepmode="backward"),
+            dict(count=3, label="3y", step="year", stepmode="backward"),
+            dict(count=5, label="5y", step="year", stepmode="backward"),
+            dict(step="all", label="All"),
+        ])
+    ))
+    return fig
+
+
+def txo_plot_all_residual_entry_exit(trades: pd.DataFrame, z_th: float) -> go.Figure:
+    fig = go.Figure()
+    if trades is not None and not trades.empty:
+        fig.add_trace(go.Scatter(
+            x=trades["entry_date"],
+            y=trades["entry_resid_z"],
+            mode="markers",
+            name="Entry residual z",
+            marker=dict(size=8, symbol="triangle-up", opacity=0.70),
+            customdata=trades[["strategy", "K", "total_pnl", "holding_days"]],
+            hovertemplate=(
+                "<b>進場 residual z</b><br>"
+                "日期=%{x|%Y-%m-%d}<br>"
+                "z=%{y:,.4f}<br>"
+                "策略=%{customdata[0]}<br>"
+                "K=%{customdata[1]:,.0f}<br>"
+                "Total P&L=%{customdata[2]:,.4f}<br>"
+                "持有天數=%{customdata[3]}<extra></extra>"
+            ),
+        ))
+        fig.add_trace(go.Scatter(
+            x=trades["exit_date"],
+            y=trades["exit_resid_z"],
+            mode="markers",
+            name="Exit residual z",
+            marker=dict(size=8, symbol="x", opacity=0.70),
+            customdata=trades[["strategy", "K", "total_pnl", "holding_days"]],
+            hovertemplate=(
+                "<b>出場 residual z</b><br>"
+                "日期=%{x|%Y-%m-%d}<br>"
+                "z=%{y:,.4f}<br>"
+                "策略=%{customdata[0]}<br>"
+                "K=%{customdata[1]:,.0f}<br>"
+                "Total P&L=%{customdata[2]:,.4f}<br>"
+                "持有天數=%{customdata[3]}<extra></extra>"
+            ),
+        ))
+    fig.add_hline(y=z_th, line_dash="dash", annotation_text=f"+{z_th:.2f}", annotation_position="top left")
+    fig.add_hline(y=-z_th, line_dash="dash", annotation_text=f"-{z_th:.2f}", annotation_position="bottom left")
+    fig.add_hline(y=0, line_dash="dot", annotation_text="0", annotation_position="bottom right")
+    fig.update_layout(
+        title="所有交易 Residual z-score 進出場點",
+        template="plotly_white",
+        height=560,
+        hovermode="closest",
+        xaxis_title="Date",
+        yaxis_title="Residual z-score",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(rangeslider_visible=True)
     return fig
 
 
@@ -2793,24 +2997,19 @@ def txo_show_key_metrics(trades: pd.DataFrame, summary: pd.DataFrame) -> None:
     total_pnl = float(trades["total_pnl"].sum()) if trades is not None and not trades.empty else 0.0
     n_trades = int(len(trades)) if trades is not None else 0
     win_rate = float((trades["total_pnl"] > 0).mean()) if n_trades else np.nan
-    profit_factor = np.nan
-    if n_trades:
-        wins = trades.loc[trades["total_pnl"] > 0, "total_pnl"].sum()
-        losses = trades.loc[trades["total_pnl"] < 0, "total_pnl"].sum()
-        if losses != 0:
-            profit_factor = wins / abs(losses)
     avg_holding = float(trades["holding_days"].mean()) if n_trades else np.nan
+    max_dd_pct = txo_max_drawdown_pct_by_exit_date(trades) if n_trades else np.nan
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Total P&L", f"{total_pnl:,.4f}")
     c2.metric("Trades", f"{n_trades:,}")
     c3.metric("Win Rate", f"{win_rate:.2%}" if pd.notna(win_rate) else "NA")
-    c4.metric("Profit Factor", f"{profit_factor:.2f}" if pd.notna(profit_factor) else "NA")
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Option P&L", f"{float(summary['Option P&L'].sum()):,.4f}" if summary is not None and not summary.empty else "NA")
-    c6.metric("Hedge P&L", f"{float(summary['Hedge P&L'].sum()):,.4f}" if summary is not None and not summary.empty else "NA")
-    c7.metric("Avg Holding Days", f"{avg_holding:.2f}" if pd.notna(avg_holding) else "NA")
-    c8.metric("Max Drawdown", f"{txo_max_drawdown_by_exit_date(trades):,.4f}" if n_trades else "NA")
+
+    c4, c5, c6, c7 = st.columns(4)
+    c4.metric("Option P&L", f"{float(summary['Option P&L'].sum()):,.4f}" if summary is not None and not summary.empty else "NA")
+    c5.metric("Hedge P&L", f"{float(summary['Hedge P&L'].sum()):,.4f}" if summary is not None and not summary.empty else "NA")
+    c6.metric("Avg Holding Days", f"{avg_holding:.2f}" if pd.notna(avg_holding) else "NA")
+    c7.metric("Max Drawdown", f"{max_dd_pct:.2%}" if pd.notna(max_dd_pct) else "NA")
 
 
 def render_txo_method_notes() -> None:
@@ -2818,7 +3017,7 @@ def render_txo_method_notes() -> None:
         """
         ### TXO delta hedge策略流程
 
-        本策略先讀取 TXO 選擇權資料，將每個交易日與到期日下的履約價、價格與 IV 展開成逐履約價資料；接著只保留價平附近 moneyness 區間，使用二次式 OLS 擬合當日 IV curve，並以「真實 IV - 模型 IV」作為 residual。當 residual 高於 `mu + Z_TH * sigma` 時，代表真實 IV 相對模型 IV 偏高，策略建立 Short Call 或 Short Put；當 residual 低於 `mu - Z_TH * sigma` 時，代表真實 IV 相對偏低，策略建立 Long Call 或 Long Put。開倉後每日用模型 IV 計算 Black-Scholes delta，並用現貨部位做 delta hedge；當 residual 回到合理區間、到期，或資料序列結束時平倉。績效輸出保留原本的 Panel A、Panel B、Panel C，並額外提供累積損益、P&L 拆解以及單筆交易的進出場標註圖。
+        本策略先讀取 TXO 選擇權資料，將每個交易日與到期日下的履約價、價格與 IV 展開成逐履約價資料；接著只保留價平附近 moneyness 區間，使用二次式 OLS 擬合當日 IV curve，並以「真實 IV - 模型 IV」作為 residual。當 residual 高於 `mu + Z_TH * sigma` 時，代表真實 IV 相對模型 IV 偏高，策略建立 Short Call 或 Short Put；當 residual 低於 `mu - Z_TH * sigma` 時，代表真實 IV 相對偏低，策略建立 Long Call 或 Long Put。開倉後每日用模型 IV 計算 Black-Scholes delta，並用現貨部位做 delta hedge；當 residual 回到合理區間、到期，或資料序列結束時平倉。績效輸出保留原本的 Panel A、Panel B、Panel C，並額外提供累積損益、P&L 拆解以及所有交易的進出場標註圖。
 
         **主要可調參數：**
         - `Residual band Z 門檻`：控制錯價訊號嚴格程度，原始設定為 `1.96`。
@@ -2865,7 +3064,7 @@ def render_txo_delta_hedge_page() -> None:
             return
 
     result = st.session_state.get("txo_result")
-    tabs = st.tabs(["① 回測結果", "② 交易明細與進出場圖", "③ 原始資料", "④ 方法說明"])
+    tabs = st.tabs(["① 回測結果", "② 交易明細", "③ 方法說明"])
 
     with tabs[0]:
         if not result:
@@ -2873,14 +3072,14 @@ def render_txo_delta_hedge_page() -> None:
         else:
             trades = result["trades"]
             summary = result["summary"]
+            df = result["df"]
             txo_show_key_metrics(trades, summary)
             st.divider()
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.plotly_chart(txo_plot_equity(trades), use_container_width=True)
-            with c2:
-                st.plotly_chart(txo_plot_strategy_pnl(summary), use_container_width=True)
+            st.plotly_chart(txo_plot_equity(trades), use_container_width=True)
+            st.plotly_chart(txo_plot_all_entry_exit_points(df, trades), use_container_width=True)
+            st.plotly_chart(txo_plot_all_residual_entry_exit(trades, result["settings"].z_th), use_container_width=True)
+            st.plotly_chart(txo_plot_strategy_pnl(summary), use_container_width=True)
 
             st.markdown("#### Signal counts")
             safe_streamlit_dataframe(result["signal_counts"], use_container_width=True)
@@ -2899,7 +3098,6 @@ def render_txo_delta_hedge_page() -> None:
             st.info("請先到「回測結果」執行 TXO 回測。")
         else:
             trades = result["trades"]
-            df = result["df"]
             if trades.empty:
                 st.warning("本次參數下沒有產生交易。")
             else:
@@ -2915,35 +3113,7 @@ def render_txo_delta_hedge_page() -> None:
 
                 safe_streamlit_dataframe(filtered.head(settings.table_rows), use_container_width=True, hide_index=True)
 
-                labels = [
-                    f"#{i} | {row.strategy} | K={float(row.K):.0f} | {pd.Timestamp(row.entry_date).date()} -> {pd.Timestamp(row.exit_date).date()} | P&L={float(row.total_pnl):.4f}"
-                    for i, row in filtered.iterrows()
-                ]
-                if labels:
-                    selected_label = st.selectbox("選擇一筆交易查看進出場圖", labels)
-                    selected_i = labels.index(selected_label)
-                    trade = filtered.iloc[selected_i]
-
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.plotly_chart(txo_plot_trade_price_path(df, trade), use_container_width=True)
-                    with c2:
-                        st.plotly_chart(txo_plot_trade_residual_path(df, trade, result["settings"].z_th), use_container_width=True)
-
-                    st.markdown("#### 選取交易細節")
-                    safe_streamlit_dataframe(pd.DataFrame([trade]), use_container_width=True, hide_index=True)
-
     with tabs[2]:
-        if not result:
-            st.info("請先到「回測結果」執行 TXO 回測。")
-        else:
-            st.markdown("#### Trades")
-            safe_streamlit_dataframe(result["trades"].head(settings.table_rows), use_container_width=True, hide_index=True)
-            st.markdown("#### All points with model IV and residual")
-            safe_streamlit_dataframe(result["df"].head(settings.table_rows), use_container_width=True, hide_index=True)
-            st.markdown("#### Full summary")
-            safe_streamlit_dataframe(result["summary"].round(4), use_container_width=True, hide_index=True)
-    with tabs[3]:
         render_txo_method_notes()
 
 
