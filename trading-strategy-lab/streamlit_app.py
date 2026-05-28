@@ -2264,7 +2264,7 @@ def txo_sidebar_settings() -> TXODeltaHedgeSettings:
     st.sidebar.divider()
     st.sidebar.header("成本與契約設定")
     tcost = st.sidebar.number_input("單邊交易成本率", min_value=0.0, max_value=0.1, value=0.001, step=0.0001, format="%.6f")
-    mult = st.sidebar.number_input("契約乘數 / 損益倍數", min_value=0.01, max_value=10000.0, value=50.0, step=1.0, format="%.2f")
+    mult = st.sidebar.number_input("契約乘數（TXO 每點 50 元）", min_value=0.01, max_value=10000.0, value=50.0, step=1.0, format="%.2f")
 
     if moneyness_low >= moneyness_high:
         st.sidebar.error("Moneyness 下界必須小於上界。")
@@ -2602,7 +2602,7 @@ def txo_run_backtest(x: pd.DataFrame, settings: TXODeltaHedgeSettings) -> pd.Dat
 
             if math.isfinite(row.model_IV) and row.model_IV > 0:
                 new_delta = txo_bs_delta(row.S0, row.K, row.r, row.DTE, row.model_IV, row.option_type, settings.iv_div)
-                new_spot_qty = -pos * new_delta * settings.mult
+                new_spot_qty = -pos * new_delta
                 hedge_pnl -= settings.tcost * abs((new_spot_qty - spot_qty) * row.S0) * settings.mult
                 spot_qty = new_spot_qty
 
@@ -2645,7 +2645,7 @@ def txo_run_backtest(x: pd.DataFrame, settings: TXODeltaHedgeSettings) -> pd.Dat
 
             opt_pnl = -settings.tcost * abs(pos * row.price) * settings.mult
             delta = txo_bs_delta(row.S0, row.K, row.r, row.DTE, row.model_IV, row.option_type, settings.iv_div)
-            spot_qty = -pos * delta * settings.mult
+            spot_qty = -pos * delta
             hedge_pnl = -settings.tcost * abs(spot_qty * row.S0) * settings.mult
             prev_S = row.S0
 
@@ -3023,7 +3023,7 @@ def render_txo_method_notes() -> None:
         - `Residual band Z 門檻`：控制錯價訊號嚴格程度，原始設定為 `1.96`。
         - `Moneyness 下界 / 上界`：控制 IV curve 校準與交易訊號採用的價平附近範圍，原始設定為 `0.9` 到 `1.1`。
         - `單邊交易成本率`：同時計入 option 開平倉與 hedge 調整成本，原始設定為 `0.001`。
-        - `契約乘數 / 損益倍數`：用來放大或縮小 option 與 hedge P&L，原始設定為 `1.0`。
+        - `契約乘數（TXO 每點 50 元）`：用來將 TXO 點數損益換算成新臺幣損益，預設為 `50.0`。避險部位數量以 delta 口數計算，不再把契約乘數重複乘進 `spot_qty`。
         """
     )
 
