@@ -2264,7 +2264,7 @@ def txo_sidebar_settings() -> TXODeltaHedgeSettings:
     st.sidebar.divider()
     st.sidebar.header("成本與契約設定")
     tcost = st.sidebar.number_input("單邊交易成本率", min_value=0.0, max_value=0.1, value=0.001, step=0.0001, format="%.6f")
-    mult = st.sidebar.number_input("契約乘數 / 損益倍數", min_value=0.01, max_value=10000.0, value=50, step=1.0, format="%.2f")
+    mult = st.sidebar.number_input("契約乘數 / 損益倍數", min_value=0.01, max_value=10000.0, value=50.0, step=1.0, format="%.2f")
 
     if moneyness_low >= moneyness_high:
         st.sidebar.error("Moneyness 下界必須小於上界。")
