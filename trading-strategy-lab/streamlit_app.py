@@ -2232,15 +2232,13 @@ def render_strategy_page(strategy: StrategyName) -> None:
 @dataclass(frozen=True)
 class TXODeltaHedgeSettings:
     data_path: str
-    out_dir: str
     tcost: float
     z_th: float
     moneyness_low: float
     moneyness_high: float
     mult: float
-    iv_div: float
-    save_outputs: bool
-    table_rows: int
+    iv_div: float = 100.0
+    table_rows: int = 300
 
 
 def txo_sidebar_settings() -> TXODeltaHedgeSettings:
@@ -2257,51 +2255,29 @@ def txo_sidebar_settings() -> TXODeltaHedgeSettings:
         value="data/txo_options_iv.csv",
         help="GitHub 版本建議放在 data/txo_options_iv.csv。欄位需包含交易日期、到期日、DTE、S0、r、履約價、otm_last、otm_iv。",
     )
-    out_dir = st.sidebar.text_input(
-        "輸出資料夾",
-        value="outputs/txo_iv_strategy_output",
-        help="若勾選寫入輸出資料夾，會產生 summary Excel、trades CSV、all points CSV。",
-    )
-    uploaded_file = st.sidebar.file_uploader(
-        "或直接上傳 txo_options_iv.csv",
-        type=["csv"],
-        help="若有上傳檔案，會優先使用上傳檔；沒有上傳才讀取上方路徑。",
-        key="txo_uploaded_file",
-    )
-    if uploaded_file is not None:
-        st.sidebar.success("已選擇上傳檔，執行時會優先使用它。")
 
     st.sidebar.divider()
     st.sidebar.header("IV 校準與錯價參數")
     z_th = st.sidebar.number_input("Residual band Z 門檻", min_value=0.50, max_value=5.00, value=1.96, step=0.01, format="%.2f")
     moneyness_low = st.sidebar.number_input("Moneyness 下界", min_value=0.50, max_value=1.00, value=0.90, step=0.01, format="%.2f")
     moneyness_high = st.sidebar.number_input("Moneyness 上界", min_value=1.00, max_value=1.50, value=1.10, step=0.01, format="%.2f")
-    iv_div = st.sidebar.number_input("IV 除數", min_value=1.0, max_value=1000.0, value=100.0, step=1.0, format="%.1f", help="若 IV 是百分比，例如 18.5%，請維持 100。")
-
     st.sidebar.divider()
     st.sidebar.header("成本與契約設定")
     tcost = st.sidebar.number_input("單邊交易成本率", min_value=0.0, max_value=0.1, value=0.001, step=0.0001, format="%.6f")
     mult = st.sidebar.number_input("契約乘數 / 損益倍數", min_value=0.01, max_value=10000.0, value=1.0, step=1.0, format="%.2f")
-
-    st.sidebar.divider()
-    st.sidebar.header("輸出設定")
-    save_outputs = st.sidebar.checkbox("同時寫入輸出資料夾", value=True)
-    table_rows = st.sidebar.number_input("大型明細表預覽列數", min_value=10, max_value=5000, value=300, step=50)
 
     if moneyness_low >= moneyness_high:
         st.sidebar.error("Moneyness 下界必須小於上界。")
 
     return TXODeltaHedgeSettings(
         data_path=str(data_path).strip(),
-        out_dir=str(out_dir).strip(),
         tcost=float(tcost),
         z_th=float(z_th),
         moneyness_low=float(moneyness_low),
         moneyness_high=float(moneyness_high),
         mult=float(mult),
-        iv_div=float(iv_div),
-        save_outputs=bool(save_outputs),
-        table_rows=int(table_rows),
+        iv_div=100.0,
+        table_rows=300,
     )
 
 
@@ -2354,9 +2330,6 @@ def txo_read_csv_from_path(path_str: str) -> pd.DataFrame:
 
 
 def txo_read_raw(settings: TXODeltaHedgeSettings) -> pd.DataFrame:
-    uploaded_file = st.session_state.get("txo_uploaded_file")
-    if uploaded_file is not None:
-        return pd.read_csv(uploaded_file, encoding="utf-8-sig")
     return txo_read_csv_from_path(settings.data_path)
 
 
@@ -2733,53 +2706,10 @@ def txo_run_pipeline(raw: pd.DataFrame, settings: TXODeltaHedgeSettings) -> dict
         "panel_c": panel_c,
         "settings": settings,
     }
-    if settings.save_outputs:
-        txo_save_outputs(result, settings)
     return result
 
 
-def txo_save_outputs(result: dict[str, object], settings: TXODeltaHedgeSettings) -> dict[str, str]:
-    out_dir = Path(settings.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = Path.cwd() / out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    summary_path = out_dir / "txo_iv_strategy_summary_residual_196sigma.xlsx"
-    trades_path = out_dir / "txo_iv_strategy_trades_residual_196sigma.csv"
-    df_path = out_dir / "txo_iv_strategy_all_points_with_model_iv_residual_196sigma.csv"
-
-    with pd.ExcelWriter(summary_path, engine="openpyxl") as writer:
-        prepare_dataframe_for_output(result["panel_a"]).to_excel(writer, sheet_name="Panel_A", index=False)
-        prepare_dataframe_for_output(result["panel_b"]).to_excel(writer, sheet_name="Panel_B", index=False)
-        prepare_dataframe_for_output(result["panel_c"]).to_excel(writer, sheet_name="Panel_C", index=False)
-        prepare_dataframe_for_output(result["summary"]).to_excel(writer, sheet_name="Full_Summary", index=False)
-        prepare_dataframe_for_output(result["signal_counts"]).to_excel(writer, sheet_name="Signal_Counts", index=True)
-
-    prepare_dataframe_for_output(result["trades"]).to_csv(trades_path, index=False, encoding="utf-8-sig")
-    prepare_dataframe_for_output(result["df"]).to_csv(df_path, index=False, encoding="utf-8-sig")
-
-    result["saved_paths"] = {
-        "summary_path": str(summary_path),
-        "trades_path": str(trades_path),
-        "df_path": str(df_path),
-    }
-    return result["saved_paths"]
-
-
-def txo_excel_bytes(result: dict[str, object]) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        prepare_dataframe_for_output(result["panel_a"]).to_excel(writer, sheet_name="Panel_A", index=False)
-        prepare_dataframe_for_output(result["panel_b"]).to_excel(writer, sheet_name="Panel_B", index=False)
-        prepare_dataframe_for_output(result["panel_c"]).to_excel(writer, sheet_name="Panel_C", index=False)
-        prepare_dataframe_for_output(result["summary"]).to_excel(writer, sheet_name="Full_Summary", index=False)
-        prepare_dataframe_for_output(result["signal_counts"]).to_excel(writer, sheet_name="Signal_Counts", index=True)
-    output.seek(0)
-    return output.getvalue()
-
-
-def txo_csv_bytes(df: pd.DataFrame) -> bytes:
-    return prepare_dataframe_for_output(df).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+# TXO results are displayed on the Streamlit page only; no files are written or exported.
 
 
 def txo_equity_by_exit_date(trades: pd.DataFrame) -> pd.Series:
@@ -2883,27 +2813,6 @@ def txo_show_key_metrics(trades: pd.DataFrame, summary: pd.DataFrame) -> None:
     c8.metric("Max Drawdown", f"{txo_max_drawdown_by_exit_date(trades):,.4f}" if n_trades else "NA")
 
 
-def txo_download_buttons(result: dict[str, object]) -> None:
-    st.download_button(
-        "下載 TXO summary Excel",
-        data=txo_excel_bytes(result),
-        file_name="txo_iv_strategy_summary_residual_196sigma.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.download_button(
-        "下載 TXO trades CSV",
-        data=txo_csv_bytes(result["trades"]),
-        file_name="txo_iv_strategy_trades_residual_196sigma.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        "下載 TXO all points CSV",
-        data=txo_csv_bytes(result["df"]),
-        file_name="txo_iv_strategy_all_points_with_model_iv_residual_196sigma.csv",
-        mime="text/csv",
-    )
-
-
 def render_txo_method_notes() -> None:
     st.markdown(
         """
@@ -2916,7 +2825,6 @@ def render_txo_method_notes() -> None:
         - `Moneyness 下界 / 上界`：控制 IV curve 校準與交易訊號採用的價平附近範圍，原始設定為 `0.9` 到 `1.1`。
         - `單邊交易成本率`：同時計入 option 開平倉與 hedge 調整成本，原始設定為 `0.001`。
         - `契約乘數 / 損益倍數`：用來放大或縮小 option 與 hedge P&L，原始設定為 `1.0`。
-        - `IV 除數`：若 IV 欄位以百分比表示，維持 `100`；若已是小數波動率，則改為 `1`。
         """
     )
 
@@ -2952,15 +2860,12 @@ def render_txo_delta_hedge_page() -> None:
                 result = txo_run_pipeline(raw, settings)
                 st.session_state["txo_result"] = result
             st.success("TXO delta hedge 回測完成。")
-            saved_paths = result.get("saved_paths")
-            if saved_paths:
-                st.info("已輸出：\n" + "\n".join(str(v) for v in saved_paths.values()))
         except Exception as exc:
             st.error(f"TXO 回測失敗：{exc}")
             return
 
     result = st.session_state.get("txo_result")
-    tabs = st.tabs(["① 回測結果", "② 交易明細與進出場圖", "③ 原始輸出資料", "④ 方法說明"])
+    tabs = st.tabs(["① 回測結果", "② 交易明細與進出場圖", "③ 原始資料", "④ 方法說明"])
 
     with tabs[0]:
         if not result:
@@ -2988,9 +2893,6 @@ def render_txo_delta_hedge_page() -> None:
 
             st.markdown("#### Panel C: P&L Decomposition and Holding Period")
             safe_streamlit_dataframe(result["panel_c"].round(4), use_container_width=True, hide_index=True)
-
-            st.markdown("#### 下載輸出")
-            txo_download_buttons(result)
 
     with tabs[1]:
         if not result:
@@ -3041,9 +2943,6 @@ def render_txo_delta_hedge_page() -> None:
             safe_streamlit_dataframe(result["df"].head(settings.table_rows), use_container_width=True, hide_index=True)
             st.markdown("#### Full summary")
             safe_streamlit_dataframe(result["summary"].round(4), use_container_width=True, hide_index=True)
-            st.markdown("#### 下載完整資料")
-            txo_download_buttons(result)
-
     with tabs[3]:
         render_txo_method_notes()
 
