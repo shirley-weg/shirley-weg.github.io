@@ -13,6 +13,7 @@ from io import BytesIO
 from typing import Literal
 import itertools
 import logging
+import math
 import re
 import warnings
 from pathlib import Path
@@ -318,7 +319,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-StrategyName = Literal["distance", "cointegration", "ff5_alpha"]
+StrategyName = Literal["distance", "cointegration", "ff5_alpha", "txo_delta_hedge"]
 
 
 @dataclass(frozen=True)
@@ -1277,6 +1278,7 @@ def render_strategy_selector() -> None:
     st.title("Trading Strategy Lab")
     st.caption("請選擇要使用的交易策略。")
 
+    st.markdown("### 股票 / 現貨型交易策略")
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -1284,8 +1286,7 @@ def render_strategy_selector() -> None:
             """
             <div class="strategy-card">
               <h3>配對策略1(距離法)</h3>
-              <p>
-              </p>
+              <p>以標準化價格距離篩選走勢相近的股票 pair，並用 spread z-score 進行進出場。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1299,8 +1300,7 @@ def render_strategy_selector() -> None:
             """
             <div class="strategy-card">
               <h3>配對策略2(共整合法)</h3>
-              <p>
-              </p>
+              <p>以共整合檢定尋找長期均衡關係較強的股票 pair，再搭配 beta 與產業條件做篩選。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1314,8 +1314,7 @@ def render_strategy_selector() -> None:
             """
             <div class="strategy-card">
               <h3>策略3(台股五因子 月調倉策略)</h3>
-              <p>
-              </p>
+              <p>以 FF5 因子模型估計個股 alpha，定期選出 Alpha Top N 標的並進行投組回測。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1324,6 +1323,28 @@ def render_strategy_selector() -> None:
             st.session_state["selected_strategy"] = "ff5_alpha"
             st.rerun()
 
+    st.divider()
+    st.markdown("### 衍生性商品交易策略")
+    dcol1, dcol2, dcol3 = st.columns(3)
+
+    with dcol1:
+        st.markdown(
+            """
+            <div class="strategy-card">
+              <h3>TXO delta hedge策略</h3>
+              <p>針對台指選擇權進行 IV curve 校準，利用 residual band 偵測高估 / 低估，再每日用 Black-Scholes delta 調整避險部位。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("進入 TXO delta hedge策略", use_container_width=True):
+            st.session_state["selected_strategy"] = "txo_delta_hedge"
+            st.rerun()
+
+    with dcol2:
+        st.empty()
+    with dcol3:
+        st.empty()
 
 def sidebar_settings(strategy: StrategyName) -> AppSettings:
     if st.sidebar.button("返回策略選擇"):
@@ -2200,6 +2221,831 @@ def render_strategy_page(strategy: StrategyName) -> None:
     with tabs[2]:
         render_method_notes(settings)
 
+
+
+
+
+# ============================================================
+# Derivatives Strategy: TXO Delta Hedge / IV Mispricing
+# ============================================================
+
+@dataclass(frozen=True)
+class TXODeltaHedgeSettings:
+    data_path: str
+    out_dir: str
+    tcost: float
+    z_th: float
+    moneyness_low: float
+    moneyness_high: float
+    mult: float
+    iv_div: float
+    save_outputs: bool
+    table_rows: int
+
+
+def txo_sidebar_settings() -> TXODeltaHedgeSettings:
+    if st.sidebar.button("返回策略選擇"):
+        st.session_state["selected_strategy"] = None
+        st.rerun()
+
+    st.sidebar.caption("目前策略：TXO delta hedge策略")
+    st.sidebar.divider()
+
+    st.sidebar.header("資料檔案")
+    data_path = st.sidebar.text_input(
+        "TXO CSV 路徑",
+        value="data/txo_options_iv.csv",
+        help="GitHub 版本建議放在 data/txo_options_iv.csv。欄位需包含交易日期、到期日、DTE、S0、r、履約價、otm_last、otm_iv。",
+    )
+    out_dir = st.sidebar.text_input(
+        "輸出資料夾",
+        value="outputs/txo_iv_strategy_output",
+        help="若勾選寫入輸出資料夾，會產生 summary Excel、trades CSV、all points CSV。",
+    )
+    uploaded_file = st.sidebar.file_uploader(
+        "或直接上傳 txo_options_iv.csv",
+        type=["csv"],
+        help="若有上傳檔案，會優先使用上傳檔；沒有上傳才讀取上方路徑。",
+        key="txo_uploaded_file",
+    )
+    if uploaded_file is not None:
+        st.sidebar.success("已選擇上傳檔，執行時會優先使用它。")
+
+    st.sidebar.divider()
+    st.sidebar.header("IV 校準與錯價參數")
+    z_th = st.sidebar.number_input("Residual band Z 門檻", min_value=0.50, max_value=5.00, value=1.96, step=0.01, format="%.2f")
+    moneyness_low = st.sidebar.number_input("Moneyness 下界", min_value=0.50, max_value=1.00, value=0.90, step=0.01, format="%.2f")
+    moneyness_high = st.sidebar.number_input("Moneyness 上界", min_value=1.00, max_value=1.50, value=1.10, step=0.01, format="%.2f")
+    iv_div = st.sidebar.number_input("IV 除數", min_value=1.0, max_value=1000.0, value=100.0, step=1.0, format="%.1f", help="若 IV 是百分比，例如 18.5%，請維持 100。")
+
+    st.sidebar.divider()
+    st.sidebar.header("成本與契約設定")
+    tcost = st.sidebar.number_input("單邊交易成本率", min_value=0.0, max_value=0.1, value=0.001, step=0.0001, format="%.6f")
+    mult = st.sidebar.number_input("契約乘數 / 損益倍數", min_value=0.01, max_value=10000.0, value=1.0, step=1.0, format="%.2f")
+
+    st.sidebar.divider()
+    st.sidebar.header("輸出設定")
+    save_outputs = st.sidebar.checkbox("同時寫入輸出資料夾", value=True)
+    table_rows = st.sidebar.number_input("大型明細表預覽列數", min_value=10, max_value=5000, value=300, step=50)
+
+    if moneyness_low >= moneyness_high:
+        st.sidebar.error("Moneyness 下界必須小於上界。")
+
+    return TXODeltaHedgeSettings(
+        data_path=str(data_path).strip(),
+        out_dir=str(out_dir).strip(),
+        tcost=float(tcost),
+        z_th=float(z_th),
+        moneyness_low=float(moneyness_low),
+        moneyness_high=float(moneyness_high),
+        mult=float(mult),
+        iv_div=float(iv_div),
+        save_outputs=bool(save_outputs),
+        table_rows=int(table_rows),
+    )
+
+
+def txo_resolve_path(path_str: str) -> Path:
+    raw = str(path_str).strip().strip('"').strip("'")
+    if not raw:
+        raise FileNotFoundError("TXO CSV 路徑是空的。")
+
+    p = Path(raw)
+    if p.is_absolute():
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"找不到 TXO CSV：{p}")
+
+    app_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd().resolve()
+    candidates = [
+        app_dir / p,
+        cwd / p,
+        app_dir.parent / p,
+        cwd / "trading-strategy-lab" / p,
+        app_dir / "data" / p.name,
+        cwd / "data" / p.name,
+        app_dir / "data" / "txo" / p.name,
+        cwd / "data" / "txo" / p.name,
+        app_dir / "option data" / p.name,
+        cwd / "option data" / p.name,
+    ]
+
+    seen: set[Path] = set()
+    unique_candidates: list[Path] = []
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate not in seen:
+            unique_candidates.append(candidate)
+            seen.add(candidate)
+
+    for candidate in unique_candidates:
+        if candidate.exists():
+            return candidate
+
+    checked = "\n".join(str(c) for c in unique_candidates)
+    raise FileNotFoundError(f"找不到 TXO CSV：{path_str}\n已嘗試以下位置：\n{checked}")
+
+
+@st.cache_data(show_spinner=False)
+def txo_read_csv_from_path(path_str: str) -> pd.DataFrame:
+    path = txo_resolve_path(path_str)
+    return pd.read_csv(path, encoding="utf-8-sig")
+
+
+def txo_read_raw(settings: TXODeltaHedgeSettings) -> pd.DataFrame:
+    uploaded_file = st.session_state.get("txo_uploaded_file")
+    if uploaded_file is not None:
+        return pd.read_csv(uploaded_file, encoding="utf-8-sig")
+    return txo_read_csv_from_path(settings.data_path)
+
+
+def txo_to_arr(x: object) -> np.ndarray:
+    """
+    將 TXO CSV 裡的 array-like 字串轉成 numpy array。
+    例如 '[4900.0, 5000.0, 5100.0]' -> np.array([4900, 5000, 5100])。
+    """
+    if isinstance(x, np.ndarray):
+        return x.astype(float)
+    if isinstance(x, (list, tuple)):
+        return np.asarray(x, dtype=float)
+    return np.fromstring(str(x).strip().strip("[]"), sep=",")
+
+
+def txo_n_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(float(z) / math.sqrt(2.0)))
+
+
+def txo_bs_delta(S: float, K: float, r: float, DTE: float, iv_pct: float, option_type: str, iv_div: float) -> float:
+    """用校準出的理論 IV 計算 Black-Scholes delta。"""
+    T = max(float(DTE) / 365.0, 1e-8)
+    sig = max(float(iv_pct) / float(iv_div), 1e-8)
+    d1 = (math.log(float(S) / float(K)) + (float(r) + 0.5 * sig * sig) * T) / (sig * math.sqrt(T))
+    cdf = txo_n_cdf(d1)
+    return cdf if option_type == "call" else cdf - 1.0
+
+
+def txo_max_drawdown_by_exit_date(d: pd.DataFrame) -> float:
+    daily_equity = d.groupby("exit_date")["total_pnl"].sum().sort_index().cumsum()
+    dd = daily_equity - daily_equity.cummax()
+    return float(dd.min()) if len(dd) else np.nan
+
+
+def txo_prepare_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    raw = raw.copy()
+    raw = raw.rename(columns={
+        "交易日期": "quote_date",
+        "到期日": "expiration_date",
+        "履約價": "K",
+        "otm_last": "price",
+        "otm_iv": "IV",
+    })
+    required = ["quote_date", "expiration_date", "DTE", "S0", "r", "K", "price", "IV"]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        raise ValueError(f"TXO CSV 缺少必要欄位：{missing}")
+
+    raw["quote_date"] = pd.to_datetime(raw["quote_date"], errors="coerce")
+    raw["expiration_date"] = pd.to_datetime(raw["expiration_date"], errors="coerce")
+    raw = raw.dropna(subset=["quote_date", "expiration_date"]).copy()
+    return raw[required].copy()
+
+
+def txo_build_iv_points(raw: pd.DataFrame, settings: TXODeltaHedgeSettings) -> tuple[pd.DataFrame, pd.Series]:
+    raw = txo_prepare_raw(raw)
+    dfs: list[pd.DataFrame] = []
+
+    for row in raw.itertuples(index=False):
+        K = txo_to_arr(row.K)
+        price = txo_to_arr(row.price)
+        iv = txo_to_arr(row.IV)
+
+        n = min(len(K), len(price), len(iv))
+        if n == 0:
+            continue
+
+        K = K[:n]
+        price = price[:n]
+        iv = iv[:n]
+
+        keep = np.isfinite(K) & np.isfinite(price) & (price > 0)
+        K = K[keep]
+        price = price[keep]
+        iv = iv[keep]
+        if len(K) == 0:
+            continue
+
+        S0 = float(row.S0)
+        in_moneyness = (K >= S0 * settings.moneyness_low) & (K <= S0 * settings.moneyness_high)
+
+        valid_iv = np.isfinite(iv) & (iv > 0)
+        fit_valid = valid_iv & in_moneyness
+
+        model_iv = np.full(len(K), np.nan)
+        iv_resid = np.full(len(K), np.nan)
+        resid_mu = np.full(len(K), np.nan)
+        resid_sig = np.full(len(K), np.nan)
+        resid_lb = np.full(len(K), np.nan)
+        resid_ub = np.full(len(K), np.nan)
+        resid_z = np.full(len(K), np.nan)
+
+        if fit_valid.sum() >= 3:
+            A_fit = np.c_[np.ones(fit_valid.sum()), K[fit_valid], K[fit_valid] ** 2]
+            coef = np.linalg.lstsq(A_fit, iv[fit_valid], rcond=None)[0]
+            A_all = np.c_[np.ones(len(K)), K, K ** 2]
+            model_iv = A_all @ coef
+            model_iv = np.where(model_iv > 0, model_iv, np.nan)
+
+            iv_resid = iv - model_iv
+            fit_resid = iv_resid[fit_valid]
+            fit_resid = fit_resid[np.isfinite(fit_resid)]
+
+            if len(fit_resid) >= 3:
+                mu = np.mean(fit_resid)
+                sig = np.std(fit_resid, ddof=0)
+                if np.isfinite(sig) and sig > 0:
+                    lb = mu - settings.z_th * sig
+                    ub = mu + settings.z_th * sig
+                    resid_mu[:] = mu
+                    resid_sig[:] = sig
+                    resid_lb[:] = lb
+                    resid_ub[:] = ub
+                    resid_z = (iv_resid - mu) / sig
+
+        option_type = np.where(K <= S0, "put", "call")
+
+        tmp = pd.DataFrame({
+            "quote_date": row.quote_date,
+            "expiration_date": row.expiration_date,
+            "S0": float(row.S0),
+            "r": float(row.r),
+            "DTE": float(row.DTE),
+            "K": K,
+            "price": price,
+            "IV": iv,
+            "model_IV": model_iv,
+            "iv_resid": iv_resid,
+            "resid_mu": resid_mu,
+            "resid_sig": resid_sig,
+            "resid_lb": resid_lb,
+            "resid_ub": resid_ub,
+            "resid_z": resid_z,
+            "in_moneyness": in_moneyness,
+            "option_type": option_type,
+        })
+        dfs.append(tmp)
+
+    if not dfs:
+        empty = pd.DataFrame(columns=[
+            "quote_date", "expiration_date", "S0", "r", "DTE", "K", "price", "IV", "model_IV",
+            "iv_resid", "resid_mu", "resid_sig", "resid_lb", "resid_ub", "resid_z",
+            "in_moneyness", "option_type", "overpriced", "underpriced", "entry_strategy",
+        ])
+        return empty, pd.Series(dtype=int, name="count")
+
+    df = pd.concat(dfs, ignore_index=True)
+    df["overpriced"] = (
+        df["in_moneyness"]
+        & np.isfinite(df["iv_resid"])
+        & np.isfinite(df["resid_ub"])
+        & (df["iv_resid"] > df["resid_ub"])
+    )
+    df["underpriced"] = (
+        df["in_moneyness"]
+        & np.isfinite(df["iv_resid"])
+        & np.isfinite(df["resid_lb"])
+        & (df["iv_resid"] < df["resid_lb"])
+    )
+    df["entry_strategy"] = pd.Series(pd.NA, index=df.index, dtype="string")
+    df.loc[df["overpriced"] & (df["option_type"] == "call"), "entry_strategy"] = "Short Call"
+    df.loc[df["overpriced"] & (df["option_type"] == "put"), "entry_strategy"] = "Short Put"
+    df.loc[df["underpriced"] & (df["option_type"] == "call"), "entry_strategy"] = "Long Call"
+    df.loc[df["underpriced"] & (df["option_type"] == "put"), "entry_strategy"] = "Long Put"
+
+    signal_counts = df["entry_strategy"].value_counts()
+    return df, signal_counts
+
+
+def txo_run_backtest(x: pd.DataFrame, settings: TXODeltaHedgeSettings) -> pd.DataFrame:
+    keys = ["expiration_date", "K", "option_type"]
+    x = x.sort_values(keys + ["quote_date"]).reset_index(drop=True)
+    if x.empty:
+        return pd.DataFrame(columns=[
+            "strategy", "option_type", "K", "expiration_date", "entry_date", "exit_date", "holding_days",
+            "entry_price", "exit_price", "entry_IV", "exit_IV", "entry_model_IV", "exit_model_IV",
+            "entry_resid", "exit_resid", "entry_resid_z", "exit_resid_z", "entry_resid_lb", "exit_resid_lb",
+            "entry_resid_ub", "exit_resid_ub", "option_pnl", "hedge_pnl", "total_pnl", "exit_reason",
+        ])
+
+    x["has_next"] = x.duplicated(keys, keep="last")
+
+    trades: list[tuple] = []
+    open_pos = False
+    cur_key = None
+    last = None
+
+    def close_trade(row, forced: bool = False):
+        nonlocal open_pos, pos, spot_qty, opt_pnl, hedge_pnl
+
+        price = row.price
+        S = row.S0
+        date = row.quote_date
+
+        opt_pnl += pos * (price - entry_price) * settings.mult
+        opt_pnl -= settings.tcost * abs(pos * price) * settings.mult
+        hedge_pnl -= settings.tcost * abs(spot_qty * S) * settings.mult
+
+        trades.append((
+            strategy,
+            opt_type_open,
+            K_open,
+            exp_open,
+            entry_date,
+            date,
+            (date - entry_date).days,
+            entry_price,
+            price,
+            entry_iv,
+            row.IV,
+            entry_model_iv,
+            row.model_IV,
+            entry_resid,
+            row.iv_resid,
+            entry_resid_z,
+            row.resid_z,
+            entry_resid_lb,
+            row.resid_lb,
+            entry_resid_ub,
+            row.resid_ub,
+            opt_pnl,
+            hedge_pnl,
+            opt_pnl + hedge_pnl,
+            "forced" if forced else "residual_band_or_expiry",
+        ))
+        open_pos = False
+
+    for row in x.itertuples(index=False):
+        key = (row.expiration_date, row.K, row.option_type)
+        if cur_key is None:
+            cur_key = key
+
+        if key != cur_key:
+            if open_pos and last is not None:
+                close_trade(last, forced=True)
+            open_pos = False
+            cur_key = key
+
+        if open_pos:
+            hedge_pnl += spot_qty * (row.S0 - prev_S) * settings.mult
+            prev_S = row.S0
+
+            in_residual_band = (
+                math.isfinite(row.iv_resid)
+                and math.isfinite(row.resid_lb)
+                and math.isfinite(row.resid_ub)
+                and (row.resid_lb <= row.iv_resid <= row.resid_ub)
+            )
+
+            if row.DTE <= 0 or in_residual_band:
+                close_trade(row, forced=False)
+                last = row
+                continue
+
+            if math.isfinite(row.model_IV) and row.model_IV > 0:
+                new_delta = txo_bs_delta(row.S0, row.K, row.r, row.DTE, row.model_IV, row.option_type, settings.iv_div)
+                new_spot_qty = -pos * new_delta * settings.mult
+                hedge_pnl -= settings.tcost * abs((new_spot_qty - spot_qty) * row.S0) * settings.mult
+                spot_qty = new_spot_qty
+
+        can_open = (
+            (not open_pos)
+            and bool(row.has_next)
+            and row.DTE > 0
+            and bool(row.in_moneyness)
+            and math.isfinite(row.IV)
+            and math.isfinite(row.model_IV)
+            and row.model_IV > 0
+            and math.isfinite(row.iv_resid)
+            and math.isfinite(row.resid_lb)
+            and math.isfinite(row.resid_ub)
+        )
+
+        if can_open:
+            if row.iv_resid > row.resid_ub:
+                pos = -1
+                strategy = "Short " + row.option_type.capitalize()
+            elif row.iv_resid < row.resid_lb:
+                pos = 1
+                strategy = "Long " + row.option_type.capitalize()
+            else:
+                last = row
+                continue
+
+            open_pos = True
+            exp_open = row.expiration_date
+            K_open = row.K
+            opt_type_open = row.option_type
+            entry_date = row.quote_date
+            entry_price = row.price
+            entry_iv = row.IV
+            entry_model_iv = row.model_IV
+            entry_resid = row.iv_resid
+            entry_resid_z = row.resid_z
+            entry_resid_lb = row.resid_lb
+            entry_resid_ub = row.resid_ub
+
+            opt_pnl = -settings.tcost * abs(pos * row.price) * settings.mult
+            delta = txo_bs_delta(row.S0, row.K, row.r, row.DTE, row.model_IV, row.option_type, settings.iv_div)
+            spot_qty = -pos * delta * settings.mult
+            hedge_pnl = -settings.tcost * abs(spot_qty * row.S0) * settings.mult
+            prev_S = row.S0
+
+        last = row
+
+    if open_pos and last is not None:
+        close_trade(last, forced=True)
+
+    cols = [
+        "strategy", "option_type", "K", "expiration_date", "entry_date", "exit_date", "holding_days",
+        "entry_price", "exit_price", "entry_IV", "exit_IV", "entry_model_IV", "exit_model_IV",
+        "entry_resid", "exit_resid", "entry_resid_z", "exit_resid_z", "entry_resid_lb", "exit_resid_lb",
+        "entry_resid_ub", "exit_resid_ub", "option_pnl", "hedge_pnl", "total_pnl", "exit_reason",
+    ]
+    trades_df = pd.DataFrame(trades, columns=cols)
+    for c in ["expiration_date", "entry_date", "exit_date"]:
+        if c in trades_df.columns:
+            trades_df[c] = pd.to_datetime(trades_df[c], errors="coerce")
+    return trades_df
+
+
+def txo_make_summary(trades: pd.DataFrame, signal_counts: pd.Series) -> pd.DataFrame:
+    order = ["Short Call", "Long Call", "Short Put", "Long Put"]
+    rows: list[dict[str, object]] = []
+
+    for s in order:
+        d = trades[trades["strategy"] == s].sort_values("exit_date") if len(trades) else pd.DataFrame(columns=trades.columns)
+        pnl = d["total_pnl"] if "total_pnl" in d else pd.Series(dtype=float)
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+        std = pnl.std(ddof=1) if len(d) > 1 else np.nan
+
+        rows.append({
+            "Strategy": s,
+            "Signals": int(signal_counts.get(s, 0)),
+            "Trades": len(d),
+            "Win Rate (%)": 100 * wins.size / len(d) if len(d) else np.nan,
+            "Total P&L": pnl.sum() if len(d) else np.nan,
+            "Mean Return": pnl.mean() if len(d) else np.nan,
+            "Std. Dev.": std,
+            "Sharpe Ratio": pnl.mean() / std * np.sqrt(252) if len(d) > 1 and pd.notna(std) and std != 0 else np.nan,
+            "Avg Win": wins.mean() if wins.size else np.nan,
+            "Avg Loss": losses.mean() if losses.size else np.nan,
+            "Win/Loss Ratio": abs(wins.mean() / losses.mean()) if wins.size and losses.size else np.nan,
+            "Profit Factor": wins.sum() / abs(losses.sum()) if wins.size and losses.size and losses.sum() != 0 else np.nan,
+            "Max Drawdown": txo_max_drawdown_by_exit_date(d) if len(d) else np.nan,
+            "Option P&L": d["option_pnl"].sum() if len(d) else np.nan,
+            "Hedge P&L": d["hedge_pnl"].sum() if len(d) else np.nan,
+            "Avg Holding Days": d["holding_days"].mean() if len(d) else np.nan,
+            "Avg Trade P&L": pnl.mean() if len(d) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def txo_output_panels(summary: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    panel_a = summary[["Strategy", "Signals", "Trades", "Win Rate (%)", "Total P&L", "Mean Return", "Std. Dev.", "Sharpe Ratio"]]
+    panel_b = summary[["Strategy", "Avg Win", "Avg Loss", "Win/Loss Ratio", "Profit Factor", "Max Drawdown"]]
+    panel_c = summary[["Strategy", "Option P&L", "Hedge P&L", "Avg Holding Days", "Avg Trade P&L"]]
+    return panel_a, panel_b, panel_c
+
+
+def txo_run_pipeline(raw: pd.DataFrame, settings: TXODeltaHedgeSettings) -> dict[str, object]:
+    df, signal_counts = txo_build_iv_points(raw, settings)
+    trades = txo_run_backtest(df, settings)
+    summary = txo_make_summary(trades, signal_counts)
+    panel_a, panel_b, panel_c = txo_output_panels(summary)
+    result = {
+        "df": df,
+        "trades": trades,
+        "signal_counts": signal_counts,
+        "summary": summary,
+        "panel_a": panel_a,
+        "panel_b": panel_b,
+        "panel_c": panel_c,
+        "settings": settings,
+    }
+    if settings.save_outputs:
+        txo_save_outputs(result, settings)
+    return result
+
+
+def txo_save_outputs(result: dict[str, object], settings: TXODeltaHedgeSettings) -> dict[str, str]:
+    out_dir = Path(settings.out_dir)
+    if not out_dir.is_absolute():
+        out_dir = Path.cwd() / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_path = out_dir / "txo_iv_strategy_summary_residual_196sigma.xlsx"
+    trades_path = out_dir / "txo_iv_strategy_trades_residual_196sigma.csv"
+    df_path = out_dir / "txo_iv_strategy_all_points_with_model_iv_residual_196sigma.csv"
+
+    with pd.ExcelWriter(summary_path, engine="openpyxl") as writer:
+        prepare_dataframe_for_output(result["panel_a"]).to_excel(writer, sheet_name="Panel_A", index=False)
+        prepare_dataframe_for_output(result["panel_b"]).to_excel(writer, sheet_name="Panel_B", index=False)
+        prepare_dataframe_for_output(result["panel_c"]).to_excel(writer, sheet_name="Panel_C", index=False)
+        prepare_dataframe_for_output(result["summary"]).to_excel(writer, sheet_name="Full_Summary", index=False)
+        prepare_dataframe_for_output(result["signal_counts"]).to_excel(writer, sheet_name="Signal_Counts", index=True)
+
+    prepare_dataframe_for_output(result["trades"]).to_csv(trades_path, index=False, encoding="utf-8-sig")
+    prepare_dataframe_for_output(result["df"]).to_csv(df_path, index=False, encoding="utf-8-sig")
+
+    result["saved_paths"] = {
+        "summary_path": str(summary_path),
+        "trades_path": str(trades_path),
+        "df_path": str(df_path),
+    }
+    return result["saved_paths"]
+
+
+def txo_excel_bytes(result: dict[str, object]) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        prepare_dataframe_for_output(result["panel_a"]).to_excel(writer, sheet_name="Panel_A", index=False)
+        prepare_dataframe_for_output(result["panel_b"]).to_excel(writer, sheet_name="Panel_B", index=False)
+        prepare_dataframe_for_output(result["panel_c"]).to_excel(writer, sheet_name="Panel_C", index=False)
+        prepare_dataframe_for_output(result["summary"]).to_excel(writer, sheet_name="Full_Summary", index=False)
+        prepare_dataframe_for_output(result["signal_counts"]).to_excel(writer, sheet_name="Signal_Counts", index=True)
+    output.seek(0)
+    return output.getvalue()
+
+
+def txo_csv_bytes(df: pd.DataFrame) -> bytes:
+    return prepare_dataframe_for_output(df).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
+def txo_equity_by_exit_date(trades: pd.DataFrame) -> pd.Series:
+    if trades is None or trades.empty:
+        return pd.Series(dtype=float, name="equity")
+    equity = trades.groupby("exit_date")["total_pnl"].sum().sort_index().cumsum()
+    equity.name = "Cumulative P&L"
+    return equity
+
+
+def txo_plot_equity(trades: pd.DataFrame) -> go.Figure:
+    equity = txo_equity_by_exit_date(trades)
+    fig = go.Figure()
+    if len(equity):
+        fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines+markers", name="Cumulative P&L"))
+    fig.update_layout(title="TXO Delta Hedge 累積損益", template="plotly_white", height=420, hovermode="x unified")
+    return fig
+
+
+def txo_plot_strategy_pnl(summary: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if summary is not None and not summary.empty:
+        fig.add_trace(go.Bar(x=summary["Strategy"], y=summary["Option P&L"], name="Option P&L"))
+        fig.add_trace(go.Bar(x=summary["Strategy"], y=summary["Hedge P&L"], name="Hedge P&L"))
+    fig.update_layout(title="Option / Hedge P&L 拆解", template="plotly_white", barmode="group", height=400, hovermode="x unified")
+    return fig
+
+
+def txo_match_trade_path(df: pd.DataFrame, trade: pd.Series) -> pd.DataFrame:
+    if df is None or df.empty or trade is None:
+        return pd.DataFrame()
+    k = float(trade["K"])
+    exp = pd.Timestamp(trade["expiration_date"])
+    opt_type = str(trade["option_type"])
+    entry = pd.Timestamp(trade["entry_date"])
+    exit_ = pd.Timestamp(trade["exit_date"])
+    mask = (
+        np.isclose(df["K"].astype(float), k)
+        & (pd.to_datetime(df["expiration_date"]) == exp)
+        & (df["option_type"].astype(str) == opt_type)
+        & (pd.to_datetime(df["quote_date"]) >= entry)
+        & (pd.to_datetime(df["quote_date"]) <= exit_)
+    )
+    return df.loc[mask].sort_values("quote_date").copy()
+
+
+def txo_plot_trade_price_path(df: pd.DataFrame, trade: pd.Series) -> go.Figure:
+    path = txo_match_trade_path(df, trade)
+    fig = go.Figure()
+    if len(path):
+        fig.add_trace(go.Scatter(x=path["quote_date"], y=path["price"], mode="lines+markers", name="Option Price"))
+    entry_date = pd.Timestamp(trade["entry_date"])
+    exit_date = pd.Timestamp(trade["exit_date"])
+    fig.add_trace(go.Scatter(x=[entry_date], y=[trade["entry_price"]], mode="markers+text", name="Entry", text=["進場"], textposition="top center", marker=dict(size=12, symbol="triangle-up")))
+    fig.add_trace(go.Scatter(x=[exit_date], y=[trade["exit_price"]], mode="markers+text", name="Exit", text=["出場"], textposition="bottom center", marker=dict(size=12, symbol="x")))
+    fig.update_layout(
+        title=f"進出場標註：{trade['strategy']} | K={float(trade['K']):.0f} | Exp={pd.Timestamp(trade['expiration_date']).date()}",
+        template="plotly_white",
+        height=430,
+        hovermode="x unified",
+        yaxis_title="Option Price",
+    )
+    return fig
+
+
+def txo_plot_trade_residual_path(df: pd.DataFrame, trade: pd.Series, z_th: float) -> go.Figure:
+    path = txo_match_trade_path(df, trade)
+    fig = go.Figure()
+    if len(path):
+        fig.add_trace(go.Scatter(x=path["quote_date"], y=path["resid_z"], mode="lines+markers", name="Residual z"))
+    fig.add_hline(y=z_th, line_dash="dash", annotation_text=f"+{z_th:.2f}", annotation_position="top left")
+    fig.add_hline(y=-z_th, line_dash="dash", annotation_text=f"-{z_th:.2f}", annotation_position="bottom left")
+    fig.add_hline(y=0, line_dash="dot", annotation_text="0", annotation_position="bottom right")
+    fig.add_trace(go.Scatter(x=[pd.Timestamp(trade["entry_date"])], y=[trade["entry_resid_z"]], mode="markers+text", name="Entry z", text=["進場"], textposition="top center", marker=dict(size=12, symbol="triangle-up")))
+    fig.add_trace(go.Scatter(x=[pd.Timestamp(trade["exit_date"])], y=[trade["exit_resid_z"]], mode="markers+text", name="Exit z", text=["出場"], textposition="bottom center", marker=dict(size=12, symbol="x")))
+    fig.update_layout(title="Residual z-score 與進出場點", template="plotly_white", height=430, hovermode="x unified", yaxis_title="Residual z-score")
+    return fig
+
+
+def txo_show_key_metrics(trades: pd.DataFrame, summary: pd.DataFrame) -> None:
+    total_pnl = float(trades["total_pnl"].sum()) if trades is not None and not trades.empty else 0.0
+    n_trades = int(len(trades)) if trades is not None else 0
+    win_rate = float((trades["total_pnl"] > 0).mean()) if n_trades else np.nan
+    profit_factor = np.nan
+    if n_trades:
+        wins = trades.loc[trades["total_pnl"] > 0, "total_pnl"].sum()
+        losses = trades.loc[trades["total_pnl"] < 0, "total_pnl"].sum()
+        if losses != 0:
+            profit_factor = wins / abs(losses)
+    avg_holding = float(trades["holding_days"].mean()) if n_trades else np.nan
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total P&L", f"{total_pnl:,.4f}")
+    c2.metric("Trades", f"{n_trades:,}")
+    c3.metric("Win Rate", f"{win_rate:.2%}" if pd.notna(win_rate) else "NA")
+    c4.metric("Profit Factor", f"{profit_factor:.2f}" if pd.notna(profit_factor) else "NA")
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Option P&L", f"{float(summary['Option P&L'].sum()):,.4f}" if summary is not None and not summary.empty else "NA")
+    c6.metric("Hedge P&L", f"{float(summary['Hedge P&L'].sum()):,.4f}" if summary is not None and not summary.empty else "NA")
+    c7.metric("Avg Holding Days", f"{avg_holding:.2f}" if pd.notna(avg_holding) else "NA")
+    c8.metric("Max Drawdown", f"{txo_max_drawdown_by_exit_date(trades):,.4f}" if n_trades else "NA")
+
+
+def txo_download_buttons(result: dict[str, object]) -> None:
+    st.download_button(
+        "下載 TXO summary Excel",
+        data=txo_excel_bytes(result),
+        file_name="txo_iv_strategy_summary_residual_196sigma.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.download_button(
+        "下載 TXO trades CSV",
+        data=txo_csv_bytes(result["trades"]),
+        file_name="txo_iv_strategy_trades_residual_196sigma.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "下載 TXO all points CSV",
+        data=txo_csv_bytes(result["df"]),
+        file_name="txo_iv_strategy_all_points_with_model_iv_residual_196sigma.csv",
+        mime="text/csv",
+    )
+
+
+def render_txo_method_notes() -> None:
+    st.markdown(
+        """
+        ### TXO delta hedge策略流程
+
+        本策略先讀取 TXO 選擇權資料，將每個交易日與到期日下的履約價、價格與 IV 展開成逐履約價資料；接著只保留價平附近 moneyness 區間，使用二次式 OLS 擬合當日 IV curve，並以「真實 IV - 模型 IV」作為 residual。當 residual 高於 `mu + Z_TH * sigma` 時，代表真實 IV 相對模型 IV 偏高，策略建立 Short Call 或 Short Put；當 residual 低於 `mu - Z_TH * sigma` 時，代表真實 IV 相對偏低，策略建立 Long Call 或 Long Put。開倉後每日用模型 IV 計算 Black-Scholes delta，並用現貨部位做 delta hedge；當 residual 回到合理區間、到期，或資料序列結束時平倉。績效輸出保留原本的 Panel A、Panel B、Panel C，並額外提供累積損益、P&L 拆解以及單筆交易的進出場標註圖。
+
+        **主要可調參數：**
+        - `Residual band Z 門檻`：控制錯價訊號嚴格程度，原始設定為 `1.96`。
+        - `Moneyness 下界 / 上界`：控制 IV curve 校準與交易訊號採用的價平附近範圍，原始設定為 `0.9` 到 `1.1`。
+        - `單邊交易成本率`：同時計入 option 開平倉與 hedge 調整成本，原始設定為 `0.001`。
+        - `契約乘數 / 損益倍數`：用來放大或縮小 option 與 hedge P&L，原始設定為 `1.0`。
+        - `IV 除數`：若 IV 欄位以百分比表示，維持 `100`；若已是小數波動率，則改為 `1`。
+        """
+    )
+
+
+def render_txo_delta_hedge_page() -> None:
+    st.title("TXO delta hedge策略")
+    st.caption("衍生性商品交易策略 / IV 錯價偵測 / 每日 Delta Hedge 回測")
+    settings = txo_sidebar_settings()
+
+    st.markdown(
+        """
+        <div class="strategy-card">
+          <h3>策略說明</h3>
+          <p>
+          本策略針對台指選擇權建立每日 IV curve，透過 residual band 判斷真實 IV 是否相對模型 IV 過高或過低；
+          若 IV 偏高則賣出選擇權，若 IV 偏低則買進選擇權，並在持有期間每日依 Black-Scholes delta 調整現貨避險部位。
+          當 residual 回到合理區間、到期或資料結束時平倉，最後彙整選擇權損益、避險損益與總績效。
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if settings.moneyness_low >= settings.moneyness_high:
+        st.error("請先修正左側 Moneyness 上下界。")
+        return
+
+    run_clicked = st.button("執行 TXO delta hedge 回測", type="primary", use_container_width=True)
+    if run_clicked:
+        try:
+            with st.spinner("讀取 TXO 資料並執行 IV 校準、錯價判斷與 delta hedge 回測..."):
+                raw = txo_read_raw(settings)
+                result = txo_run_pipeline(raw, settings)
+                st.session_state["txo_result"] = result
+            st.success("TXO delta hedge 回測完成。")
+            saved_paths = result.get("saved_paths")
+            if saved_paths:
+                st.info("已輸出：\n" + "\n".join(str(v) for v in saved_paths.values()))
+        except Exception as exc:
+            st.error(f"TXO 回測失敗：{exc}")
+            return
+
+    result = st.session_state.get("txo_result")
+    tabs = st.tabs(["① 回測結果", "② 交易明細與進出場圖", "③ 原始輸出資料", "④ 方法說明"])
+
+    with tabs[0]:
+        if not result:
+            st.info("請先點選上方按鈕執行 TXO delta hedge 回測。")
+        else:
+            trades = result["trades"]
+            summary = result["summary"]
+            txo_show_key_metrics(trades, summary)
+            st.divider()
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.plotly_chart(txo_plot_equity(trades), use_container_width=True)
+            with c2:
+                st.plotly_chart(txo_plot_strategy_pnl(summary), use_container_width=True)
+
+            st.markdown("#### Signal counts")
+            safe_streamlit_dataframe(result["signal_counts"], use_container_width=True)
+
+            st.markdown("#### Panel A: Trading Performance Metrics")
+            safe_streamlit_dataframe(result["panel_a"].round(4), use_container_width=True, hide_index=True)
+
+            st.markdown("#### Panel B: Risk-Adjusted Performance")
+            safe_streamlit_dataframe(result["panel_b"].round(4), use_container_width=True, hide_index=True)
+
+            st.markdown("#### Panel C: P&L Decomposition and Holding Period")
+            safe_streamlit_dataframe(result["panel_c"].round(4), use_container_width=True, hide_index=True)
+
+            st.markdown("#### 下載輸出")
+            txo_download_buttons(result)
+
+    with tabs[1]:
+        if not result:
+            st.info("請先到「回測結果」執行 TXO 回測。")
+        else:
+            trades = result["trades"]
+            df = result["df"]
+            if trades.empty:
+                st.warning("本次參數下沒有產生交易。")
+            else:
+                strategy_options = ["全部"] + sorted(trades["strategy"].dropna().unique().tolist())
+                strategy_filter = st.selectbox("篩選策略", strategy_options)
+                filtered = trades.copy()
+                if strategy_filter != "全部":
+                    filtered = filtered[filtered["strategy"] == strategy_filter].copy()
+
+                sort_col = st.selectbox("交易排序", ["entry_date", "exit_date", "total_pnl", "holding_days"], index=0)
+                ascending = st.checkbox("由小到大排序", value=True)
+                filtered = filtered.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
+
+                safe_streamlit_dataframe(filtered.head(settings.table_rows), use_container_width=True, hide_index=True)
+
+                labels = [
+                    f"#{i} | {row.strategy} | K={float(row.K):.0f} | {pd.Timestamp(row.entry_date).date()} -> {pd.Timestamp(row.exit_date).date()} | P&L={float(row.total_pnl):.4f}"
+                    for i, row in filtered.iterrows()
+                ]
+                if labels:
+                    selected_label = st.selectbox("選擇一筆交易查看進出場圖", labels)
+                    selected_i = labels.index(selected_label)
+                    trade = filtered.iloc[selected_i]
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.plotly_chart(txo_plot_trade_price_path(df, trade), use_container_width=True)
+                    with c2:
+                        st.plotly_chart(txo_plot_trade_residual_path(df, trade, result["settings"].z_th), use_container_width=True)
+
+                    st.markdown("#### 選取交易細節")
+                    safe_streamlit_dataframe(pd.DataFrame([trade]), use_container_width=True, hide_index=True)
+
+    with tabs[2]:
+        if not result:
+            st.info("請先到「回測結果」執行 TXO 回測。")
+        else:
+            st.markdown("#### Trades")
+            safe_streamlit_dataframe(result["trades"].head(settings.table_rows), use_container_width=True, hide_index=True)
+            st.markdown("#### All points with model IV and residual")
+            safe_streamlit_dataframe(result["df"].head(settings.table_rows), use_container_width=True, hide_index=True)
+            st.markdown("#### Full summary")
+            safe_streamlit_dataframe(result["summary"].round(4), use_container_width=True, hide_index=True)
+            st.markdown("#### 下載完整資料")
+            txo_download_buttons(result)
+
+    with tabs[3]:
+        render_txo_method_notes()
 
 
 # ============================================================
@@ -5101,6 +5947,8 @@ def main() -> None:
         render_strategy_page("cointegration")
     elif st.session_state["selected_strategy"] == "ff5_alpha":
         render_strategy3_page()
+    elif st.session_state["selected_strategy"] == "txo_delta_hedge":
+        render_txo_delta_hedge_page()
     else:
         st.session_state["selected_strategy"] = None
         st.rerun()
