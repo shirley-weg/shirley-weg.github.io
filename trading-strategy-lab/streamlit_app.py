@@ -3017,7 +3017,7 @@ def render_txo_method_notes() -> None:
         """
         ### TXO delta hedge策略流程
 
-        本策略先讀取 TXO 選擇權資料，將每個交易日與到期日下的履約價、價格與 IV 展開成逐履約價資料；接著只保留價平附近 moneyness 區間，使用二次式 OLS 擬合當日 IV curve，並以「真實 IV - 模型 IV」作為 residual。當 residual 高於 `mu + Z_TH * sigma` 時，代表真實 IV 相對模型 IV 偏高，策略建立 Short Call 或 Short Put；當 residual 低於 `mu - Z_TH * sigma` 時，代表真實 IV 相對偏低，策略建立 Long Call 或 Long Put。開倉後每日用模型 IV 計算 Black-Scholes delta，並用現貨部位做 delta hedge；當 residual 回到合理區間、到期，或資料序列結束時平倉。績效輸出保留原本的 Panel A、Panel B、Panel C，並額外提供累積損益、P&L 拆解以及所有交易的進出場標註圖。
+        本策略先讀取 TXO 選擇權資料，將每個交易日與到期日下的履約價、價格與 IV 展開成逐履約價資料；接著只保留價平附近 moneyness 區間，使用二次式 OLS 擬合當日 IV curve，並以「真實 IV - 模型 IV」作為 residual。當 residual 高於 `mu + Z_TH * sigma` 時，代表真實 IV 相對模型 IV 偏高，策略建立 Short Call 或 Short Put；當 residual 低於 `mu - Z_TH * sigma` 時，代表真實 IV 相對偏低，策略建立 Long Call 或 Long Put。開倉後每日用模型 IV 計算 Black-Scholes delta，並用現貨部位做 delta hedge；當 residual 回到合理區間、到期，或資料序列結束時平倉。績效輸出保留原本的 Panel A、Panel B、Panel C，並額外提供累積損益、P&L 拆解以及單筆交易的進出場標註圖。
 
         **主要可調參數：**
         - `Residual band Z 門檻`：控制錯價訊號嚴格程度，原始設定為 `1.96`。
@@ -3064,7 +3064,7 @@ def render_txo_delta_hedge_page() -> None:
             return
 
     result = st.session_state.get("txo_result")
-    tabs = st.tabs(["① 回測結果", "② 交易明細", "③ 方法說明"])
+    tabs = st.tabs(["① 回測結果", "② 交易明細與進出場圖", "③ 方法說明"])
 
     with tabs[0]:
         if not result:
@@ -3077,8 +3077,6 @@ def render_txo_delta_hedge_page() -> None:
             st.divider()
 
             st.plotly_chart(txo_plot_equity(trades), use_container_width=True)
-            st.plotly_chart(txo_plot_all_entry_exit_points(df, trades), use_container_width=True)
-            st.plotly_chart(txo_plot_all_residual_entry_exit(trades, result["settings"].z_th), use_container_width=True)
             st.plotly_chart(txo_plot_strategy_pnl(summary), use_container_width=True)
 
             st.markdown("#### Signal counts")
@@ -3098,6 +3096,7 @@ def render_txo_delta_hedge_page() -> None:
             st.info("請先到「回測結果」執行 TXO 回測。")
         else:
             trades = result["trades"]
+            df = result["df"]
             if trades.empty:
                 st.warning("本次參數下沒有產生交易。")
             else:
@@ -3112,6 +3111,22 @@ def render_txo_delta_hedge_page() -> None:
                 filtered = filtered.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
 
                 safe_streamlit_dataframe(filtered.head(settings.table_rows), use_container_width=True, hide_index=True)
+
+                st.markdown("#### 單筆交易進出場圖")
+                labels = [
+                    f"#{i} | {row.strategy} | K={float(row.K):.0f} | {pd.Timestamp(row.entry_date).date()} -> {pd.Timestamp(row.exit_date).date()} | P&L={float(row.total_pnl):.4f}"
+                    for i, row in filtered.iterrows()
+                ]
+                if labels:
+                    selected_label = st.selectbox("選擇一筆交易查看進出場圖", labels)
+                    selected_i = labels.index(selected_label)
+                    trade = filtered.iloc[selected_i]
+
+                    st.plotly_chart(txo_plot_trade_price_path(df, trade), use_container_width=True)
+                    st.plotly_chart(txo_plot_trade_residual_path(df, trade, result["settings"].z_th), use_container_width=True)
+
+                    st.markdown("#### 選取交易細節")
+                    safe_streamlit_dataframe(pd.DataFrame([trade]), use_container_width=True, hide_index=True)
 
     with tabs[2]:
         render_txo_method_notes()
