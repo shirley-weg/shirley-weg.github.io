@@ -1,1 +1,0 @@
-# shirley-weg.github.io
