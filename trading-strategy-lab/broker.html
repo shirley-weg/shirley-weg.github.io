@@ -508,7 +508,7 @@
       <input
         id="searchInput"
         type="search"
-        placeholder="搜尋券商、分點代號或分點名稱，例如：元大、凱基、9200、台北"
+        placeholder="搜尋券商，例如：元大、凱基、摩根士丹利"
       />
 
       <button class="btn primary" id="clearBtn">清除搜尋</button>
@@ -584,7 +584,7 @@
         <div>
           <div class="panel-title">所有分點資料</div>
           <div class="panel-subtitle">
-            依目前日期與搜尋條件過濾，預設依買賣超金額由大到小排列
+            依目前日期與上方券商搜尋條件過濾，預設依買賣超金額由大到小排列
           </div>
         </div>
       </div>
@@ -611,7 +611,7 @@
     </section>
 
     <p class="small-note">
-      研究用途，不構成投資建議。買進金額與賣出金額使用「張數 × 均價 × 1000」估算。
+      研究用途，不構成投資建議。買進金額與賣出金額使用資料檔案中的金額欄位或「張數 × 均價 × 1000」估算。
     </p>
   </main>
 
@@ -623,7 +623,7 @@
     let selectedBroker = null;
     let activeTab = "stocks";
     let detailCache = {};
-    let detailStockQuery = "";
+    let detailStockCodeQuery = "";
 
     const dateSelect = document.getElementById("dateSelect");
     const searchInput = document.getElementById("searchInput");
@@ -688,42 +688,26 @@
       return String(value || "").toLowerCase().trim();
     }
 
-    function getQuery() {
+    function getBrokerQuery() {
       return normalizeText(searchInput.value);
     }
 
-    function getDetailStockQuery() {
-      return normalizeText(detailStockQuery);
+    function getDetailStockCodeQuery() {
+      return normalizeText(detailStockCodeQuery);
     }
 
     function bySelectedDate(row) {
       return row.date === selectedDate;
     }
 
-    function rowMatchesQuery(row, q) {
+    function brokerMatchesQuery(row, q) {
       if (!q) return true;
-
-      const text = [
-        row.broker,
-        row.branch_code,
-        row.branch_name,
-        row.branch_full_name,
-        row.stock_code,
-        row.stock_name
-      ].map(normalizeText).join(" ");
-
-      return text.includes(q);
+      return normalizeText(row.broker).includes(q);
     }
 
-    function rowMatchesStockQuery(row, q) {
+    function stockCodeMatchesQuery(row, q) {
       if (!q) return true;
-
-      const stockText = [
-        row.stock_code,
-        row.stock_name
-      ].map(normalizeText).join(" ");
-
-      return stockText.includes(q);
+      return normalizeText(row.stock_code).includes(q);
     }
 
     async function loadData() {
@@ -739,7 +723,7 @@
         selectedDate = rawData.latest_date;
         selectedBroker = null;
         detailCache = {};
-        detailStockQuery = "";
+        detailStockCodeQuery = "";
 
         initDateSelect();
         renderAll();
@@ -803,46 +787,32 @@
     }
 
     function getBrokerRows() {
-      const q = getQuery();
-
-      const branchMatchedBrokers = new Set(
-        rawData.branch_summary
-          .filter(bySelectedDate)
-          .filter(row => rowMatchesQuery(row, q))
-          .map(row => row.broker)
-      );
+      const q = getBrokerQuery();
 
       return rawData.broker_summary
         .filter(bySelectedDate)
-        .filter(row => {
-          if (!q) return true;
-
-          const brokerHit = normalizeText(row.broker).includes(q);
-          return brokerHit || branchMatchedBrokers.has(row.broker);
-        })
+        .filter(row => brokerMatchesQuery(row, q))
         .sort((a, b) => Number(b.net_value || 0) - Number(a.net_value || 0));
     }
 
     function getBranchRows() {
-      const q = getQuery();
+      const q = getBrokerQuery();
 
       return rawData.branch_summary
         .filter(bySelectedDate)
-        .filter(row => rowMatchesQuery(row, q))
+        .filter(row => brokerMatchesQuery(row, q))
         .sort((a, b) => Number(b.net_value || 0) - Number(a.net_value || 0));
     }
 
     async function getDetailRowsForBroker(broker) {
-      const q = getQuery();
-      const stockQ = getDetailStockQuery();
+      const stockCodeQ = getDetailStockCodeQuery();
 
       const rows = await loadBrokerDetail(broker);
 
       return rows
         .filter(bySelectedDate)
         .filter(row => row.broker === broker)
-        .filter(row => rowMatchesQuery(row, q))
-        .filter(row => rowMatchesStockQuery(row, stockQ));
+        .filter(row => stockCodeMatchesQuery(row, stockCodeQ));
     }
 
     function renderStats() {
@@ -893,7 +863,7 @@
         tr.addEventListener("click", () => {
           selectedBroker = tr.dataset.broker;
           activeTab = "stocks";
-          detailStockQuery = "";
+          detailStockCodeQuery = "";
           renderAll();
           document.querySelector(".grid").scrollIntoView({
             behavior: "smooth",
@@ -954,8 +924,8 @@
           let subtitle =
             `${selectedDate}｜買進 ${fmtYi(brokerRow.buy_value)}｜賣出 ${fmtYi(brokerRow.sell_value)}｜買賣超 ${fmtSignedYi(brokerRow.net_value)}`;
 
-          if (detailStockQuery.trim()) {
-            subtitle += `｜個股篩選：${detailStockQuery.trim()}`;
+          if (detailStockCodeQuery.trim()) {
+            subtitle += `｜個股代號：${detailStockCodeQuery.trim()}`;
           }
 
           detailSubtitle.textContent = subtitle;
@@ -975,24 +945,24 @@
           </div>
         `;
 
-        const stockFilter = `
+        const stockCodeFilter = `
           <div class="detail-stock-filter">
             <input
-              id="detailStockInput"
+              id="detailStockCodeInput"
               type="search"
-              placeholder="輸入個股代號或名稱，例如：2330、台積電、2308"
-              value="${escapeHtml(detailStockQuery)}"
+              placeholder="輸入個股代號，例如：2330、2308、2454"
+              value="${escapeHtml(detailStockCodeQuery)}"
             />
 
-            <button class="btn" id="detailStockClearBtn" type="button">
-              清除個股
+            <button class="btn" id="detailStockCodeClearBtn" type="button">
+              清除個股代號
             </button>
 
             <div class="detail-filter-note">
               ${
-                detailStockQuery.trim()
-                  ? `目前右側詳細資訊只顯示符合「${escapeHtml(detailStockQuery.trim())}」的資料，共 ${rows.length.toLocaleString("zh-TW")} 筆明細。`
-                  : "可輸入個股代號或名稱，只篩選右側詳細資訊；左側券商排行與下方所有分點資料不受影響。"
+                detailStockCodeQuery.trim()
+                  ? `目前右側詳細資訊只顯示個股代號包含「${escapeHtml(detailStockCodeQuery.trim())}」的資料，共 ${rows.length.toLocaleString("zh-TW")} 筆明細。`
+                  : "可輸入個股代號，只篩選右側「個股買賣超」、「分點排行」、「逐筆明細」；上方券商搜尋與左側券商排行不受影響。"
               }
             </div>
           </div>
@@ -1001,7 +971,7 @@
         let content = "";
 
         if (rows.length === 0) {
-          content = `<div class="empty">此券商在目前搜尋條件或個股篩選下沒有明細。</div>`;
+          content = `<div class="empty">此券商在目前個股代號篩選下沒有明細。</div>`;
         } else if (activeTab === "stocks") {
           content = renderBrokerStockRanking(rows);
         } else if (activeTab === "branches") {
@@ -1010,7 +980,7 @@
           content = renderRawDetailTable(rows);
         }
 
-        detailBody.innerHTML = tabs + stockFilter + content;
+        detailBody.innerHTML = tabs + stockCodeFilter + content;
 
         detailBody.querySelectorAll(".tab-btn").forEach(btn => {
           btn.addEventListener("click", () => {
@@ -1019,14 +989,16 @@
           });
         });
 
-        const detailStockInput = document.getElementById("detailStockInput");
-        const detailStockClearBtn = document.getElementById("detailStockClearBtn");
+        const detailStockCodeInput = document.getElementById("detailStockCodeInput");
+        const detailStockCodeClearBtn = document.getElementById("detailStockCodeClearBtn");
 
-        if (detailStockInput) {
-          detailStockInput.addEventListener("input", () => {
-            detailStockQuery = detailStockInput.value;
+        if (detailStockCodeInput) {
+          detailStockCodeInput.addEventListener("input", () => {
+            detailStockCodeQuery = detailStockCodeInput.value;
+
             renderDetail().then(() => {
-              const nextInput = document.getElementById("detailStockInput");
+              const nextInput = document.getElementById("detailStockCodeInput");
+
               if (nextInput) {
                 nextInput.focus();
                 const len = nextInput.value.length;
@@ -1036,9 +1008,9 @@
           });
         }
 
-        if (detailStockClearBtn) {
-          detailStockClearBtn.addEventListener("click", () => {
-            detailStockQuery = "";
+        if (detailStockCodeClearBtn) {
+          detailStockCodeClearBtn.addEventListener("click", () => {
+            detailStockCodeQuery = "";
             activeTab = "stocks";
             renderDetail();
           });
@@ -1161,7 +1133,7 @@
         .sort((a, b) => Number(b.net_value || 0) - Number(a.net_value || 0));
 
       if (branchRows.length === 0) {
-        return `<div class="empty">此券商在目前搜尋條件下沒有分點資料。</div>`;
+        return `<div class="empty">此券商在目前個股代號篩選下沒有分點資料。</div>`;
       }
 
       return `
@@ -1248,7 +1220,7 @@
       selectedDate = dateSelect.value;
       selectedBroker = null;
       activeTab = "stocks";
-      detailStockQuery = "";
+      detailStockCodeQuery = "";
       renderAll();
     });
 
@@ -1261,7 +1233,7 @@
       searchInput.value = "";
       selectedBroker = null;
       activeTab = "stocks";
-      detailStockQuery = "";
+      detailStockCodeQuery = "";
       renderAll();
     });
 
